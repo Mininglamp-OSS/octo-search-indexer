@@ -68,3 +68,25 @@ func TestCheckpoint_MissingFileStartsEmpty(t *testing.T) {
 		t.Fatalf("missing file must yield 0 watermark")
 	}
 }
+
+// TestCheckpoint_CreatesParentDir 🔴 P2-2：父目录不存在时 OpenCheckpoint 应建好目录（fail-fast），
+// 之后 Advance 能直接持久化，不晚到第一次写才失败。
+func TestCheckpoint_CreatesParentDir(t *testing.T) {
+	// 多层尚不存在的父目录。
+	path := filepath.Join(t.TempDir(), "nested", "deep", "cp.json")
+	cp, err := OpenCheckpoint(path)
+	if err != nil {
+		t.Fatalf("OpenCheckpoint must create missing parent dirs: %v", err)
+	}
+	if err := cp.Advance("message", 5); err != nil {
+		t.Fatalf("advance must persist after dir prepared: %v", err)
+	}
+	// 重开验证已落盘。
+	cp2, err := OpenCheckpoint(path)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	if cp2.Get("message") != 5 {
+		t.Fatalf("checkpoint not persisted into created dir: %d", cp2.Get("message"))
+	}
+}

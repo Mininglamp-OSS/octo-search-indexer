@@ -1,7 +1,9 @@
 package backfill
 
 import (
+	"encoding/json"
 	"fmt"
+	"os"
 	"path/filepath"
 	"testing"
 )
@@ -179,5 +181,112 @@ func TestDLQSpill_Sync(t *testing.T) {
 	defer mustCloseT(t, s2)
 	if s2.Count() != 1 {
 		t.Fatalf("synced record must be visible to reopen, got %d", s2.Count())
+	}
+}
+
+// writeRawSpill 直接往 spill 文件写原始字节（模拟崩溃留下的尾部状态），不经 DLQSpill。
+func writeRawSpill(t *testing.T, dir, content string) string {
+	t.Helper()
+	if err := os.MkdirAll(dir, 0o750); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	path := filepath.Join(dir, "backfill-dlq.ndjson")
+	if err := os.WriteFile(path, []byte(content), 0o640); err != nil {
+		t.Fatalf("write raw spill: %v", err)
+	}
+	return path
+}
+
+// validLine 返回一条合法 NDJSON 记录行（含结尾换行）。
+func validLine(t *testing.T, mid string, createdAt int64) string {
+	t.Helper()
+	rec := dlqRecord{Reason: "backfill_payload_unparseable", MessageID: mid, CreatedAt: createdAt}
+	b, err := json.Marshal(rec)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	return string(b) + "\n"
+}
+
+// TestDLQSpill_RecoverTornTrailingLine 🔴 P1(a)：尾部半写行（无结尾换行）→ 优雅截断、启动成功，
+// 完整行计数正确，且文件被截到只剩完整行。
+func TestDLQSpill_RecoverTornTrailingLine(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "d")
+	// 两条完整行 + 一条未 fsync 的半写尾行（无换行结尾，且 JSON 被截断）。
+	torn := `{"reason":"backfill_payload_unparseable","message_id":"m3","created_at":300`
+	content := validLine(t, "m1", 100) + validLine(t, "m2", 200) + torn
+	path := writeRawSpill(t, dir, content)
+
+	s, err := OpenDLQSpill(dir)
+	if err != nil {
+		t.Fatalf("torn trailing line must recover, got error: %v", err)
+	}
+	defer mustCloseT(t, s)
+	if s.Count() != 2 {
+		t.Fatalf("recovered count must be 2 (complete lines), got %d", s.Count())
+	}
+	// 文件应被截断到只剩两条完整行（torn 尾行已去除）。
+	data := mustRead(t, path)
+	if got := countLines(string(data)); got != 2 {
+		t.Fatalf("file must be truncated to 2 complete lines, got %d", got)
+	}
+	// 截断后继续写一条新记录 → 仍是完整行，重开可再解析（不会和旧半行拼成损坏行）。
+	if err := s.Write(dlqRecord{MessageID: "m4", CreatedAt: 400}); err != nil {
+		t.Fatalf("write after recovery: %v", err)
+	}
+	if cerr := s.Close(); cerr != nil {
+		t.Fatalf("close: %v", cerr)
+	}
+	s2, err := OpenDLQSpill(dir)
+	if err != nil {
+		t.Fatalf("reopen after recovery+append must succeed: %v", err)
+	}
+	defer mustCloseT(t, s2)
+	if s2.Count() != 3 {
+		t.Fatalf("after recovery+append, count must be 3, got %d", s2.Count())
+	}
+}
+
+// TestDLQSpill_NonTrailingCorruptionFatal 🔴 P1(b)：非末尾的完整行（以换行结尾）损坏 → 仍致命，
+// 拒绝启动（那是真损坏，不是未 fsync 的半行）。
+func TestDLQSpill_NonTrailingCorruptionFatal(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "d")
+	// 第一行损坏但以换行结尾（=完整行损坏），后面跟一条合法行。
+	content := "{this is not valid json}\n" + validLine(t, "m2", 200)
+	writeRawSpill(t, dir, content)
+	if _, err := OpenDLQSpill(dir); err == nil {
+		t.Fatalf("non-trailing corrupt (newline-terminated) line must be fatal")
+	}
+}
+
+// TestDLQSpill_AllCompleteLinesNoTruncate 全是完整行（末行有换行）→ 不截断、不豁免，全部计入。
+func TestDLQSpill_AllCompleteLinesNoTruncate(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "d")
+	content := validLine(t, "m1", 100) + validLine(t, "m2", 200)
+	path := writeRawSpill(t, dir, content)
+	s, err := OpenDLQSpill(dir)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer mustCloseT(t, s)
+	if s.Count() != 2 {
+		t.Fatalf("count=%d want 2", s.Count())
+	}
+	if got := countLines(string(mustRead(t, path))); got != 2 {
+		t.Fatalf("complete file must be untouched, got %d lines", got)
+	}
+}
+
+// TestDLQSpill_TornSingleLineOnly 只有一条半写行（无完整行）→ 截断为空、启动成功、计数 0。
+func TestDLQSpill_TornSingleLineOnly(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "d")
+	writeRawSpill(t, dir, `{"message_id":"m1","created_at":1`)
+	s, err := OpenDLQSpill(dir)
+	if err != nil {
+		t.Fatalf("single torn line must recover: %v", err)
+	}
+	defer mustCloseT(t, s)
+	if s.Count() != 0 {
+		t.Fatalf("count must be 0 after truncating the only (torn) line, got %d", s.Count())
 	}
 }

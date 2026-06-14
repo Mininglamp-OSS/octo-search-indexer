@@ -5,10 +5,12 @@
 //   - 对账口径与 es-indexer 写入器**解耦**（沿用 internal/esindex 的解耦纪律）：本包只描述
 //     「源行数 / sink doc 数 / 已知排除」的算术，数据来源经接口注入，可被阶段 6 backfill job
 //     直接复用为其正确性 gate。
-//   - 不变式（阶段 6 backfill 验收门）：
-//     ES(按 _id=message_id 去重 doc 数) + DLQ 条数 + 已知排除(raw_excluded: Signal/非文本)
-//     == 源 message 行数(时间窗内)
-//     无法归因的缺口（reconciled != 0）即 STOP。
+//   - 不变式（阶段 6 backfill 验收门），与 Reconcile 实现一致：
+//     ES(按 _id=message_id 去重 doc 数) + DLQ 条数 == 源 message 行数(时间窗内)
+//     等价写法：ES_docs == 源行数 − DLQ。
+//     **raw_excluded（Signal/非文本）不是独立加项**——它仍是一条 ES doc（content=null），已计入
+//     ES_docs，故既不从源行数扣、也不单列；RawExcluded 字段仅作观测，不参与对平算术。
+//     无法归因的缺口（Diff != 0）即 STOP。
 //
 // 路线甲提醒：撤回/删除态**不进** ES，但它们的正文行仍在 message 表里（撤回是 message_extra
 // 原地 UPDATE，不删 message 行）。对账以 message 表行数为源真相；撤回/删除不计入「源排除」——

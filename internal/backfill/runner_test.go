@@ -232,7 +232,53 @@ func TestRunner_PermanentESRejectToDLQ(t *testing.T) {
 	}
 }
 
-// TestRunner_TransientRetriesInPlace 429 → 仅未解决子集原地重试，自愈后全部写入，无重复 doc。
+// TestRunner_PermanentRejectRecordKeepsSourcePKAndPayload 🔴 P2-1：永久拒绝的 DLQ 记录须保留
+// 源 PK（table/id）+ 原始 payload，便于排查 / 回灌。
+func TestRunner_PermanentRejectRecordKeepsSourcePKAndPayload(t *testing.T) {
+	poison := textRow(42, "poison", "boom-body", 100)
+	src := &fakeSource{rows: map[string][]*srcMessageRow{"message": {poison}}}
+	w := newFakeWriter()
+	w.permanent["poison"] = struct{}{}
+	r, dlq, _ := newTestRunner(t, Config{Tables: []string{"message"}, BatchSize: 10}, src, w)
+	if _, err := r.Run(context.Background()); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	recs := readDLQRecords(t, dlq.Path())
+	if len(recs) != 1 {
+		t.Fatalf("want 1 dlq record, got %d", len(recs))
+	}
+	rec := recs[0]
+	if rec.Table != "message" || rec.ID != 42 || rec.MessageID != "poison" {
+		t.Fatalf("permanent-reject record must keep source PK: %+v", rec)
+	}
+	if string(rec.Payload) != string(poison.Payload) {
+		t.Fatalf("permanent-reject record must keep original payload: got %q want %q", rec.Payload, poison.Payload)
+	}
+	if rec.CreatedAt != 100 {
+		t.Fatalf("permanent-reject record must keep created_at, got %d", rec.CreatedAt)
+	}
+}
+
+// TestRunner_EmptyMessageIDNoDedupCollapse 🔴 P2-1：空 message_id 的多条 DLQ 行用 table:id 兜底
+// 去重键，不被静默合并 / 计数偏低。
+func TestRunner_EmptyMessageIDNoDedupCollapse(t *testing.T) {
+	// 两条空 message_id 的真异常（不同 id），不得塌缩成一条。
+	src := &fakeSource{rows: map[string][]*srcMessageRow{
+		"message": {
+			{ID: 1, MessageID: "", Payload: []byte("{bad-1"), CreatedUnix: 100},
+			{ID: 2, MessageID: "", Payload: []byte("{bad-2"), CreatedUnix: 100},
+		},
+	}}
+	w := newFakeWriter()
+	r, dlq, _ := newTestRunner(t, Config{Tables: []string{"message"}, BatchSize: 10}, src, w)
+	stats, err := r.Run(context.Background())
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if stats.DLQ != 2 || dlq.Count() != 2 {
+		t.Fatalf("empty message_id rows must NOT collapse: stats.DLQ=%d count=%d want 2", stats.DLQ, dlq.Count())
+	}
+}
 func TestRunner_TransientRetriesInPlace(t *testing.T) {
 	src := &fakeSource{rows: map[string][]*srcMessageRow{
 		"message": {textRow(1, "a", "x", 100), textRow(2, "slow", "y", 100), textRow(3, "c", "z", 100)},
@@ -372,6 +418,27 @@ func TestRunner_CtxCancelStops(t *testing.T) {
 	if _, err := r.Run(ctx); err == nil {
 		t.Fatalf("cancelled ctx must stop with error")
 	}
+}
+
+// readDLQRecords 读出 spill 文件全部记录（测试断言用）。
+func readDLQRecords(t *testing.T, path string) []dlqRecord {
+	t.Helper()
+	data, err := os.ReadFile(path) //nolint:gosec // 测试路径
+	if err != nil {
+		t.Fatalf("read spill: %v", err)
+	}
+	var recs []dlqRecord
+	for _, line := range splitLines(string(data)) {
+		if line == "" {
+			continue
+		}
+		var rec dlqRecord
+		if err := json.Unmarshal([]byte(line), &rec); err != nil {
+			t.Fatalf("bad spill line %q: %v", line, err)
+		}
+		recs = append(recs, rec)
+	}
+	return recs
 }
 
 // assertDLQContains 断言 spill 文件含某 message_id。

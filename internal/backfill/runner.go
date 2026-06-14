@@ -129,6 +129,14 @@ func (r *Runner) runTable(ctx context.Context, table string) (Stats, error) {
 	}
 }
 
+// mainItem 把一条进 ES 正文流的契约消息与其源行配对，使 ES 永久拒绝时仍能把源 PK（table/id）
+// + 原始 payload 写进 DLQ 记录（P2-1：便于排查 / 回灌，且空 message_id 时用 table:id 兜底去重，
+// 不致 dedup 塌缩 / 计数偏低）。
+type mainItem struct {
+	row *srcMessageRow
+	msg searchmsg.Message
+}
+
 // processBatch 处理一批（同分表、按 id 升序）：抽取三态分流 → 真异常落 DLQ spill →
 // main 批幂等 bulk 写 ES（transient 原地重试未解决子集，permanent 4xx 落 DLQ spill）。
 //
@@ -136,7 +144,7 @@ func (r *Runner) runTable(ctx context.Context, table string) (Stats, error) {
 // 推进 checkpoint，保证「推进的每个 id 都已终态处理」。
 func (r *Runner) processBatch(ctx context.Context, table string, rows []*srcMessageRow, s *Stats) error {
 	s.Read += int64(len(rows))
-	main := make([]searchmsg.Message, 0, len(rows))
+	main := make([]mainItem, 0, len(rows))
 	for _, row := range rows {
 		msg, outcome := extractMessage(row)
 		switch outcome {
@@ -154,7 +162,7 @@ func (r *Runner) processBatch(ctx context.Context, table string, rows []*srcMess
 			if outcome == outcomeRawExcluded {
 				s.RawExcluded++
 			}
-			main = append(main, msg)
+			main = append(main, mainItem{row: row, msg: msg})
 		}
 	}
 	return r.writeMain(ctx, table, main, s)
@@ -166,7 +174,7 @@ func (r *Runner) processBatch(ctx context.Context, table string, rows []*srcMess
 //   - per-item transient(429/5xx) → 仅对未解决子集原地退避重试，直到全部 OK 或 permanent 终态。
 //
 // 阻塞直到本批所有 main 文档均终态（OK 或已 spill）；ctx 取消（SIGTERM）即返回。
-func (r *Runner) writeMain(ctx context.Context, table string, main []searchmsg.Message, s *Stats) error {
+func (r *Runner) writeMain(ctx context.Context, table string, main []mainItem, s *Stats) error {
 	remaining := main
 	for attempt := 0; len(remaining) > 0; attempt++ {
 		if err := ctx.Err(); err != nil {
@@ -177,7 +185,11 @@ func (r *Runner) writeMain(ctx context.Context, table string, main []searchmsg.M
 				return err
 			}
 		}
-		results, err := r.writer.Bulk(ctx, remaining)
+		msgs := make([]searchmsg.Message, len(remaining))
+		for i := range remaining {
+			msgs[i] = remaining[i].msg
+		}
+		results, err := r.writer.Bulk(ctx, msgs)
 		if err != nil {
 			// 批级 transient：保持 remaining 不变，下轮整批重试。
 			r.logf("backfill: bulk batch-level transient (table=%s n=%d attempt=%d): %v",
@@ -186,28 +198,27 @@ func (r *Runner) writeMain(ctx context.Context, table string, main []searchmsg.M
 		}
 		next := remaining[:0:0] // 新底层数组，避免别名污染
 		for i, res := range results {
+			item := remaining[i]
 			switch {
 			case res.OK:
 				s.Indexed++
 			case res.Permanent():
 				// ES 永久拒绝（4xx 毒丸，如 mapping 冲突）：未进 ES，落 DLQ spill 计数。
+				// P2-1：保留源 PK（table/id）+ 原始 payload；空 message_id 用 table:id 兜底去重。
 				rec := dlqRecord{
 					Reason: "permanent_es_reject",
-					Table:  table, MessageID: remaining[i].MessageID,
-					CreatedAt: remaining[i].CreatedAt,
-				}
-				if remaining[i].Content != nil {
-					rec.Payload = []byte(*remaining[i].Content)
+					Table:  table, ID: item.row.ID, MessageID: item.row.MessageID,
+					Payload: item.row.Payload, CreatedAt: item.row.CreatedUnix,
 				}
 				if werr := r.dlq.Write(rec); werr != nil {
 					return werr
 				}
 				s.DLQ++
 				s.DLQPermanent++
-				r.logf("backfill: permanent ES reject -> DLQ spill (table=%s msg=%s status=%d): %v",
-					table, remaining[i].MessageID, res.Status, res.Err)
+				r.logf("backfill: permanent ES reject -> DLQ spill (table=%s id=%d msg=%q status=%d): %v",
+					table, item.row.ID, item.row.MessageID, res.Status, res.Err)
 			default: // transient(429/5xx)：留待下轮原地重试。
-				next = append(next, remaining[i])
+				next = append(next, item)
 			}
 		}
 		remaining = next

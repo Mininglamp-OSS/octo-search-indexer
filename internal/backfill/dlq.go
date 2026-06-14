@@ -2,6 +2,7 @@ package backfill
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -81,22 +82,35 @@ func OpenDLQSpill(dir string) (*DLQSpill, error) {
 }
 
 // loadSeen 从既有 spill 文件重建「去重键 → created_at」集（resume 时计数不归零、写入幂等）。
+//
+// 🔴 崩溃可续传性（P1）：本 job 设计为可被中断后续跑（6h / 315 万行，中途崩溃是预期失败模式）。
+// Write 是裸 append、Sync 每批一次（在 checkpoint Advance 前），故**批中途崩溃会在 spill 尾部
+// 留一条未 fsync 的半写 NDJSON 行**。replay 必须：
+//   - **只容忍最后一段「无结尾换行」的半写尾行**——把它截掉（该行所属批从未 Sync、其源 id
+//     也从未 Advance，resume 会重读重写，截断安全）；
+//   - **任何「以换行结尾」的完整行解析失败仍致命**——append-only 顺序写下，损坏只会是后缀；
+//     一条已换行结尾却解析失败的行 = 真正的内部损坏（位翻转 / 人为篡改），绝不静默放过。
+//
+// 截断尾部半行还防止下次 append 把「半行 + 新行」拼成一条真损坏行（再启动就会误判致命）。
 func loadSeen(path string) (map[string]int64, error) {
 	seen := map[string]int64{}
-	f, err := os.Open(path) //nolint:gosec // path 来自运维配置，非用户输入
+	data, err := os.ReadFile(path) //nolint:gosec // path 来自运维配置，非用户输入
 	if err != nil {
 		if os.IsNotExist(err) {
 			return seen, nil
 		}
 		return nil, fmt.Errorf("backfill: open spill for replay: %w", err)
 	}
-	defer func() {
-		if cerr := f.Close(); cerr != nil {
-			// 只读句柄关闭失败不致命，但记一笔以免静默。
-			fmt.Fprintf(os.Stderr, "backfill: close spill replay handle: %v\n", cerr)
-		}
-	}()
-	sc := bufio.NewScanner(f)
+	if len(data) == 0 {
+		return seen, nil
+	}
+
+	// 以最后一个换行符切分：之前（含该换行）的是「完整行」区，之后的非空残留是未 fsync 的半写尾行。
+	lastNL := bytes.LastIndexByte(data, '\n')
+	completeBytes := data[:lastNL+1] // lastNL=-1（全文件无换行）时为空切片
+	tail := data[lastNL+1:]          // 最后一个换行之后的残留（torn tail，可能为空）
+
+	sc := bufio.NewScanner(bytes.NewReader(completeBytes))
 	sc.Buffer(make([]byte, 0, 64*1024), 8*1024*1024) // 容忍大 payload 行
 	for sc.Scan() {
 		line := sc.Bytes()
@@ -105,12 +119,21 @@ func loadSeen(path string) (map[string]int64, error) {
 		}
 		var rec dlqRecord
 		if err := json.Unmarshal(line, &rec); err != nil {
-			return nil, fmt.Errorf("backfill: corrupt spill line during replay: %w", err)
+			// 已换行结尾的完整行损坏 = 真损坏（非末尾豁免），致命。
+			return nil, fmt.Errorf("backfill: corrupt non-trailing spill line during replay (real corruption, not an un-fsynced partial tail): %w", err)
 		}
 		seen[dedupKey(rec)] = rec.CreatedAt
 	}
 	if err := sc.Err(); err != nil {
 		return nil, fmt.Errorf("backfill: scan spill during replay: %w", err)
+	}
+
+	// 截掉未 fsync 的半写尾行（崩溃恢复），让文件回到「全是完整行」的状态可继续 append。
+	if len(tail) > 0 {
+		if err := os.Truncate(path, int64(len(completeBytes))); err != nil {
+			return nil, fmt.Errorf("backfill: truncate torn trailing spill line (%d bytes) during crash recovery: %w", len(tail), err)
+		}
+		fmt.Fprintf(os.Stderr, "backfill: recovered spill by truncating a %d-byte un-fsynced trailing partial line\n", len(tail))
 	}
 	return seen, nil
 }

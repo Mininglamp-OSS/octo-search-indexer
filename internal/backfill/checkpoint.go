@@ -37,6 +37,11 @@ func OpenCheckpoint(path string) (*CheckpointStore, error) {
 	if path == "" {
 		return s, nil
 	}
+	// 提早建好父目录并 fail-fast（P2-2）：否则父目录缺失要等到第一次 Advance 写临时文件时才报错，
+	// 那时已扫了一整批白工。开局就把目录准备好，让配置错误立刻暴露。
+	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
+		return nil, fmt.Errorf("backfill: mkdir checkpoint dir: %w", err)
+	}
 	data, err := os.ReadFile(path) //nolint:gosec // path 来自运维配置，非用户输入
 	if err != nil {
 		if os.IsNotExist(err) {
