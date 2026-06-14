@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 )
 
@@ -197,6 +198,14 @@ func writeRawSpill(t *testing.T, dir, content string) string {
 	return path
 }
 
+// writeSyncedSidecar 写 offset sidecar（模拟已 fsync 的持久长度）。
+func writeSyncedSidecar(t *testing.T, dir string, off int64) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(dir, "backfill-dlq.synced"), []byte(strconv.FormatInt(off, 10)), 0o640); err != nil {
+		t.Fatalf("write sidecar: %v", err)
+	}
+}
+
 // validLine 返回一条合法 NDJSON 记录行（含结尾换行）。
 func validLine(t *testing.T, mid string, createdAt int64) string {
 	t.Helper()
@@ -208,30 +217,29 @@ func validLine(t *testing.T, mid string, createdAt int64) string {
 	return string(b) + "\n"
 }
 
-// TestDLQSpill_RecoverTornTrailingLine 🔴 P1(a)：尾部半写行（无结尾换行）→ 优雅截断、启动成功，
-// 完整行计数正确，且文件被截到只剩完整行。
-func TestDLQSpill_RecoverTornTrailingLine(t *testing.T) {
+// TestDLQSpill_RecoverDirtySuffix 🔴 P1（根因）：sidecar 记录已 fsync 的前缀长度；崩溃留下的
+// 未 fsync 脏后缀（任意条数、任意撕裂形态）在重开时整段截到 sidecar offset，干净前缀完整保留。
+func TestDLQSpill_RecoverDirtySuffix(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "d")
-	// 两条完整行 + 一条未 fsync 的半写尾行（无换行结尾，且 JSON 被截断）。
-	torn := `{"reason":"backfill_payload_unparseable","message_id":"m3","created_at":300`
-	content := validLine(t, "m1", 100) + validLine(t, "m2", 200) + torn
-	path := writeRawSpill(t, dir, content)
+	clean := validLine(t, "m1", 100) + validLine(t, "m2", 200) // 已 fsync 的干净前缀
+	// 脏后缀：一条完整行 + 一条撕裂半行（模拟一批多条 append 中途崩溃）。
+	dirty := validLine(t, "m3", 300) + `{"message_id":"m4","created_at":40`
+	path := writeRawSpill(t, dir, clean+dirty)
+	writeSyncedSidecar(t, dir, int64(len(clean))) // 只有 clean 段被 fsync 过
 
 	s, err := OpenDLQSpill(dir)
 	if err != nil {
-		t.Fatalf("torn trailing line must recover, got error: %v", err)
+		t.Fatalf("dirty suffix must recover to sidecar offset, got: %v", err)
 	}
 	defer mustCloseT(t, s)
 	if s.Count() != 2 {
-		t.Fatalf("recovered count must be 2 (complete lines), got %d", s.Count())
+		t.Fatalf("recovered count must be 2 (synced prefix), got %d", s.Count())
 	}
-	// 文件应被截断到只剩两条完整行（torn 尾行已去除）。
-	data := mustRead(t, path)
-	if got := countLines(string(data)); got != 2 {
-		t.Fatalf("file must be truncated to 2 complete lines, got %d", got)
+	if got := countLines(string(mustRead(t, path))); got != 2 {
+		t.Fatalf("file must be truncated to the 2 synced lines, got %d", got)
 	}
-	// 截断后继续写一条新记录 → 仍是完整行，重开可再解析（不会和旧半行拼成损坏行）。
-	if err := s.Write(dlqRecord{MessageID: "m4", CreatedAt: 400}); err != nil {
+	// 续写后重开应得 3 条（脏后缀的 m3/m4 已被丢弃，不会拼成损坏行）。
+	if err := s.Write(dlqRecord{MessageID: "m5", CreatedAt: 500}); err != nil {
 		t.Fatalf("write after recovery: %v", err)
 	}
 	if cerr := s.Close(); cerr != nil {
@@ -247,44 +255,66 @@ func TestDLQSpill_RecoverTornTrailingLine(t *testing.T) {
 	}
 }
 
-// TestDLQSpill_NonTrailingCorruptionFatal 🔴 P1(b)：非末尾的完整行（以换行结尾）损坏 → 仍致命，
-// 拒绝启动（那是真损坏，不是未 fsync 的半行）。
-func TestDLQSpill_NonTrailingCorruptionFatal(t *testing.T) {
+// TestDLQSpill_CorruptionWithinSyncedPrefixFatal 🔴 已 fsync 前缀（[0,offset)）内的记录损坏 = 真损坏
+// （位翻转/篡改），致命拒启动——不被当作可丢弃的脏后缀。
+func TestDLQSpill_CorruptionWithinSyncedPrefixFatal(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "d")
-	// 第一行损坏但以换行结尾（=完整行损坏），后面跟一条合法行。
-	content := "{this is not valid json}\n" + validLine(t, "m2", 200)
-	writeRawSpill(t, dir, content)
+	// 前缀内：一条损坏完整行 + 一条合法行，整段都在 sidecar offset 之内。
+	prefix := "{this is not valid json}\n" + validLine(t, "m2", 200)
+	writeRawSpill(t, dir, prefix)
+	writeSyncedSidecar(t, dir, int64(len(prefix))) // 整个前缀都被「fsync 过」
 	if _, err := OpenDLQSpill(dir); err == nil {
-		t.Fatalf("non-trailing corrupt (newline-terminated) line must be fatal")
+		t.Fatalf("corruption within the synced prefix must be fatal")
 	}
 }
 
-// TestDLQSpill_RecoverNewlineTerminatedFinalCorrupt 🔴 P1（精修）：非原子写回下，最后一条记录
-// 即便结尾换行已落盘，更早字节也可能陈旧。故**最后一条记录**解析失败（即便以换行结尾）→ 截断恢复，
-// 不致命（它属未 Sync 批、源 id 未 Advance，resume 会重写）。
-func TestDLQSpill_RecoverNewlineTerminatedFinalCorrupt(t *testing.T) {
+// TestDLQSpill_SyncedPrefixNotEndingAtBoundaryFatal sidecar offset 落在记录中间（前缀不以换行结尾）
+// = 持久状态不一致，致命。
+func TestDLQSpill_SyncedPrefixNotEndingAtBoundaryFatal(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "d")
-	// 一条合法完整行 + 最后一条「以换行结尾但损坏」的记录（撕裂的最终 append）。
-	content := validLine(t, "m1", 100) + "{half-written-final-record}\n"
-	path := writeRawSpill(t, dir, content)
+	line := validLine(t, "m1", 100)
+	writeRawSpill(t, dir, line)
+	writeSyncedSidecar(t, dir, int64(len(line))-3) // 截在记录中间
+	if _, err := OpenDLQSpill(dir); err == nil {
+		t.Fatalf("synced offset not at a record boundary must be fatal")
+	}
+}
+
+// TestDLQSpill_NoSidecarTruncatesAll 无 sidecar（offset=0）+ 既有内容 → 视为全未 fsync，截到 0。
+// （首次崩溃在第一批 Sync 之前的退化情形；那批 checkpoint 也没推进，resume 重写。）
+func TestDLQSpill_NoSidecarTruncatesAll(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "d")
+	path := writeRawSpill(t, dir, validLine(t, "m1", 100)+validLine(t, "m2", 200))
 	s, err := OpenDLQSpill(dir)
 	if err != nil {
-		t.Fatalf("newline-terminated torn FINAL record must recover (truncate), got: %v", err)
+		t.Fatalf("no sidecar must recover (truncate all), got: %v", err)
 	}
 	defer mustCloseT(t, s)
-	if s.Count() != 1 {
-		t.Fatalf("recovered count must be 1 (the valid line), got %d", s.Count())
+	if s.Count() != 0 {
+		t.Fatalf("no sidecar => everything un-synced => count 0, got %d", s.Count())
 	}
-	if got := countLines(string(mustRead(t, path))); got != 1 {
-		t.Fatalf("torn final record must be truncated, file should have 1 line, got %d", got)
+	if got := countLines(string(mustRead(t, path))); got != 0 {
+		t.Fatalf("file must be truncated to empty, got %d lines", got)
 	}
 }
 
-// TestDLQSpill_AllCompleteLinesNoTruncate 全是完整行（末行有换行）→ 不截断、不豁免，全部计入。
-func TestDLQSpill_AllCompleteLinesNoTruncate(t *testing.T) {
+// TestDLQSpill_FileShorterThanSidecarFatal 文件比 sidecar 记录的同步长度还短 → 持久状态丢失，致命。
+func TestDLQSpill_FileShorterThanSidecarFatal(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "d")
+	line := validLine(t, "m1", 100)
+	writeRawSpill(t, dir, line)
+	writeSyncedSidecar(t, dir, int64(len(line))+50) // 谎称同步长度超过文件实际大小
+	if _, err := OpenDLQSpill(dir); err == nil {
+		t.Fatalf("file shorter than synced offset must be fatal")
+	}
+}
+
+// TestDLQSpill_AllSyncedNoTruncate 全部内容都在 sidecar offset 内（已 fsync）→ 不截断、全部计入。
+func TestDLQSpill_AllSyncedNoTruncate(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "d")
 	content := validLine(t, "m1", 100) + validLine(t, "m2", 200)
 	path := writeRawSpill(t, dir, content)
+	writeSyncedSidecar(t, dir, int64(len(content))) // 整段都已 fsync
 	s, err := OpenDLQSpill(dir)
 	if err != nil {
 		t.Fatalf("open: %v", err)
@@ -294,11 +324,11 @@ func TestDLQSpill_AllCompleteLinesNoTruncate(t *testing.T) {
 		t.Fatalf("count=%d want 2", s.Count())
 	}
 	if got := countLines(string(mustRead(t, path))); got != 2 {
-		t.Fatalf("complete file must be untouched, got %d lines", got)
+		t.Fatalf("fully-synced file must be untouched, got %d lines", got)
 	}
 }
 
-// TestDLQSpill_TornSingleLineOnly 只有一条半写行（无完整行）→ 截断为空、启动成功、计数 0。
+// TestDLQSpill_TornSingleLineOnly 只有一条半写行（无 sidecar）→ 截断为空、启动成功、计数 0。
 func TestDLQSpill_TornSingleLineOnly(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "d")
 	writeRawSpill(t, dir, `{"message_id":"m1","created_at":1`)
@@ -308,45 +338,6 @@ func TestDLQSpill_TornSingleLineOnly(t *testing.T) {
 	}
 	defer mustCloseT(t, s)
 	if s.Count() != 0 {
-		t.Fatalf("count must be 0 after truncating the only (torn) line, got %d", s.Count())
-	}
-}
-
-// TestDLQSpill_ValidFinalRecordMissingNewlineTruncated 🔴 P1（精修2）：最后一条记录 JSON 完整可解析
-// 但缺结尾换行（崩溃时只丢了 '\n'）→ 仍视为撕裂截掉。否则文件无 NDJSON 分隔符，下次 append 会把
-// 新记录直接拼到它后面成一条真损坏行。截断后该源 id（未 Advance）resume 会重写，安全。
-func TestDLQSpill_ValidFinalRecordMissingNewlineTruncated(t *testing.T) {
-	dir := filepath.Join(t.TempDir(), "d")
-	// 一条带换行的完整行 + 一条「合法 JSON 但无结尾换行」的最后记录。
-	noNL := validLine(t, "m2", 200)
-	noNL = noNL[:len(noNL)-1] // 去掉结尾换行
-	content := validLine(t, "m1", 100) + noNL
-	path := writeRawSpill(t, dir, content)
-
-	s, err := OpenDLQSpill(dir)
-	if err != nil {
-		t.Fatalf("valid-but-newline-less final record must recover (truncate): %v", err)
-	}
-	// 截断后只剩第一条带分隔符的完整行。
-	if s.Count() != 1 {
-		t.Fatalf("count after truncating newline-less final record must be 1, got %d", s.Count())
-	}
-	// 续写一条新记录，重开应得 2 条（绝不和旧记录拼成损坏行）。
-	if err := s.Write(dlqRecord{MessageID: "m3", CreatedAt: 300}); err != nil {
-		t.Fatalf("write after recovery: %v", err)
-	}
-	if cerr := s.Close(); cerr != nil {
-		t.Fatalf("close: %v", cerr)
-	}
-	if got := countLines(string(mustRead(t, path))); got != 2 {
-		t.Fatalf("after recovery+append, file must have 2 clean NDJSON lines, got %d", got)
-	}
-	s2, err := OpenDLQSpill(dir)
-	if err != nil {
-		t.Fatalf("reopen must parse cleanly (no concatenated corrupt line): %v", err)
-	}
-	defer mustCloseT(t, s2)
-	if s2.Count() != 2 {
-		t.Fatalf("reopen count must be 2, got %d", s2.Count())
+		t.Fatalf("count must be 0 after truncating the only (un-synced) line, got %d", s.Count())
 	}
 }

@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -41,17 +43,28 @@ type dlqRecord struct {
 // DLQ 量级极小（真异常稀少；线上实测撤回都仅 0.21%、真不可解析的更罕见），故在内存保留全部
 // 记录（去重键 → created_at）以支持按窗计数，开销可忽略。
 type DLQSpill struct {
-	path string
+	path       string
+	offsetPath string
 
-	mu      sync.Mutex
-	f       *os.File
-	seen    map[string]int64 // dedup key (message_id) -> created_at（按窗计数用）
-	nowUnix func() int64
+	mu         sync.Mutex
+	f          *os.File
+	seen       map[string]int64 // dedup key (message_id) -> created_at（按窗计数用）
+	pendingLen int64            // 当前文件总字节数（含尚未 fsync 的 append）
+	syncedLen  int64            // 已 fsync 且已记入 offset sidecar 的持久长度（字节）
+	nowUnix    func() int64
 }
 
 // OpenDLQSpill 打开（或创建）spill 文件，并从既有内容重建去重集 + 计数（resume 安全）。
 // dir 为空表示禁用 spill——此时若 backfill 遇到 DLQ 行必须硬停（见 runner），绝不允许 DLQ 行
 // 静默消失破坏对账。
+//
+// 🔴 崩溃可续传性（P1，根因修法）：用一个持久 offset sidecar（`backfill-dlq.synced`）记录
+// 「已 fsync 的 spill 字节长度」。Sync() 在每批 fsync spill 内容后，把当时长度原子写入 sidecar
+// （temp+rename）。重开时把 spill **截断到 sidecar 记录的 offset**——丢弃其后**全部**未 fsync 的
+// 脏后缀（可能是单条撕裂、也可能是一批多条 append 中途崩溃留下的多条脏记录）。这段脏后缀对应的
+// 源 id 从未 Advance 过 checkpoint（Advance 在 Sync 之后），resume 必重读重写，丢弃绝对安全。
+// 截断后只解析 [0, offset) 这段「既 fsync 又与 checkpoint 一致」的干净前缀——其中任何解析失败都是
+// 真损坏（位翻转/篡改），致命。这样彻底取代了「猜哪条是撕裂尾行」的脆弱启发式。
 func OpenDLQSpill(dir string) (*DLQSpill, error) {
 	if dir == "" {
 		return nil, fmt.Errorf("backfill: DLQ spill dir is required (DLQ rows must be durably accounted; refuse to silently drop)")
@@ -60,10 +73,17 @@ func OpenDLQSpill(dir string) (*DLQSpill, error) {
 		return nil, fmt.Errorf("backfill: mkdir spill dir: %w", err)
 	}
 	path := filepath.Join(dir, "backfill-dlq.ndjson")
-	seen, err := loadSeen(path)
+	offsetPath := filepath.Join(dir, "backfill-dlq.synced")
+
+	syncedLen, err := readSyncedOffset(offsetPath)
 	if err != nil {
 		return nil, err
 	}
+	seen, err := recoverAndLoad(path, syncedLen)
+	if err != nil {
+		return nil, err
+	}
+
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o640)
 	if err != nil {
 		return nil, fmt.Errorf("backfill: open spill file: %w", err)
@@ -77,77 +97,82 @@ func OpenDLQSpill(dir string) (*DLQSpill, error) {
 		}
 		return nil, err
 	}
-	return &DLQSpill{path: path, f: f, seen: seen, nowUnix: func() int64 { return time.Now().Unix() }}, nil
+	return &DLQSpill{
+		path: path, offsetPath: offsetPath, f: f, seen: seen,
+		pendingLen: syncedLen, syncedLen: syncedLen,
+		nowUnix: func() int64 { return time.Now().Unix() },
+	}, nil
 }
 
-// loadSeen 从既有 spill 文件重建「去重键 → created_at」集（resume 时计数不归零、写入幂等）。
-//
-// 🔴 崩溃可续传性（P1）：本 job 设计为可被中断后续跑（6h / 315 万行，中途崩溃是预期失败模式）。
-// Write 是裸 append、Sync 每批一次（在 checkpoint Advance 前），故**批中途崩溃会在 spill 尾部
-// 留一条未 fsync 的撕裂记录**。非原子写回下，这条「最后一条记录」即便结尾换行已落盘，其更早的
-// 字节也可能仍是陈旧/垃圾（换行/文件长度先于内容到盘）。replay 规则：
-//   - **只对「最后一条记录」豁免**——解析失败即把它整条截掉（不论有无结尾换行）。该记录属于
-//     未 Sync 的批、其源 id 也从未 Advance，resume 会重读重写，截断绝对安全。
-//   - **最后一条之前的任何记录解析失败仍致命**——append-only 顺序写下，那是真正的内部损坏
-//     （位翻转 / 篡改），绝不静默放过。
-//
-// 截断撕裂尾记录还防止下次 append 把「半记录 + 新记录」拼成一条真损坏行。
-func loadSeen(path string) (map[string]int64, error) {
-	seen := map[string]int64{}
-	data, err := os.ReadFile(path) //nolint:gosec // path 来自运维配置，非用户输入
+// readSyncedOffset 读 offset sidecar（不存在/空 → 0：表示尚无任何已 fsync 的 spill 前缀）。
+// sidecar 由 temp+rename 原子写，故不会出现撕裂；解析失败即真损坏 → 致命。
+func readSyncedOffset(offsetPath string) (int64, error) {
+	data, err := os.ReadFile(offsetPath) //nolint:gosec // path 来自运维配置
 	if err != nil {
 		if os.IsNotExist(err) {
+			return 0, nil
+		}
+		return 0, fmt.Errorf("backfill: read spill offset sidecar: %w", err)
+	}
+	s := strings.TrimSpace(string(data))
+	if s == "" {
+		return 0, nil
+	}
+	off, err := strconv.ParseInt(s, 10, 64)
+	if err != nil || off < 0 {
+		return 0, fmt.Errorf("backfill: corrupt spill offset sidecar %q (atomic-rename written, so this is real corruption): %v", s, err)
+	}
+	return off, nil
+}
+
+// recoverAndLoad 把 spill 截断到 syncedLen（丢弃未 fsync 的脏后缀），再严格解析 [0, syncedLen)
+// 干净前缀，重建去重集 + 计数。
+func recoverAndLoad(path string, syncedLen int64) (map[string]int64, error) {
+	seen := map[string]int64{}
+	info, err := os.Stat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			if syncedLen != 0 {
+				return nil, fmt.Errorf("backfill: spill offset sidecar says %d bytes but spill file is missing (durability state lost; manual inspection required)", syncedLen)
+			}
 			return seen, nil
 		}
-		return nil, fmt.Errorf("backfill: open spill for replay: %w", err)
+		return nil, fmt.Errorf("backfill: stat spill file: %w", err)
 	}
-	if len(data) == 0 {
+	size := info.Size()
+	if size < syncedLen {
+		// 文件比已记录的同步长度还短：持久层不一致（被外部截断/损坏），不可静默放过。
+		return nil, fmt.Errorf("backfill: spill file (%d bytes) shorter than synced offset (%d) — durability state lost; manual inspection required", size, syncedLen)
+	}
+	if size > syncedLen {
+		// 丢弃 syncedLen 之后的未 fsync 脏后缀（崩溃恢复；这段对应的源 id 从未 Advance 过 checkpoint）。
+		if err := os.Truncate(path, syncedLen); err != nil {
+			return nil, fmt.Errorf("backfill: truncate un-synced dirty spill suffix (%d -> %d bytes) during crash recovery: %w", size, syncedLen, err)
+		}
+		fmt.Fprintf(os.Stderr, "backfill: recovered spill by truncating a %d-byte un-fsynced dirty suffix to synced offset %d\n", size-syncedLen, syncedLen)
+	}
+	if syncedLen == 0 {
 		return seen, nil
 	}
 
-	// 逐条扫描（记录以 '\n' 分隔；最后一段可能无结尾换行）。崩溃恢复规则：
-	//   - **无结尾换行的最后一段**：恒视为撕裂尾记录 → 截掉（即便能解析）。没有持久化的换行分隔符
-	//     就意味着下次 append 会把新记录直接拼到它后面成一条真损坏行；且该记录属未 Sync 批、源 id
-	//     未 Advance，resume 会重写，截断绝对安全。
-	//   - **有结尾换行的最后一条记录解析失败**：非原子写回下换行可能先于更早字节到盘，故也视为撕裂
-	//     → 截掉。
-	//   - **最后一条之前的任何记录解析失败**：append-only 顺序写下的真损坏（位翻转/篡改），致命。
-	var truncateAt int64 = -1
-	offset := 0
-	n := len(data)
-	for offset < n {
-		nl := bytes.IndexByte(data[offset:], '\n')
-		if nl < 0 {
-			// 无结尾换行的最后一段：撕裂尾记录，整条截掉（不论能否解析）。
-			truncateAt = int64(offset)
-			break
-		}
-		line := data[offset : offset+nl]
-		lineEnd := offset + nl + 1
-		isLast := lineEnd >= n // 换行后已无更多字节 ⇒ 这是最后一条（已带分隔符的）记录
+	data, err := os.ReadFile(path) //nolint:gosec // path 来自运维配置
+	if err != nil {
+		return nil, fmt.Errorf("backfill: read spill for replay: %w", err)
+	}
+	// [0, syncedLen) 是既 fsync、又与 checkpoint 一致的干净前缀：必由完整记录构成、以换行结尾。
+	// 任何偏差（非换行结尾 / 解析失败）都是该持久区内的真损坏，致命。
+	if data[len(data)-1] != '\n' {
+		return nil, fmt.Errorf("backfill: synced spill prefix does not end at a record boundary (real corruption)")
+	}
+	for _, line := range bytes.Split(data[:len(data)-1], []byte{'\n'}) {
 		if len(bytes.TrimSpace(line)) == 0 {
-			offset = lineEnd // 跳过空行
 			continue
 		}
 		var rec dlqRecord
 		if err := json.Unmarshal(line, &rec); err != nil {
-			if isLast {
-				truncateAt = int64(offset) // 撕裂的最后记录（换行先到盘）→ 整条截掉
-				break
-			}
-			// 最后一条之前的完整记录损坏 = 真损坏，致命。
-			return nil, fmt.Errorf("backfill: corrupt non-final spill record during replay (real corruption, not an un-fsynced torn final append): %w", err)
+			return nil, fmt.Errorf("backfill: corrupt record in synced spill prefix during replay (real corruption): %w", err)
 		}
 		seen[dedupKey(rec)] = rec.CreatedAt
-		offset = lineEnd
-	}
-
-	// 截掉未 fsync 的撕裂尾记录（崩溃恢复），让文件回到「全是带分隔符的完整记录」状态可继续 append。
-	if truncateAt >= 0 {
-		if err := os.Truncate(path, truncateAt); err != nil {
-			return nil, fmt.Errorf("backfill: truncate torn trailing spill record (from byte %d) during crash recovery: %w", truncateAt, err)
-		}
-		fmt.Fprintf(os.Stderr, "backfill: recovered spill by truncating a %d-byte un-fsynced torn final record\n", int64(n)-truncateAt)
 	}
 	return seen, nil
 }
@@ -192,9 +217,11 @@ func (s *DLQSpill) Write(rec dlqRecord) error {
 	if err != nil {
 		return fmt.Errorf("backfill: marshal dlq record (id=%d msg=%s): %w", rec.ID, rec.MessageID, err)
 	}
-	if _, err := s.f.Write(append(data, '\n')); err != nil {
+	line := append(data, '\n')
+	if _, err := s.f.Write(line); err != nil {
 		return fmt.Errorf("backfill: write dlq spill (id=%d msg=%s): %w", rec.ID, rec.MessageID, err)
 	}
+	s.pendingLen += int64(len(line))
 	s.seen[key] = rec.CreatedAt
 	return nil
 }
@@ -228,17 +255,71 @@ func (s *DLQSpill) CountInWindow(fromUnix, toUnix int64) int64 {
 	return n
 }
 
-// Sync 把已 append 的 DLQ 记录刷盘（fsync）。**必须在推进 checkpoint 前调用**：否则主机崩溃 /
-// 延迟写回失败可能让 checkpoint 跳过某些 id，而它们的 DLQ 记录尚未落盘 → resume 后 DLQ 漏计、
-// 该行不经手动回退 checkpoint 不可恢复（durability ordering：先让 DLQ 落盘，再推进游标）。
+// Sync 把已 append 的 DLQ 记录刷盘（fsync），再原子推进 offset sidecar 到当前文件长度。
+// **必须在推进 checkpoint 前调用**：否则主机崩溃 / 延迟写回失败可能让 checkpoint 跳过某些 id，
+// 而它们的 DLQ 记录尚未落盘 → resume 后 DLQ 漏计、该行不经手动回退 checkpoint 不可恢复
+// （durability ordering：先让 DLQ 落盘 + offset 记账，再推进游标）。
+//
+// 顺序保证崩溃可恢复：先 fsync spill 内容（[0,pendingLen) 全部持久），再原子写 offset=pendingLen。
+// 若崩在「fsync 后、写 sidecar 前」，offset 仍是旧值，多出的已 fsync 后缀会在重开时被当脏后缀
+// 截掉——保守但安全（那批 checkpoint 也没推进，resume 会重写）。
 func (s *DLQSpill) Sync() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.f == nil {
 		return nil
 	}
+	if s.pendingLen == s.syncedLen {
+		return nil // 无新增，免去重复 fsync / sidecar 写
+	}
 	if err := s.f.Sync(); err != nil {
 		return fmt.Errorf("backfill: sync dlq spill: %w", err)
+	}
+	if err := writeSyncedOffset(s.offsetPath, s.pendingLen); err != nil {
+		return err
+	}
+	s.syncedLen = s.pendingLen
+	return nil
+}
+
+// writeSyncedOffset 原子写 offset sidecar（temp + fsync + rename + fsync dir），使其本身崩溃可恢复。
+func writeSyncedOffset(offsetPath string, off int64) error {
+	dir := filepath.Dir(offsetPath)
+	tmp, err := os.CreateTemp(dir, ".backfill-dlq-synced-*.tmp")
+	if err != nil {
+		return fmt.Errorf("backfill: create temp offset sidecar: %w", err)
+	}
+	tmpName := tmp.Name()
+	cleanup := func() {
+		if rerr := os.Remove(tmpName); rerr != nil && !os.IsNotExist(rerr) {
+			fmt.Fprintf(os.Stderr, "backfill: cleanup temp offset sidecar %s: %v\n", tmpName, rerr)
+		}
+	}
+	closeTmp := func() {
+		if cerr := tmp.Close(); cerr != nil {
+			fmt.Fprintf(os.Stderr, "backfill: close temp offset sidecar %s: %v\n", tmpName, cerr)
+		}
+	}
+	if _, err := tmp.WriteString(strconv.FormatInt(off, 10)); err != nil {
+		closeTmp()
+		cleanup()
+		return fmt.Errorf("backfill: write temp offset sidecar: %w", err)
+	}
+	if err := tmp.Sync(); err != nil {
+		closeTmp()
+		cleanup()
+		return fmt.Errorf("backfill: sync temp offset sidecar: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		cleanup()
+		return fmt.Errorf("backfill: close temp offset sidecar: %w", err)
+	}
+	if err := os.Rename(tmpName, offsetPath); err != nil {
+		cleanup()
+		return fmt.Errorf("backfill: rename offset sidecar into place: %w", err)
+	}
+	if err := fsyncDir(dir); err != nil {
+		return err
 	}
 	return nil
 }
@@ -246,14 +327,25 @@ func (s *DLQSpill) Sync() error {
 // Path 返回 spill 文件路径（日志 / 运维用）。
 func (s *DLQSpill) Path() string { return s.path }
 
-// Close 把缓冲刷盘并关闭文件。
+// Close 把缓冲刷盘（fsync）、推进 offset sidecar 到当前长度，再关闭文件。
+// Close 是**优雅停止**路径（非崩溃），故把已写入的记录全部标记为持久（推进 sidecar）——
+// 与 Sync 同样的「先 fsync 内容、再原子写 sidecar」顺序，下次重开不会把这些已落盘记录当脏后缀截掉。
 func (s *DLQSpill) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.f == nil {
 		return nil
 	}
-	err := s.f.Sync()
+	var err error
+	if s.pendingLen != s.syncedLen {
+		if serr := s.f.Sync(); serr != nil {
+			err = fmt.Errorf("backfill: sync dlq spill on close: %w", serr)
+		} else if oerr := writeSyncedOffset(s.offsetPath, s.pendingLen); oerr != nil {
+			err = oerr
+		} else {
+			s.syncedLen = s.pendingLen
+		}
+	}
 	if cerr := s.f.Close(); cerr != nil && err == nil {
 		err = cerr
 	}

@@ -51,6 +51,13 @@ it lands two classes of "not in ES body index" rows into a **local DLQ spill fil
 That exact count is fed into the reconcile gate as the authoritative `DLQ` input, so
 legitimately-DLQ'd messages are **not** misjudged as ES-missing.
 
+**Crash recovery.** The spill is append-only; each batch fsyncs the spill and then
+atomically advances a durable offset sidecar (`<spill-dir>/backfill-dlq.synced`)
+*before* the checkpoint advances. On restart the spill is truncated to that synced
+offset, discarding the entire un-fsynced dirty suffix (whatever its torn shape) — those
+rows belong to a batch whose checkpoint never advanced, so resume re-derives them. Any
+parse error *within* the synced prefix is treated as real corruption and is fatal.
+
 ## Reconciliation gate (correctness gate)
 
 The job can run the gate inline (`-reconcile -from <epoch> -to <epoch>`) using its own
