@@ -259,6 +259,27 @@ func TestDLQSpill_NonTrailingCorruptionFatal(t *testing.T) {
 	}
 }
 
+// TestDLQSpill_RecoverNewlineTerminatedFinalCorrupt 🔴 P1（精修）：非原子写回下，最后一条记录
+// 即便结尾换行已落盘，更早字节也可能陈旧。故**最后一条记录**解析失败（即便以换行结尾）→ 截断恢复，
+// 不致命（它属未 Sync 批、源 id 未 Advance，resume 会重写）。
+func TestDLQSpill_RecoverNewlineTerminatedFinalCorrupt(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "d")
+	// 一条合法完整行 + 最后一条「以换行结尾但损坏」的记录（撕裂的最终 append）。
+	content := validLine(t, "m1", 100) + "{half-written-final-record}\n"
+	path := writeRawSpill(t, dir, content)
+	s, err := OpenDLQSpill(dir)
+	if err != nil {
+		t.Fatalf("newline-terminated torn FINAL record must recover (truncate), got: %v", err)
+	}
+	defer mustCloseT(t, s)
+	if s.Count() != 1 {
+		t.Fatalf("recovered count must be 1 (the valid line), got %d", s.Count())
+	}
+	if got := countLines(string(mustRead(t, path))); got != 1 {
+		t.Fatalf("torn final record must be truncated, file should have 1 line, got %d", got)
+	}
+}
+
 // TestDLQSpill_AllCompleteLinesNoTruncate 全是完整行（末行有换行）→ 不截断、不豁免，全部计入。
 func TestDLQSpill_AllCompleteLinesNoTruncate(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "d")
