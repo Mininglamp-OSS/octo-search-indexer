@@ -85,6 +85,8 @@ type kafkaDLQSink struct {
 }
 
 // newKafkaDLQSink 建 DLQ producer（RequireAll，保证 DLQ 持久化；失败由 dlqHandler 重试/逃逸）。
+// AllowAutoTopicCreation=false：DLQ topic 须由部署侧预建——避免 topic 名拼错时静默建出错误 topic
+// 把毒丸写进黑洞（P2-3）。
 func newKafkaDLQSink(brokers []string, dlqTopic string) (*kafkaDLQSink, error) {
 	if len(brokers) == 0 || dlqTopic == "" {
 		return nil, fmt.Errorf("consumer: DLQ brokers and topic required")
@@ -95,7 +97,7 @@ func newKafkaDLQSink(brokers []string, dlqTopic string) (*kafkaDLQSink, error) {
 		Balancer:               &kafka.Hash{},
 		RequiredAcks:           kafka.RequireAll,
 		Async:                  false,
-		AllowAutoTopicCreation: true,
+		AllowAutoTopicCreation: false,
 	}
 	return &kafkaDLQSink{writer: w}, nil
 }

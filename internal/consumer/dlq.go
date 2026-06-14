@@ -57,7 +57,7 @@ type dlqHandler struct {
 	sink    dlqSink
 	alert   alerter
 	cfg     dlqConfig
-	sleep   func(time.Duration) // 可注入（测试免真 sleep）
+	sleep   func(context.Context, time.Duration) error // ctx-aware（测试注入即时返回）
 	nowUnix func() int64
 }
 
@@ -66,7 +66,7 @@ func newDLQHandler(sink dlqSink, alert alerter, cfg dlqConfig) *dlqHandler {
 		sink:    sink,
 		alert:   alert,
 		cfg:     cfg,
-		sleep:   func(d time.Duration) { time.Sleep(d) },
+		sleep:   sleepCtx,
 		nowUnix: func() int64 { return time.Now().Unix() },
 	}
 }
@@ -90,7 +90,10 @@ func (h *dlqHandler) Send(ctx context.Context, rec dlqRecord) error {
 			return cerr
 		}
 		if attempt > 0 {
-			h.sleep(h.cfg.RetryBackoff * time.Duration(attempt))
+			// 指数退避 + 满抖动 + ctx 感知（P2-1/P2-2）：缓解多副本 thundering herd，且 SIGTERM 即停。
+			if serr := h.sleep(ctx, expJitterBackoff(h.cfg.RetryBackoff, attempt)); serr != nil {
+				return serr
+			}
 		}
 		if werr := h.sink.WriteDLQ(ctx, rec.Key, value); werr == nil {
 			return nil // DLQ 投递成功，终态处理完成

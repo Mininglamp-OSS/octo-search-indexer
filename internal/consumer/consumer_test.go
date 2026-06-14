@@ -173,9 +173,9 @@ func newProc(t *testing.T, src messageSource, w esindex.Writer, sink dlqSink, al
 	t.Helper()
 	dcfg := dlqConfig{MaxRetries: 2, RetryBackoff: time.Millisecond, SpillDir: spillDir}
 	dlq := newDLQHandler(sink, alert, dcfg)
-	dlq.sleep = func(time.Duration) {}
+	dlq.sleep = func(context.Context, time.Duration) error { return nil }
 	p := NewProcessor(src, w, dlq, alert, Config{BatchSize: 10, TransientBackoff: time.Millisecond})
-	p.sleep = func(time.Duration) {}
+	p.sleep = func(context.Context, time.Duration) error { return nil }
 	return p
 }
 

@@ -66,6 +66,10 @@ func NewService(cfg ServiceConfig) (*Service, error) {
 
 	dlqSink, err := newKafkaDLQSink(cfg.Brokers, cfg.DLQTopic)
 	if err != nil {
+		// 避免已建好的 source reader 泄漏（P2-4：构造器后段出错须回收前段资源）。
+		if cerr := source.Close(); cerr != nil {
+			log.Printf("consumer: close source after DLQ-sink init failure: %v", cerr)
+		}
 		return nil, err
 	}
 

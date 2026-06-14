@@ -38,9 +38,9 @@ type Processor struct {
 	dlq       *dlqHandler
 	alert     alerter
 	batchSize int
-	// transientBackoff 是整批含 transient 时、原地退避重试的间隔（offset 不前进）。
+	// transientBackoff 是整批含 transient 时、原地退避重试的间隔基（指数+抖动，offset 不前进）。
 	transientBackoff time.Duration
-	sleep            func(time.Duration)
+	sleep            func(context.Context, time.Duration) error
 }
 
 // Config 配置 Processor。
@@ -68,7 +68,7 @@ func NewProcessor(src messageSource, writer esindex.Writer, dlq *dlqHandler, ale
 		alert:            alert,
 		batchSize:        cfg.BatchSize,
 		transientBackoff: cfg.TransientBackoff,
-		sleep:            func(d time.Duration) { time.Sleep(d) },
+		sleep:            sleepCtx,
 	}
 }
 
@@ -142,7 +142,10 @@ func (p *Processor) processBatch(ctx context.Context, batch []fetchedMessage) er
 		}
 		if attempt > 0 {
 			// 🔴 C4 原地重试：退避后重跑**同一批**未终态条目，不拉新 offset。
-			p.sleep(p.transientBackoff)
+			// 指数退避 + 满抖动 + ctx 感知（P2-1/P2-2）：缓解多副本 thundering herd，SIGTERM 即停。
+			if serr := p.sleep(ctx, expJitterBackoff(p.transientBackoff, attempt)); serr != nil {
+				return serr
+			}
 		}
 
 		// 仅对仍 transient 的条目重跑（已 OK / 已进 DLQ 的不再处理）。

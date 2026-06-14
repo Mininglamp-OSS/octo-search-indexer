@@ -10,7 +10,7 @@ import (
 
 func newTestDLQ(sink dlqSink, alert alerter, spillDir string) *dlqHandler {
 	h := newDLQHandler(sink, alert, dlqConfig{MaxRetries: 2, RetryBackoff: time.Millisecond, SpillDir: spillDir})
-	h.sleep = func(time.Duration) {}
+	h.sleep = func(context.Context, time.Duration) error { return nil }
 	h.nowUnix = func() int64 { return 1700000000 }
 	return h
 }
