@@ -3,15 +3,6 @@
     "index": {
       "number_of_shards": 1,
       "number_of_replicas": 1
-    },
-    "analysis": {
-      "analyzer": {
-        "octo_cjk_text": {
-          "type": "custom",
-          "tokenizer": "standard",
-          "filter": ["lowercase", "cjk_width", "cjk_bigram"]
-        }
-      }
     }
   },
   "mappings": {
@@ -24,7 +15,8 @@
       "from_uid":       { "type": "keyword" },
       "content": {
         "type": "text",
-        "analyzer": "octo_cjk_text"
+        "analyzer": "ik_max_word",
+        "search_analyzer": "ik_smart"
       },
       "content_type":   { "type": "integer" },
       "raw_excluded":   { "type": "boolean" },

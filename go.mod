@@ -4,6 +4,7 @@ go 1.25
 
 require (
 	github.com/Mininglamp-OSS/octo-lib v0.0.0-20260614033907-f62e626a34db
+	github.com/go-sql-driver/mysql v1.7.1
 	github.com/opensearch-project/opensearch-go/v3 v3.1.0
 	github.com/segmentio/kafka-go v0.4.51
 )

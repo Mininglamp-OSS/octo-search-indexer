@@ -237,7 +237,7 @@ func TestEnsureIndex_CreatesWhenMissing(t *testing.T) {
 	if !createCalled {
 		t.Fatalf("expected index create (PUT) when missing")
 	}
-	if !strings.Contains(createBody, "octo_cjk_text") || !strings.Contains(createBody, `"content"`) {
+	if !strings.Contains(createBody, "ik_max_word") || !strings.Contains(createBody, `"content"`) {
 		t.Fatalf("create body must carry embedded mapping/analyzer, got: %s", createBody)
 	}
 }
