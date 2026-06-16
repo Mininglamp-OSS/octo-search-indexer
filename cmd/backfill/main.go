@@ -11,6 +11,8 @@
 //   - 限速 ≤5k docs/s（默认）；checkpoint 续传（已灌 message_id 高水位，与实时游标物理隔离）。
 //   - 真异常 / ES 永久拒绝落本地 DLQ spill 并精确计数，作为对账门权威输入。
 //   - 配置全走 flag / env。运行结束后建议跑 cmd/reconcile（或 -reconcile 内联对账门）核验。
+//     -reconcile 内联门含 count 对账 **+ 字段级抽样比对**（-recon-sample，默认 200）：
+//     count 只证条数、抽样证 reader 契约关键字段（spaceId/visibles/messageSeq 等）内容一致。
 //
 // 🔴 隔离纪律：本作业对真实环境执行需 Yu / 运维显式 sign-off 后低峰触发，绝不自动跑生产。
 //
@@ -68,6 +70,8 @@ func run() error {
 		doRecon    = flag.Bool("reconcile", false, "after backfill, run the reconcile gate (requires -from/-to)")
 		fromUnix   = flag.Int64("from", 0, "reconcile window start (epoch seconds, inclusive)")
 		toUnix     = flag.Int64("to", 0, "reconcile window end (epoch seconds, inclusive; 0 = now)")
+		sampleN    = flag.Int("recon-sample", envInt("BACKFILL_RECON_SAMPLE", 200), "reconcile field-level sample size (0 disables field sampling, count gate only)")
+		maxDet     = flag.Int("recon-sample-max-details", envInt("BACKFILL_RECON_SAMPLE_MAX_DETAILS", 50), "cap on sample-mismatch detail entries in the report")
 	)
 	flag.Parse()
 
@@ -145,7 +149,7 @@ func run() error {
 	}
 
 	if *doRecon {
-		return reconcile(ctx, db, splitCSV(*esAddrs), *esUser, *esPass, *esIndex, tables, *fromUnix, *toUnix, dlq)
+		return reconcile(ctx, db, splitCSV(*esAddrs), *esUser, *esPass, *esIndex, tables, *fromUnix, *toUnix, *sampleN, *maxDet, dlq)
 	}
 	log.Printf("backfill complete. Run cmd/reconcile (or re-run with -reconcile -from/-to) to gate correctness. Total DLQ count: %d", dlq.Count())
 	return nil
@@ -155,8 +159,14 @@ func run() error {
 // 🔴 用**按窗** DLQ 计数（CountInWindow）：reconcile 窗可能不覆盖本次 run 处理的全部行
 // （如分批跑、或只校验某个时间段），用全量 dlqCount 会把窗外的 DLQ 行也减掉 → false
 // mismatch/false OK（codex review P2-window）。
+//
+// 🔴 字段级抽样门（YUJ-4701 落地 Jerry-Xin non-blocking）：count 门只证「条数」一致，不证
+// 「内容」一致。复用 recon.CompareSamples 逐字段核对 reader 契约关键字段（messageId/channelId/
+// channelType/spaceId/visibles/messageSeq），检出「条数对得上但字段错位」的静默 drift——backfill
+// 正是富化 spaceId/visibles/messageSeq 的唯一路径，这些字段错位最该在 backfill 后立即拦住。
+// sampleN<=0 时退回纯 count 门（与 cmd/reconcile -sample 0 同口径）。
 // 对平退出码 0；不对平返回错误（main 退出码 1）作为 STOP 信号。
-func reconcile(ctx context.Context, db *sql.DB, esAddrs []string, user, pass, index string, tables []string, fromUnix, toUnix int64, dlq *backfill.DLQSpill) error {
+func reconcile(ctx context.Context, db *sql.DB, esAddrs []string, user, pass, index string, tables []string, fromUnix, toUnix int64, sampleN, maxDet int, dlq *backfill.DLQSpill) error {
 	to := toUnix
 	if to == 0 {
 		to = time.Now().Unix()
@@ -200,9 +210,30 @@ func reconcile(ctx context.Context, db *sql.DB, esAddrs []string, user, pass, in
 	if err != nil {
 		return fmt.Errorf("reconcile inputs not self-consistent: %w", err)
 	}
-	log.Printf("reconcile gate: %s", report.String())
-	if !report.OK {
-		return fmt.Errorf("reconcile MISMATCH (diff=%d): backfill correctness gate FAILED — STOP, do not proceed", report.Diff)
+
+	full := recon.FullReport{Count: report, RanAtUnixSeconds: time.Now().Unix()}
+	full.Window.FromUnix = fromUnix
+	full.Window.ToUnix = to
+
+	// 字段级抽样门（count 门不证内容一致）。
+	if sampleN > 0 {
+		sampleReader := recon.NewMySQLSampleReader(db, tables)
+		docFetcher := recon.NewOSDocFetcher(osClient, index)
+		// 排除本批已落 DLQ spill 的真异常 / 永久拒绝行：它们本就不该在 ES 正文索引里
+		// （count 门已用同一 DLQ 计数抵消），抽样命中时不能再算成 missing（口径冲突 → false MISMATCH）。
+		excluded := dlq.MessageIDsInWindow(fromUnix, to)
+		sample, serr := recon.CompareSamplesExcluding(ctx, sampleReader, docFetcher, fromUnix, to, sampleN, maxDet, excluded)
+		if serr != nil {
+			return fmt.Errorf("sample compare: %w", serr)
+		}
+		full.Sample = sample
+	}
+
+	log.Printf("reconcile gate: %s", full.String())
+	if !full.Healthy() {
+		return fmt.Errorf("reconcile MISMATCH (count diff=%d, sample mismatch=%d missing=%d): "+
+			"backfill correctness gate FAILED — STOP, do not proceed",
+			report.Diff, full.Sample.Mismatch, full.Sample.Missing)
 	}
 	return nil
 }

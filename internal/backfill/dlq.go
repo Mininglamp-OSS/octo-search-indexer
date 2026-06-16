@@ -48,10 +48,18 @@ type DLQSpill struct {
 
 	mu         sync.Mutex
 	f          *os.File
-	seen       map[string]int64 // dedup key (message_id) -> created_at（按窗计数用）
-	pendingLen int64            // 当前文件总字节数（含尚未 fsync 的 append）
-	syncedLen  int64            // 已 fsync 且已记入 offset sidecar 的持久长度（字节）
+	seen       map[string]dlqMeta // dedup key (message_id, 空则 table:id) -> 记账元数据
+	pendingLen int64              // 当前文件总字节数（含尚未 fsync 的 append）
+	syncedLen  int64              // 已 fsync 且已记入 offset sidecar 的持久长度（字节）
 	nowUnix    func() int64
+}
+
+// dlqMeta 是单条去重 DLQ 记录的记账元数据。createdAt 供按窗对账；messageID 是源行的**真实**
+// message_id（可能为空——空 message_id 行的去重键退化为 table:id，但其真实 message_id 仍记为空），
+// 供抽样门排除集用：只有非空 message_id 才能与 ES doc / 抽样行对齐，故 MessageIDsInWindow 只吐非空值。
+type dlqMeta struct {
+	createdAt int64
+	messageID string
 }
 
 // OpenDLQSpill 打开（或创建）spill 文件，并从既有内容重建去重集 + 计数（resume 安全）。
@@ -127,8 +135,8 @@ func readSyncedOffset(offsetPath string) (int64, error) {
 
 // recoverAndLoad 把 spill 截断到 syncedLen（丢弃未 fsync 的脏后缀），再严格解析 [0, syncedLen)
 // 干净前缀，重建去重集 + 计数。
-func recoverAndLoad(path string, syncedLen int64) (map[string]int64, error) {
-	seen := map[string]int64{}
+func recoverAndLoad(path string, syncedLen int64) (map[string]dlqMeta, error) {
+	seen := map[string]dlqMeta{}
 	info, err := os.Stat(path)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -172,7 +180,7 @@ func recoverAndLoad(path string, syncedLen int64) (map[string]int64, error) {
 		if err := json.Unmarshal(line, &rec); err != nil {
 			return nil, fmt.Errorf("backfill: corrupt record in synced spill prefix during replay (real corruption): %w", err)
 		}
-		seen[dedupKey(rec)] = rec.CreatedAt
+		seen[dedupKey(rec)] = dlqMeta{createdAt: rec.CreatedAt, messageID: rec.MessageID}
 	}
 	return seen, nil
 }
@@ -222,7 +230,7 @@ func (s *DLQSpill) Write(rec dlqRecord) error {
 		return fmt.Errorf("backfill: write dlq spill (id=%d msg=%s): %w", rec.ID, rec.MessageID, err)
 	}
 	s.pendingLen += int64(len(line))
-	s.seen[key] = rec.CreatedAt
+	s.seen[key] = dlqMeta{createdAt: rec.CreatedAt, messageID: rec.MessageID}
 	return nil
 }
 
@@ -247,12 +255,29 @@ func (s *DLQSpill) CountInWindow(fromUnix, toUnix int64) int64 {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var n int64
-	for _, createdAt := range s.seen {
-		if createdAt >= fromUnix && createdAt <= toUnix {
+	for _, m := range s.seen {
+		if m.createdAt >= fromUnix && m.createdAt <= toUnix {
 			n++
 		}
 	}
 	return n
+}
+
+// MessageIDsInWindow 返回 created_at ∈ [fromUnix, toUnix] 的去重 DLQ 记录的**真实** message_id 集合。
+// 用于字段级抽样对账门（recon.CompareSamplesExcluding）：这些行**本应不在** ES 正文索引里
+// （真异常 / 永久拒绝，已记账为 DLQ），故抽样命中它们时「ES 无 doc」是预期，不算 missing。
+// 注意：空 message_id（源行 message_id 缺失/为空）不进集合——这类行去重键退化为 table:id，无法与
+// ES doc / 抽样行（抽样器按 message_id 取行）对齐，不会被抽到，吐出 table:id 反而会污染排除集。
+func (s *DLQSpill) MessageIDsInWindow(fromUnix, toUnix int64) map[string]bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make(map[string]bool)
+	for _, m := range s.seen {
+		if m.messageID != "" && m.createdAt >= fromUnix && m.createdAt <= toUnix {
+			out[m.messageID] = true
+		}
+	}
+	return out
 }
 
 // Sync 把已 append 的 DLQ 记录刷盘（fsync），再原子推进 offset sidecar 到当前文件长度。

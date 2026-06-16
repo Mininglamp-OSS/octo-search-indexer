@@ -160,6 +160,61 @@ func TestDLQSpill_CountInWindow(t *testing.T) {
 	}
 }
 
+// TestDLQSpill_MessageIDsInWindow 返回窗内 DLQ 行的 message_id 集合（抽样门排除集），
+// 与 CountInWindow 同窗口口径；空 message_id 不入集合。
+func TestDLQSpill_MessageIDsInWindow(t *testing.T) {
+	s, err := OpenDLQSpill(filepath.Join(t.TempDir(), "d"))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer mustCloseT(t, s)
+	writes := []dlqRecord{
+		{ID: 1, MessageID: "before", CreatedAt: 50},
+		{ID: 2, MessageID: "in1", CreatedAt: 150},
+		{ID: 3, MessageID: "in2", CreatedAt: 200},
+		{ID: 4, MessageID: "after", CreatedAt: 500},
+	}
+	for _, w := range writes {
+		if err := s.Write(w); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+	}
+	got := s.MessageIDsInWindow(100, 300)
+	if len(got) != 2 || !got["in1"] || !got["in2"] {
+		t.Fatalf("window [100,300] must yield {in1,in2}, got %v", got)
+	}
+	if got["before"] || got["after"] {
+		t.Fatalf("out-of-window ids must be excluded: %v", got)
+	}
+}
+
+// TestDLQSpill_MessageIDsInWindow_SkipsEmptyID 空 message_id 行（去重键退化为 table:id）
+// 不得把 table:id 当成 message_id 吐进排除集——否则会污染抽样门排除集（codex P2）。
+func TestDLQSpill_MessageIDsInWindow_SkipsEmptyID(t *testing.T) {
+	s, err := OpenDLQSpill(filepath.Join(t.TempDir(), "d"))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer mustCloseT(t, s)
+	if err := s.Write(dlqRecord{Table: "message", ID: 123, MessageID: "", CreatedAt: 150}); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := s.Write(dlqRecord{Table: "message", ID: 124, MessageID: "real1", CreatedAt: 160}); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	// 两行都在窗内、都计数；但排除集只含真实非空 message_id。
+	if got := s.CountInWindow(100, 300); got != 2 {
+		t.Fatalf("CountInWindow must count both rows, got %d", got)
+	}
+	got := s.MessageIDsInWindow(100, 300)
+	if len(got) != 1 || !got["real1"] {
+		t.Fatalf("exclusion set must contain only real non-empty message_id {real1}, got %v", got)
+	}
+	if got["message:123"] {
+		t.Fatalf("table:id fallback key must NOT leak into exclusion set: %v", got)
+	}
+}
+
 // TestDLQSpill_Sync Sync 刷盘后记录可被另一个只读 reopen 看到（落盘可见性）。
 func TestDLQSpill_Sync(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "d")

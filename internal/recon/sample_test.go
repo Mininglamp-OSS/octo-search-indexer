@@ -56,6 +56,85 @@ func TestCompareSamples_MissingDoc(t *testing.T) {
 	}
 }
 
+// TestCompareSamplesExcluding_DLQRowNotMissing 已知 DLQ 行（本就不该在 ES）被抽样命中时
+// 不计 missing、不计 Sampled——避免 inline backfill 对账门把合法 DLQ 行误判成漏灌 false MISMATCH。
+func TestCompareSamplesExcluding_DLQRowNotMissing(t *testing.T) {
+	src := &fakeSampleSrc{rows: []SampleRow{
+		{MessageID: "10", ChannelID: "g1", ChannelType: 2},  // 正常：ES 有 doc
+		{MessageID: "99", ChannelID: "gx", ChannelType: 2},  // DLQ 真异常：ES 无 doc，预期排除
+	}}
+	es := &fakeESFetch{docs: map[string]ESDocFields{
+		"10": {MessageID: 10, ChannelID: "g1", ChannelType: 2},
+	}}
+	excluded := map[string]bool{"99": true}
+	res, err := CompareSamplesExcluding(context.Background(), src, es, 0, 100, 100, 50, excluded)
+	if err != nil {
+		t.Fatalf("CompareSamplesExcluding: %v", err)
+	}
+	if res.Sampled != 1 || res.Missing != 0 || res.Mismatch != 0 {
+		t.Fatalf("excluded DLQ row must be skipped (not missing, not sampled): %+v", res)
+	}
+}
+
+// TestCompareSamplesExcluding_NilSameAsCompare excluded 为 nil 时行为与 CompareSamples 完全一致
+// （DLQ 行仍按 missing 计——无排除集时该行确实是漏灌证据）。
+func TestCompareSamplesExcluding_NilSameAsCompare(t *testing.T) {
+	src := &fakeSampleSrc{rows: []SampleRow{{MessageID: "11", ChannelID: "g", ChannelType: 1}}}
+	es := &fakeESFetch{docs: map[string]ESDocFields{}}
+	res, err := CompareSamplesExcluding(context.Background(), src, es, 0, 100, 100, 50, nil)
+	if err != nil {
+		t.Fatalf("CompareSamplesExcluding: %v", err)
+	}
+	if res.Missing != 1 || res.Sampled != 1 {
+		t.Fatalf("nil excluded must match CompareSamples semantics: %+v", res)
+	}
+}
+
+// TestCompareSamplesExcluding_SkipsEmptyMessageID 空 message_id 源行不可与 ES doc(_id) 对齐，
+// 也进不了 DLQ 排除集（去重键退化为 table:id），故既不计 Sampled 也不计 Missing——避免合法
+// backfill run 被这类行 false-fail（codex R2）。
+func TestCompareSamplesExcluding_SkipsEmptyMessageID(t *testing.T) {
+	src := &fakeSampleSrc{rows: []SampleRow{
+		{MessageID: "", ChannelID: "g", ChannelType: 2},   // 空 id：不可比对，跳过
+		{MessageID: "10", ChannelID: "g", ChannelType: 2}, // 正常
+	}}
+	es := &fakeESFetch{docs: map[string]ESDocFields{
+		"10": {MessageID: 10, ChannelID: "g", ChannelType: 2},
+	}}
+	res, err := CompareSamplesExcluding(context.Background(), src, es, 0, 100, 100, 50, nil)
+	if err != nil {
+		t.Fatalf("CompareSamplesExcluding: %v", err)
+	}
+	if res.Sampled != 1 || res.Missing != 0 || res.Mismatch != 0 {
+		t.Fatalf("empty message_id row must be skipped (not missing): %+v", res)
+	}
+}
+
+// TestCompareSamplesExcluding_OversamplesForCoverage 当窗内前若干行恰好全是 DLQ 行时，过采样
+// 应补回足额非排除行，使有效比对数稳定 ≈ limit（codex P2：不削弱高 DLQ 窗的内容门覆盖）。
+func TestCompareSamplesExcluding_OversamplesForCoverage(t *testing.T) {
+	// limit=2；前 2 行（升序 message_id）是 DLQ 行，后 2 行是正常行。
+	src := &fakeSampleSrc{rows: []SampleRow{
+		{MessageID: "10", ChannelID: "g", ChannelType: 2}, // DLQ
+		{MessageID: "20", ChannelID: "g", ChannelType: 2}, // DLQ
+		{MessageID: "30", ChannelID: "g", ChannelType: 2}, // 正常
+		{MessageID: "40", ChannelID: "g", ChannelType: 2}, // 正常
+	}}
+	es := &fakeESFetch{docs: map[string]ESDocFields{
+		"30": {MessageID: 30, ChannelID: "g", ChannelType: 2},
+		"40": {MessageID: 40, ChannelID: "g", ChannelType: 2},
+	}}
+	excluded := map[string]bool{"10": true, "20": true}
+	res, err := CompareSamplesExcluding(context.Background(), src, es, 0, 100, 2, 50, excluded)
+	if err != nil {
+		t.Fatalf("CompareSamplesExcluding: %v", err)
+	}
+	// 过采样补偿后应比对到 2 个正常行（30,40），0 missing 0 mismatch——而非被前两行掏空成 0。
+	if res.Sampled != 2 || res.Missing != 0 || res.Mismatch != 0 {
+		t.Fatalf("oversampling must preserve coverage (want sampled=2 clean): %+v", res)
+	}
+}
+
 // TestCompareSamples_SpaceIDVisiblesMismatch spaceId / visibles 字段错位 → mismatch（V1b/V3b 的对账闸）。
 func TestCompareSamples_SpaceIDVisiblesMismatch(t *testing.T) {
 	src := &fakeSampleSrc{rows: []SampleRow{

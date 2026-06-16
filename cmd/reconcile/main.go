@@ -182,7 +182,11 @@ func pushReport(ctx context.Context, url, token string, payload recon.PushPayloa
 	if err != nil {
 		return err
 	}
-	defer func() { _ = resp.Body.Close() }()
+	defer func() {
+		if cerr := resp.Body.Close(); cerr != nil {
+			log.Printf("reconcile: close push response body: %v", cerr)
+		}
+	}()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return fmt.Errorf("push returned status %d", resp.StatusCode)
 	}

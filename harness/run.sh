@@ -7,11 +7,32 @@
 # controlled message suite, and asserts the C2/C4 + idempotency + IK-tokenization
 # invariants. Throwaway local stack ONLY — never wired into a shared environment.
 #
+# 🔒 v1.9 LIVE-INGESTION SAFETY GATE (YUJ-4698 / Jerry-Xin Critical):
+#   The live consumer (internal/consumer.Service.Run) refuses to start while the
+#   Kafka contract (octo-lib searchmsg.SchemaVersion) does not carry the reader
+#   safety fields spaceId/visibles/messageSeq (i.e. SchemaVersion < 2). Writing
+#   live docs without those fields would fail-OPEN the reader's visibles gate, so
+#   the gate is fail-CLOSED by design and is NOT bypassable from this harness.
+#
+#   Consequence: at the current contract (SchemaVersion=1) `run.sh all` cannot
+#   drive a Kafka->consumer->OpenSearch e2e — the indexer exits before consuming.
+#   This script detects that up front (./harness/contractgate) and tells you to
+#   use ./harness/run-backfill.sh, which IS the v1.9 e2e path: only backfill can
+#   populate the safety fields (read straight from MySQL payload), so it exercises
+#   the full v1.9 reader contract end to end. When octo-lib bumps SchemaVersion>=2
+#   (phase 9 producer enrichment), the gate auto-unlocks and `run.sh all` drives
+#   the live path again — no harness change needed.
+#
 # Usage:
 #   ./harness/run.sh            # full run: up -> indexer -> seed -> verify -> down
+#                               #   (auto-skips with guidance while the live gate is closed)
 #   ./harness/run.sh up         # just bring the stack up
 #   ./harness/run.sh down       # tear the stack down (+volumes)
+#   ./harness/run.sh gate       # print the live-ingestion gate state and exit
 #   KEEP_UP=1 ./harness/run.sh  # leave the stack running after verify
+#   FORCE_LIVE=1 ./harness/run.sh  # (advanced) run live path even if gate reports closed;
+#                               #   the indexer still enforces its own gate, so this only
+#                               #   makes sense once the contract is bumped to SchemaVersion>=2
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -23,6 +44,65 @@ ES_URL="${ES_URL:-http://localhost:19200}"
 ES_INDEX="${ES_INDEX:-octo-message}"
 
 compose() { docker compose "$@"; }
+
+# live_gate_open reports whether the live-ingestion safety gate is currently OPEN
+# (contract carries spaceId/visibles/messageSeq, SchemaVersion>=2). It delegates to
+# ./harness/contractgate, which imports the SAME predicate the production consumer
+# uses (esindex.LiveContractCarriesSafetyFields) so it can never disagree with the
+# indexer's own startup check.
+#
+# contractgate exit codes: 0 = gate OPEN, 10 = gate CLOSED (gated by design). Any
+# OTHER non-zero (compile error, broken import, missing Go toolchain) is a broken
+# probe, NOT a closed gate — we must fail loudly rather than treat a broken harness
+# as a passing skip (would mask real breakage).
+#
+# NB: we `go build` the probe to a temp binary and run THAT, rather than `go run`:
+# `go run` collapses any non-zero program exit to 1, which would make the gated
+# exit 10 indistinguishable from a compile error. Building first preserves the
+# probe's real exit code (and a build failure is itself surfaced as a probe error).
+#
+# Returns: 0 = open, 10 = closed-by-design, other = probe error (caller must abort).
+live_gate_open() {
+  local bin="/tmp/octo-contractgate.bin"
+  if ! ( cd "$ROOT" && go build -o "$bin" ./harness/contractgate ) >/tmp/octo-contractgate.out 2>&1; then
+    return 3 # build failed → broken probe
+  fi
+  "$bin" >/tmp/octo-contractgate.out 2>&1
+}
+
+gate() {
+  echo "[harness] checking live-ingestion safety gate (octo-lib contract)..."
+  local rc=0
+  live_gate_open || rc=$?
+  if [[ $rc -eq 0 ]]; then
+    echo "[harness] gate=OPEN — $(cat /tmp/octo-contractgate.out)"
+    echo "[harness] live Kafka->consumer->OpenSearch e2e is available."
+    return 0
+  fi
+  if [[ $rc -ne 10 ]]; then
+    echo "[harness] FATAL: contract gate probe failed (exit $rc) — this is a broken probe," >&2
+    echo "[harness] not a closed gate. Refusing to skip silently. Probe output:" >&2
+    sed 's/^/[harness]   /' /tmp/octo-contractgate.out >&2
+    return 2
+  fi
+  echo "[harness] gate=CLOSED — $(cat /tmp/octo-contractgate.out)"
+  cat >&2 <<'GATE'
+[harness] The live consumer refuses to start at this contract version: the Kafka
+[harness] contract does not yet carry the reader safety fields (spaceId/visibles/
+[harness] messageSeq), so live ingestion would fail-OPEN the reader's visibles gate.
+[harness] This is the v1.9 fail-CLOSED safety gate (by design), not a harness bug.
+[harness]
+[harness] v1.9 end-to-end verification path → use the backfill harness instead:
+[harness]     ./harness/run-backfill.sh
+[harness] It populates spaceId/visibles/messageSeq from MySQL payload and asserts the
+[harness] full v1.9 reader contract (camelCase nested doc, IK 中文 recall, reconcile gate)
+[harness] end to end against real OpenSearch.
+[harness]
+[harness] When octo-lib bumps SchemaVersion>=2 (phase 9 producer enrichment), this gate
+[harness] auto-unlocks and `./harness/run.sh all` drives the live path again.
+GATE
+  return 1
+}
 
 up() {
   echo "[harness] building + starting Kafka + OpenSearch(IK)..."
@@ -138,9 +218,31 @@ verify() {
 case "${1:-all}" in
   up) up ;;
   down) down ;;
+  gate) gate ;;
   seed) seed ;;
   verify) verify ;;
   all)
+    # 🔒 v1.9 gate pre-flight: the live consumer will refuse to start while the
+    # contract lacks safety fields, so seed/verify can never pass. Detect that
+    # up front and point at the backfill harness instead of bringing up a stack
+    # that the indexer would immediately bail out of. FORCE_LIVE=1 overrides for
+    # when the contract has been bumped (the indexer still self-enforces the gate).
+    #
+    # Distinguish closed-by-design (gate rc=1, skip cleanly) from a BROKEN probe
+    # (gate rc>=2, e.g. compile error): a broken probe must abort, not masquerade
+    # as a passing skip.
+    if [[ "${FORCE_LIVE:-0}" != "1" ]]; then
+      grc=0
+      gate || grc=$?
+      if [[ $grc -ge 2 ]]; then
+        echo "[harness] aborting: contract gate probe is broken (see error above)." >&2
+        exit "$grc"
+      fi
+      if [[ $grc -ne 0 ]]; then
+        echo "[harness] skipping live e2e (gate closed). See guidance above." >&2
+        exit 0
+      fi
+    fi
     up
     run_indexer
     trap 'stop_indexer' EXIT
@@ -150,5 +252,5 @@ case "${1:-all}" in
     if [[ "${KEEP_UP:-0}" != "1" ]]; then down; fi
     echo "[harness] e2e run complete."
     ;;
-  *) echo "usage: $0 {all|up|down|seed|verify}"; exit 1 ;;
+  *) echo "usage: $0 {all|up|down|gate|seed|verify}"; exit 1 ;;
 esac

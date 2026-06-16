@@ -12,6 +12,25 @@ seed → Kafka octo.message.v1 → es-indexer consumer → OpenSearch (analysis-
 > `messageSeq`，alias `wukongim-messages-read`）。harness 的 message_id 因此用**数值** snowflake 串
 > （reader 读 `messageId` 为 long；非数值串会被判毒丸进 DLQ）。详见 `docs/forward-migration-v1.9.md`。
 
+> 🔒 **v1.9 实时写入安全门（YUJ-4698 / Jerry-Xin Critical）— 决定该用哪条 e2e 路径。**
+> 实时 consumer（`internal/consumer.Service.Run`）在 Kafka 契约（octo-lib `searchmsg.SchemaVersion`）
+> **未携带** reader 安全字段（`spaceId`/`visibles`/`messageSeq`，即 `SchemaVersion < 2`）时**拒启动**
+> （fail-CLOSED）：放行会让 reader 对空 `visibles` fail-OPEN（普通成员搜出群管才可见消息）。这是
+> 生产安全设计，**harness 不可绕过、也不应削弱**。
+>
+> 后果：当前契约 `SchemaVersion=1` 下，**`./harness/run.sh all`（Kafka→consumer→OpenSearch
+> 实时链）跑不通**——indexer 在消费前就退出。`run.sh` 会先跑 `./harness/contractgate`（复用
+> consumer 同一判定 `esindex.LiveContractCarriesSafetyFields()`，永不与生产门冲突）探测门状态：
+> - **门关（现状，SchemaVersion=1）**：`run.sh all` 不再尝试拉栈/seed，而是打印指引并 exit 0，
+>   把 v1.9 e2e 引到下面的 **backfill harness**——这是当前唯一能端到端验证 v1.9 reader 契约的路径
+>   （只有 backfill 能从 MySQL payload 自源填全 `spaceId`/`visibles`/`messageSeq`）。
+> - **门开（octo-lib 升 `SchemaVersion>=2` + 阶段 9 producer 富化后）**：门自动解封，`run.sh all`
+>   重新驱动实时链，**无需改 harness**。
+>
+> 单独看门状态：`./harness/run.sh gate`（门开 exit 0 / 门关 exit≥1，并打印当前 SchemaVersion）。
+> （仅在契约已升到 `>=2` 后才有意义的逃生口：`FORCE_LIVE=1 ./harness/run.sh all` 跳过预检直跑实时链；
+> indexer 仍自带同一安全门自检，所以这个开关无法绕过生产安全门。）
+
 > 🔒 **Isolation.** This is a local-only stack (`docker compose`). It is NEVER
 > wired into a shared test environment, and the indexer's `Kafka.On` / real
 > deployment wiring stays off until a separate, explicitly signed-off step.
@@ -24,22 +43,34 @@ seed → Kafka octo.message.v1 → es-indexer consumer → OpenSearch (analysis-
 | --- | --- |
 | `docker-compose.yml` | Kafka (KRaft, 1 broker) + OpenSearch (1 node) |
 | `opensearch-ik.Dockerfile` | OpenSearch image with the `analysis-ik` plugin installed (version-matched) |
-| `run.sh` | orchestrator: `up` (build+start+create topics) / `down` / `seed` / `verify` / `all` |
+| `run.sh` | orchestrator: `up` / `down` / `gate` (print live-ingestion gate state) / `seed` / `verify` / `all` |
+| `contractgate/` | harness-only probe: reports whether the compiled contract carries the reader safety fields (live gate open/closed); reuses the consumer's own predicate so it can't disagree with production |
 | `seed/` | producer of a controlled message suite (normal / 中文 / raw_excluded / duplicate _id / unknown schema / bad JSON) and a `-mode bulk -n N` throughput load |
 | `verify/` | asserts the invariants against OpenSearch |
 
 ## Run it
 
+> ⚠️ At the current contract (`SchemaVersion=1`) the **live** path below is gated
+> off (see the v1.9 safety-gate note above). `./harness/run.sh all` will detect
+> this, print guidance, and route you to `./harness/run-backfill.sh` — the
+> backfill harness is the v1.9 end-to-end verification path today. The live steps
+> below become runnable again once the contract is bumped to `SchemaVersion>=2`.
+
 ```sh
+# inspect the live-ingestion safety gate first (exit 0 = open, e2e live path available)
+./harness/run.sh gate
+
 # full cycle: up → indexer → seed suite → verify invariants → down
+# (auto-skips with guidance while the live gate is closed)
 ./harness/run.sh
 
-# or step by step, leaving the stack up:
+# or step by step, leaving the stack up (only meaningful once the gate is OPEN):
 KEEP_UP=1 ./harness/run.sh up
 ES_INDEXER_ENABLED=true KAFKA_BROKERS=localhost:19092 \
   ES_ADDRESSES=http://localhost:19200 ES_INDEX=octo-message \
   KAFKA_DLQ_TOPIC=octo.message.v1.dlq INDEXER_DLQ_SPILL_DIR=/tmp/spill \
   go run ./cmd/es-indexer &        # start the indexer against the harness
+                                   # (exits immediately while the contract is SchemaVersion<2)
 
 # Fence the DLQ check to THIS run: capture the DLQ end offset BEFORE seeding.
 FENCE=$(docker exec octo-harness-kafka /opt/kafka/bin/kafka-get-offsets.sh \
@@ -88,6 +119,12 @@ a real broker + real OpenSearch.
   testing only — production uses authenticated endpoints (`ES_USERNAME`/`ES_PASSWORD`).
 
 ## Phase-6 backfill harness (`run-backfill.sh` + `backfill/`)
+
+> 🔒 **This is the v1.9 end-to-end verification path while the live-ingestion gate
+> is closed (current `SchemaVersion=1`).** Only backfill can populate the reader
+> safety fields (`spaceId`/`visibles`/`messageSeq`) — it reads them straight from
+> the MySQL payload — so it is the one path that exercises the full v1.9 reader
+> contract end to end against real infra today.
 
 A second, self-contained e2e that exercises the historical backfill job (`cmd/backfill`)
 against a real MySQL + OpenSearch(IK), bypassing Kafka:

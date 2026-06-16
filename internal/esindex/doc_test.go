@@ -83,7 +83,10 @@ func TestDocFromMessage_PrecisionRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("DocFromMessage: %v", err)
 	}
-	b, _ := json.Marshal(d)
+	b, err := json.Marshal(d)
+	if err != nil {
+		t.Fatalf("json.Marshal: %v", err)
+	}
 	// 文档行必须以数值（非字符串）形式写 messageId，且不带引号。
 	if got := string(b); !containsSub(got, `"messageId":9223372036854775807`) {
 		t.Fatalf("messageId must serialize as full-precision numeric long: %s", got)

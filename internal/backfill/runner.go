@@ -148,8 +148,8 @@ func (r *Runner) processBatch(ctx context.Context, table string, rows []*srcMess
 		// docFromRow 复用 extractMessage 的三态口径，并富化 reader 必读的
 		// spaceId/visibles/messageSeq（仅 backfill 可从原始 MySQL payload 自源填）。
 		doc, outcome, err := docFromRow(row)
-		switch {
-		case outcome == outcomeDLQ:
+		switch outcome {
+		case outcomeDLQ:
 			// 真异常（payload 解析失败 / message_id 非数值）：落本地 DLQ spill 并计数（fail-closed）。
 			reason := "payload_parse"
 			if err != nil {

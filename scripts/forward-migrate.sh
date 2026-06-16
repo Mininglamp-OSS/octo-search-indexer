@@ -82,13 +82,16 @@ case "${STEP:-all}" in
   *) echo "unknown STEP=${STEP}" >&2; exit 2 ;;
 esac
 
-cat <<'ROLLBACK'
+# ROLLBACK 指引（alias 秒切回旧索引）。用展开式 heredoc（<<ROLLBACK，非单引号）让
+# $ES/$NEW_INDEX/$ALIAS/$OLD_INDEX 展开成**可直接复制执行**的命令，而不是字面量占位符。
+# JSON body 单独用单引号包住（避免外层展开破坏 JSON），index/alias 名以双引号拼接展开。
+cat <<ROLLBACK
 
-ROLLBACK（alias 秒切回旧索引）：
+ROLLBACK（alias 秒切回旧索引；下面命令已展开当前 ES/索引/alias，可直接复制执行）：
   curl -sS -XPOST "$ES/_aliases" -H 'Content-Type: application/json' -d '{
     "actions":[
-      {"remove":{"index":"'"$NEW_INDEX"'","alias":"'"$ALIAS"'"}},
-      {"add":{"index":"'"$OLD_INDEX"'","alias":"'"$ALIAS"'"}}
+      {"remove":{"index":"$NEW_INDEX","alias":"$ALIAS"}},
+      {"add":{"index":"$OLD_INDEX","alias":"$ALIAS"}}
     ]}'
-  旧索引保留 ≥7 天后再删：curl -XDELETE "$ES/$OLD_INDEX"
+  旧索引保留 ≥7 天后再删：curl -sS -XDELETE "$ES/$OLD_INDEX"
 ROLLBACK
