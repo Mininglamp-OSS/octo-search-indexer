@@ -396,3 +396,165 @@ func TestDLQSpill_TornSingleLineOnly(t *testing.T) {
 		t.Fatalf("count must be 0 after truncating the only (un-synced) line, got %d", s.Count())
 	}
 }
+
+// TestLoadDLQMessageIDsInWindow_RoundTrip 写 spill（经 in-memory DLQSpill，含 sidecar）后，
+// 只读 loader 复原的 message_id 集合必须与 in-memory MessageIDsInWindow 完全一致——保证 standalone
+// reconcile 与 inline backfill 两条字段级抽样门对 DLQ 行口径一致。
+func TestLoadDLQMessageIDsInWindow_RoundTrip(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "d")
+	s, err := OpenDLQSpill(dir)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	for _, rec := range []dlqRecord{
+		{ID: 1, MessageID: "m1", CreatedAt: 100},
+		{ID: 2, MessageID: "m2", CreatedAt: 200},
+		{ID: 3, MessageID: "m3", CreatedAt: 999}, // 窗外
+		{Table: "message", ID: 4, MessageID: "", CreatedAt: 150}, // 空 message_id：不入集
+	} {
+		if err := s.Write(rec); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+	}
+	want := s.MessageIDsInWindow(50, 300)
+	if cerr := s.Close(); cerr != nil { // Close 推进 sidecar，落同步前缀
+		t.Fatalf("close: %v", cerr)
+	}
+
+	got, err := LoadDLQMessageIDsInWindow(dir, 50, 300)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if !sameStringBoolSet(got, want) {
+		t.Fatalf("loader set %v != in-memory set %v (standalone/inline must agree)", got, want)
+	}
+	if got["m3"] {
+		t.Fatalf("out-of-window id must be excluded from set")
+	}
+	if _, ok := got["message:4"]; ok || got[""] {
+		t.Fatalf("empty message_id row must not enter exclusion set")
+	}
+}
+
+// TestLoadDLQMessageIDsInWindow_EmptyDir dir=="" → 空集、无错（退化回旧 CompareSamples 行为）。
+func TestLoadDLQMessageIDsInWindow_EmptyDir(t *testing.T) {
+	got, err := LoadDLQMessageIDsInWindow("", 0, 1000)
+	if err != nil {
+		t.Fatalf("empty dir must not error: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("empty dir must yield empty set, got %v", got)
+	}
+}
+
+// TestLoadDLQMessageIDsInWindow_MissingFile spill 文件不存在 → 空集、无错（无 backfill 的环境）。
+func TestLoadDLQMessageIDsInWindow_MissingFile(t *testing.T) {
+	got, err := LoadDLQMessageIDsInWindow(filepath.Join(t.TempDir(), "nope"), 0, 1000)
+	if err != nil {
+		t.Fatalf("missing spill file must not error: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("missing file must yield empty set, got %v", got)
+	}
+}
+
+// TestLoadDLQMessageIDsInWindow_SyncedPrefixOnly 有 sidecar 时只解析已 fsync 的同步前缀，
+// 崩溃留下的未 fsync 脏后缀（撕裂行）被丢弃，不污染排除集、不报错。
+func TestLoadDLQMessageIDsInWindow_SyncedPrefixOnly(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "d")
+	clean := validLine(t, "m1", 100) + validLine(t, "m2", 200)
+	dirty := `{"message_id":"m3","created_at":30` // 未 fsync 撕裂半行
+	writeRawSpill(t, dir, clean+dirty)
+	writeSyncedSidecar(t, dir, int64(len(clean)))
+
+	got, err := LoadDLQMessageIDsInWindow(dir, 0, 1000)
+	if err != nil {
+		t.Fatalf("synced-prefix load must not error on dirty suffix: %v", err)
+	}
+	if !got["m1"] || !got["m2"] || len(got) != 2 {
+		t.Fatalf("only synced-prefix ids expected, got %v", got)
+	}
+}
+
+// TestLoadDLQMessageIDsInWindow_NoSidecarYieldsEmpty 无 sidecar（如崩溃 / 部分拷贝 / 损坏 sidecar，
+// syncedLen==0）→ 无任何可信任的已 fsync 前缀，返回空排除集（与 OpenDLQSpill 把 offset 0 当「无持久
+// 记录」一致）。绝不退化去信任未 fsync 的裸 .ndjson：那会让 standalone 信任不持久数据、对这些 id 跳过
+// sample_missing，与 inline 门口径漂移。回退到「不排除」是安全侧（最坏把合法 DLQ 行算成 missing → 门
+// 转红人工复核，绝不悄悄放过真漏灌）。
+func TestLoadDLQMessageIDsInWindow_NoSidecarYieldsEmpty(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "d")
+	// 即便整文件都是完整记录，无 sidecar 也不信任（不持久）。
+	content := validLine(t, "m1", 100) + validLine(t, "m2", 200)
+	writeRawSpill(t, dir, content)
+
+	got, err := LoadDLQMessageIDsInWindow(dir, 0, 1000)
+	if err != nil {
+		t.Fatalf("no-sidecar load must not error (degrades to no-exclusion): %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("no synced sidecar must yield empty exclusion set (untrusted, fail-closed safe side), got %v", got)
+	}
+}
+
+// TestLoadDLQMessageIDsInWindow_SidecarSaysBytesButFileMissingFatal sidecar 记录了非零同步长度，
+// 但 spill 文件不存在：持久状态丢失，致命（与 recoverAndLoad 一致，不可静默放过）。
+func TestLoadDLQMessageIDsInWindow_SidecarSaysBytesButFileMissingFatal(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "d")
+	if err := os.MkdirAll(dir, 0o750); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	writeSyncedSidecar(t, dir, 42) // 谎称有 42 字节同步前缀，但没有 .ndjson 文件
+	if _, err := LoadDLQMessageIDsInWindow(dir, 0, 1000); err == nil {
+		t.Fatalf("sidecar bytes with missing spill file must be fatal")
+	}
+}
+
+// TestLoadDLQMessageIDsInWindow_SyncedPrefixNotRecordBoundaryFatal 同步前缀不以记录边界（换行）
+// 结尾 → 真损坏，致命（fail-closed；与 inline parseSyncedSpillPrefix 同一校验）。
+func TestLoadDLQMessageIDsInWindow_SyncedPrefixNotRecordBoundaryFatal(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "d")
+	clean := validLine(t, "m1", 100)
+	partial := `{"message_id":"m2"` // 半行，无换行
+	writeRawSpill(t, dir, clean+partial)
+	// sidecar 谎称同步前缀覆盖到半行中间（非换行边界）。
+	writeSyncedSidecar(t, dir, int64(len(clean)+len(partial)))
+	if _, err := LoadDLQMessageIDsInWindow(dir, 0, 1000); err == nil {
+		t.Fatalf("synced prefix not ending on a record boundary must be fatal")
+	}
+}
+
+// TestLoadDLQMessageIDsInWindow_CorruptSyncedRecordFatal 同步前缀内一条完整记录解析失败是真损坏
+// → 报错（fail-closed：鉴权关键门绝不在可疑 DLQ 数据上静默放过）。
+func TestLoadDLQMessageIDsInWindow_CorruptSyncedRecordFatal(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "d")
+	bad := "{not-json}\n"
+	writeRawSpill(t, dir, bad)
+	writeSyncedSidecar(t, dir, int64(len(bad)))
+	if _, err := LoadDLQMessageIDsInWindow(dir, 0, 1000); err == nil {
+		t.Fatalf("corrupt record in synced prefix must be fatal")
+	}
+}
+
+// TestLoadDLQMessageIDsInWindow_ShorterThanSyncedFatal 文件比 sidecar 记录的同步长度还短：
+// 持久层不一致 → 报错（不可静默放过）。
+func TestLoadDLQMessageIDsInWindow_ShorterThanSyncedFatal(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "d")
+	line := validLine(t, "m1", 100)
+	writeRawSpill(t, dir, line)
+	writeSyncedSidecar(t, dir, int64(len(line))+50)
+	if _, err := LoadDLQMessageIDsInWindow(dir, 0, 1000); err == nil {
+		t.Fatalf("file shorter than synced offset must be fatal")
+	}
+}
+
+func sameStringBoolSet(a, b map[string]bool) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k, v := range a {
+		if b[k] != v {
+			return false
+		}
+	}
+	return true
+}

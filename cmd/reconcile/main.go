@@ -5,10 +5,15 @@
 //
 //	reconcile -from 1709078400 -to 1718323200 \
 //	  -mysql-dsn 'user:pass@tcp(host:3306)/im_prod' -tables message,message1,message2,message3,message4 \
-//	  -es http://localhost:9200 -es-index octo-message [-dlq N]
+//	  -es http://localhost:9200 -es-index octo-message [-dlq N] [-dlq-spill-dir DIR]
 //
 // 与 indexer 写入器解耦（沿用 internal/esindex 解耦纪律）：本命令只读 MySQL + 查 ES，不依赖
 // consumer。阶段 6 backfill job 可直接 import internal/recon 复用对账算术。
+//
+// DLQ 行处理：count 对账用 -dlq 抵消窗内已知 DLQ 数；字段级抽样门用 -dlq-spill-dir 读 backfill
+// 落下的 DLQ spill 文件，把这些行（本就不该有 ES doc）从抽样比对排除——与 inline backfill 对账门
+// （cmd/backfill 用 in-memory DLQSpill.MessageIDsInWindow）口径一致，避免抽样命中合法 DLQ 行时
+// 误报 sample_missing → 误 exit 2 阻塞 alias 切换。
 package main
 
 import (
@@ -25,6 +30,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Mininglamp-OSS/octo-search-indexer/internal/backfill"
 	"github.com/Mininglamp-OSS/octo-search-indexer/internal/recon"
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/opensearch-project/opensearch-go/v3"
@@ -50,6 +56,7 @@ func run() error {
 		esUser   = flag.String("es-user", os.Getenv("RECON_ES_USER"), "OpenSearch username")
 		esPass   = flag.String("es-pass", os.Getenv("RECON_ES_PASS"), "OpenSearch password")
 		dlq      = flag.Int64("dlq", 0, "known DLQ count in window (rows that never reached ES body index)")
+		dlqDir   = flag.String("dlq-spill-dir", os.Getenv("RECON_DLQ_SPILL_DIR"), "optional backfill DLQ spill dir (or RECON_DLQ_SPILL_DIR); its message_ids are excluded from the field-level sample gate so legit DLQ rows don't false-fail as sample_missing")
 		sampleN  = flag.Int("sample", envInt("RECON_SAMPLE", 200), "field-level sample size (0 disables sampling)")
 		maxDet   = flag.Int("sample-max-details", envInt("RECON_SAMPLE_MAX_DETAILS", 50), "cap on mismatch detail entries in the report")
 		jsonOut  = flag.Bool("json", false, "emit the structured FullReport as JSON")
@@ -132,7 +139,15 @@ func run() error {
 	if *sampleN > 0 {
 		sampleReader := recon.NewMySQLSampleReader(db, splitCSV(*tablesS))
 		docFetcher := recon.NewOSDocFetcher(osClient, *esIndex)
-		sample, serr := recon.CompareSamples(ctx, sampleReader, docFetcher, *fromUnix, to, *sampleN, *maxDet)
+		// 排除 backfill 已落 DLQ spill 的真异常 / 永久拒绝行：它们本就不该在 ES 正文索引里
+		// （count 门已用同一 DLQ 计数抵消），抽样命中时不能再算成 missing（口径冲突 → false MISMATCH）。
+		// 与 inline backfill 对账门（cmd/backfill）行为一致：那条路用 in-memory DLQSpill.MessageIDsInWindow，
+		// 这条 standalone 路无 live spill，故从 backfill job 留下的 spill 文件只读复原同一份排除集。
+		excluded, lerr := backfill.LoadDLQMessageIDsInWindow(*dlqDir, *fromUnix, to)
+		if lerr != nil {
+			return fmt.Errorf("load DLQ spill exclusion set: %w", lerr)
+		}
+		sample, serr := recon.CompareSamplesExcluding(ctx, sampleReader, docFetcher, *fromUnix, to, *sampleN, *maxDet, excluded)
 		if serr != nil {
 			return serr
 		}

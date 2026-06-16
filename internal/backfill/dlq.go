@@ -169,10 +169,23 @@ func recoverAndLoad(path string, syncedLen int64) (map[string]dlqMeta, error) {
 	}
 	// [0, syncedLen) 是既 fsync、又与 checkpoint 一致的干净前缀：必由完整记录构成、以换行结尾。
 	// 任何偏差（非换行结尾 / 解析失败）都是该持久区内的真损坏，致命。
-	if data[len(data)-1] != '\n' {
+	return parseSyncedSpillPrefix(data)
+}
+
+// parseSyncedSpillPrefix 解析 spill 的「已 fsync 同步前缀」（调用方保证传入的 prefix 恰好是
+// [0, syncedLen) 字节）并重建去重集。该前缀必由完整记录构成、以换行结尾——任何偏差（非换行
+// 结尾 / 记录解析失败）都是该持久区内的真损坏，致命（fail-closed）。空前缀 = 无任何持久记录。
+// 抽离为共享函数：让 OpenDLQSpill 的崩溃恢复路径与 standalone reconcile 的只读加载路径
+// (LoadDLQMessageIDsInWindow) 用**同一**解析/校验逻辑，杜绝两条路径口径漂移。
+func parseSyncedSpillPrefix(prefix []byte) (map[string]dlqMeta, error) {
+	seen := map[string]dlqMeta{}
+	if len(prefix) == 0 {
+		return seen, nil
+	}
+	if prefix[len(prefix)-1] != '\n' {
 		return nil, fmt.Errorf("backfill: synced spill prefix does not end at a record boundary (real corruption)")
 	}
-	for _, line := range bytes.Split(data[:len(data)-1], []byte{'\n'}) {
+	for _, line := range bytes.Split(prefix[:len(prefix)-1], []byte{'\n'}) {
 		if len(bytes.TrimSpace(line)) == 0 {
 			continue
 		}
@@ -280,7 +293,66 @@ func (s *DLQSpill) MessageIDsInWindow(fromUnix, toUnix int64) map[string]bool {
 	return out
 }
 
-// Sync 把已 append 的 DLQ 记录刷盘（fsync），再原子推进 offset sidecar 到当前文件长度。
+// LoadDLQMessageIDsInWindow 只读地从 backfill 落下的 DLQ spill 文件加载 created_at ∈
+// [fromUnix, toUnix] 的去重 DLQ 记录的**真实**（非空）message_id 集合。这是 standalone
+// reconcile（cmd/reconcile）的 MessageIDsInWindow 对应物：standalone 路径不跑 backfill、没有
+// in-memory *DLQSpill，故直接从 backfill job 留下的 spill 文件复原同一份排除集，让 standalone
+// 与 inline 两条字段级抽样门对 DLQ 行的处理**口径一致**——合法 DLQ 行（坏 payload / 永久 ES
+// 拒绝，已记账为 DLQ）被抽样命中时不再误判为 sample_missing → 不再 false exit 2 阻塞 alias 切换。
+//
+// 语义与 (*DLQSpill).MessageIDsInWindow 严格一致：以 dedupKey 去重、只吐**非空** message_id、
+// 按 created_at 窗过滤。durability 口径与 OpenDLQSpill 崩溃恢复**完全一致**（fail-closed）：
+//   - dir=="" → 返回空集（无排除：行为退化回旧的 CompareSamples）。
+//   - spill 文件不存在 → 空集、不报错：standalone recon 可能跑在压根没 backfill spill 的环境
+//     （如 reindex-only 链路），「无 spill」等价「无 DLQ 行」。
+//   - **只信任 offset sidecar 记录的已 fsync 同步前缀** `[0, syncedLen)`，且复用 inline 路径同一个
+//     解析器（parseSyncedSpillPrefix）：前缀必以记录边界（换行）结尾、每条完整记录可解析，否则致命。
+//   - sidecar 缺失 / 为空（syncedLen==0）→ **视作无任何持久 DLQ 记录**，返回空集（与 OpenDLQSpill
+//     把 offset 0 当「无持久记录」一致）。绝不退化去信任未 fsync 的裸 .ndjson 后缀——那会让 standalone
+//     在崩溃 / 部分拷贝 / 损坏 sidecar 场景下信任不持久数据、对这些 id 跳过 sample_missing，与 inline 门
+//     口径漂移。「无可信前缀」时回退到「不排除」是安全侧：最坏只是把合法 DLQ 行算成 missing（门转红、
+//     人工复核），绝不会把真漏灌悄悄放过。
+//   - 文件比 syncedLen 还短 → 持久层不一致，致命（不可静默放过）。
+func LoadDLQMessageIDsInWindow(dir string, fromUnix, toUnix int64) (map[string]bool, error) {
+	out := make(map[string]bool)
+	if dir == "" {
+		return out, nil
+	}
+	syncedLen, err := readSyncedOffset(filepath.Join(dir, "backfill-dlq.synced"))
+	if err != nil {
+		return nil, err
+	}
+	if syncedLen == 0 {
+		// 无 sidecar / 空 sidecar：无任何已 fsync 的持久前缀可信任 → 不排除（fail-closed 安全侧）。
+		return out, nil
+	}
+
+	path := filepath.Join(dir, "backfill-dlq.ndjson")
+	data, err := os.ReadFile(path) //nolint:gosec // path 来自运维配置，非用户输入
+	if err != nil {
+		if os.IsNotExist(err) {
+			// sidecar 说有 syncedLen 字节，但 spill 文件不存在：持久状态丢失，致命（与 recoverAndLoad 一致）。
+			return nil, fmt.Errorf("backfill: dlq spill offset sidecar says %d bytes but spill file is missing (durability state lost; manual inspection required)", syncedLen)
+		}
+		return nil, fmt.Errorf("backfill: read dlq spill for reconcile exclusion: %w", err)
+	}
+	if syncedLen > int64(len(data)) {
+		// 文件比已记录的同步长度还短：持久层不一致（被外部截断/损坏），不可静默放过。
+		return nil, fmt.Errorf("backfill: dlq spill (%d bytes) shorter than synced offset (%d) — durability state lost; manual inspection required", len(data), syncedLen)
+	}
+
+	// 只解析已 fsync 的同步前缀，复用 inline 崩溃恢复的同一解析/校验逻辑（杜绝口径漂移）。
+	seen, err := parseSyncedSpillPrefix(data[:syncedLen])
+	if err != nil {
+		return nil, err
+	}
+	for _, m := range seen {
+		if m.messageID != "" && m.createdAt >= fromUnix && m.createdAt <= toUnix {
+			out[m.messageID] = true
+		}
+	}
+	return out, nil
+}// Sync 把已 append 的 DLQ 记录刷盘（fsync），再原子推进 offset sidecar 到当前文件长度。
 // **必须在推进 checkpoint 前调用**：否则主机崩溃 / 延迟写回失败可能让 checkpoint 跳过某些 id，
 // 而它们的 DLQ 记录尚未落盘 → resume 后 DLQ 漏计、该行不经手动回退 checkpoint 不可恢复
 // （durability ordering：先让 DLQ 落盘 + offset 记账，再推进游标）。

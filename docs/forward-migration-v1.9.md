@@ -63,6 +63,11 @@ octo-server 的读路径（`modules/messages_search`，PR#361/#374/#385）直查
      重叠安全；重灌覆盖 reindex 的空字段。生产推荐：直接 backfill 重灌新索引，跳过 reindex 的空壳。
 3. **alias 原子切换** read alias → 新索引：`STEP=3`。**前置门**：先 `make run-recon RECON_ES_INDEX=<新索引>`
    抽样对账通过（doc_drift==0 且 sample_mismatch==0 且 sample_missing==0）再切。
+   - ⚠️ 若该新索引是 backfill 重灌出来的（步骤 2 推荐路径），跑对账时必须带上 backfill 的 DLQ spill 目录：
+     `make run-recon RECON_ES_INDEX=<新索引> RECON_DLQ=<窗内 DLQ 数> RECON_DLQ_SPILL_DIR=<backfill -spill-dir>`。
+     这些合法 DLQ 行（坏 payload / 永久 ES 拒绝，故意不进 ES、已被 `-dlq` 计入）本就无 ES doc，spill 目录
+     让 standalone 抽样门把它们排除（与 inline backfill 对账门口径一致），否则抽样命中 DLQ 行会误报
+     sample_missing → 退出码 2 → 误阻塞 alias 切换。
    切换在单个 `_aliases` 事务内 `remove(index="*", must_exist=false)` + `add(新索引)`：从**任意**当前
    挂着的索引摘掉 alias 再挂新索引（幂等 + 保证 alias 任何时刻单指向，杜绝半新半旧同 alias）。
 
@@ -77,6 +82,8 @@ octo-server 的读路径（`modules/messages_search`，PR#361/#374/#385）直查
 - **count 对账**：ES doc-count vs MySQL 行数（扣 DLQ；raw_excluded 仍占 doc 不扣）。`doc_drift = ESDocs − MySQL行数`。
 - **抽样字段比对**：取 N 条样本，按 message_id 拉 ES doc，逐字段核对
   `messageId/channelId/channelType/spaceId/visibles/messageSeq`，检出「条数对得上但字段错位」的静默 drift。
+  传 `-dlq-spill-dir`（`RECON_DLQ_SPILL_DIR`）时，backfill 落下的 DLQ 行（已记账、本就不该有 ES doc）被排除，
+  不计 sample_missing——与 inline backfill 对账门（`recon.CompareSamplesExcluding`）口径一致。
 - **阈值（机检，钉死在 internal/recon）**：`doc_drift!=0` 或 `sample_mismatch!=0` 或 `sample_missing!=0` → 不健康，退出码 2。
 - **回填 octo-server**：`-push-url` POST `PushPayload`（逐字段对齐 `recon_metrics.go::ReconReport`）到只读
   ingestion 端 → `search_recon_doc_drift` / `search_recon_sample_mismatch` / `search_recon_last_run_timestamp_seconds` gauge。
