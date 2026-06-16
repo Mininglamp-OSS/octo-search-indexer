@@ -118,6 +118,11 @@ func compareRow(r SampleRow, doc ESDocFields) ([]MismatchDetail, bool) {
 		dets = append(dets, MismatchDetail{MessageID: r.MessageID, Field: field, MySQL: my, ES: es})
 	}
 
+	// _source.messageId 必须 == MySQL message_id 全精度（reader 从 _source 读 int64 做 cursor
+	// tiebreaker；_id 对但 _source.messageId 缺/0/被 float64 截断会静默打断 cursor）。
+	if r.MessageID != fmtInt(doc.MessageID) {
+		add("messageId", r.MessageID, fmtInt(doc.MessageID))
+	}
 	if fmtInt(r.MessageSeq) != fmtUint(doc.MessageSeq) {
 		add("messageSeq", fmtInt(r.MessageSeq), fmtUint(doc.MessageSeq))
 	}

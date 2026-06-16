@@ -120,3 +120,31 @@ func TestFullReport_UnhealthyOnSampleMismatch(t *testing.T) {
 		t.Fatalf("push payload must surface sample mismatch")
 	}
 }
+
+// TestCompareSamples_MessageIDPrecisionDrift _id 对但 _source.messageId 被截断/置 0 →
+// mismatch（reader 用 _source.messageId 做 cursor tiebreaker，必须全精度对齐）。
+func TestCompareSamples_MessageIDPrecisionDrift(t *testing.T) {
+	src := &fakeSampleSrc{rows: []SampleRow{
+		{MessageID: "9223372036854775807", ChannelID: "g", ChannelType: 2},
+	}}
+	es := &fakeESFetch{docs: map[string]ESDocFields{
+		// _id 命中（FetchDocs 按 _id 返回），但 _source.messageId 为 0（缺/截断）。
+		"9223372036854775807": {MessageID: 0, ChannelID: "g", ChannelType: 2},
+	}}
+	res, err := CompareSamples(context.Background(), src, es, 0, 100, 100, 50)
+	if err != nil {
+		t.Fatalf("CompareSamples: %v", err)
+	}
+	if res.Mismatch != 1 {
+		t.Fatalf("messageId _source drift must be a mismatch: %+v", res)
+	}
+	var sawField bool
+	for _, d := range res.Details {
+		if d.Field == "messageId" {
+			sawField = true
+		}
+	}
+	if !sawField {
+		t.Fatalf("mismatch detail must name messageId: %+v", res.Details)
+	}
+}

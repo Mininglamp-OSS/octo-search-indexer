@@ -6,6 +6,7 @@ import (
 	"log"
 	"time"
 
+	"github.com/Mininglamp-OSS/octo-lib/contract/searchmsg"
 	"github.com/Mininglamp-OSS/octo-search-indexer/internal/esindex"
 )
 
@@ -93,7 +94,20 @@ func NewService(cfg ServiceConfig) (*Service, error) {
 }
 
 // Run 运行消费循环直到 ctx 取消。启动时先幂等确保目标索引存在（带 mapping/中文分词）。
+//
+// 🔴 安全闸（V3b fail-OPEN 防护）：实时 consumer 写出的 doc 的 spaceId/visibles/messageSeq
+// 来自 Kafka 契约 searchmsg.Message，而当前契约（SchemaVersion 1）不带这三字段。若放行，
+// reader 对空 visibles 会 fail-OPEN（普通成员搜出群管才可见的系统消息）。故契约未携带安全
+// 字段前，实时写入**拒启动**（fail-closed），不静默灌 fail-open doc。存量经 backfill 富化。
+// 契约升到 SafetyFieldsSchemaVersion（octo-lib bump + producer 富化，阶段 9 前置）后自动解封。
 func (s *Service) Run(ctx context.Context) error {
+	if !esindex.LiveContractCarriesSafetyFields() {
+		return fmt.Errorf("consumer: live ingestion refused — Kafka contract (searchmsg.SchemaVersion=%d) "+
+			"does not carry reader safety fields (spaceId/visibles/messageSeq); writing now would fail-OPEN "+
+			"the reader's visibles gate. Bump octo-lib to SchemaVersion>=%d + enrich the producer (phase 9) "+
+			"before enabling live ingestion. Backfill enriches existing docs from MySQL meanwhile",
+			searchmsg.SchemaVersion, esindex.SafetyFieldsSchemaVersion)
+	}
 	if err := s.writer.EnsureIndex(ctx); err != nil {
 		return fmt.Errorf("consumer: ensure index: %w", err)
 	}

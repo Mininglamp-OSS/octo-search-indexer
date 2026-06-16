@@ -44,6 +44,11 @@ octo-server 的读路径（`modules/messages_search`，PR#361/#374/#385）直查
 （+SpaceID/+Visibles/+MessageSeq，SchemaVersion 1→2）+ octo-server `modules/searchetl` producer 富化，
 随阶段 9 开 Kafka.On 一并上线。本期 Kafka.On=OFF（plan §6），无实时流量，存量由 backfill 填全即可。
 
+> 🔒 **实时写入安全闸（防 V3b fail-OPEN）**：`consumer.Service.Run` 在 Kafka 契约
+> `searchmsg.SchemaVersion < SafetyFieldsSchemaVersion(=2)` 时**拒启动**实时写入——否则会灌出
+> 空 `visibles` 的 doc，让 reader 的群系统消息白名单 gate fail-OPEN（普通成员搜出群管才可见消息）。
+> octo-lib bump 到带安全字段的契约 + producer 富化后，重 pin 自动解封。存量始终由 backfill 富化。
+
 ## 前向迁移三步（钉死，禁半新半旧 doc 同 alias 服务）
 
 脚本：`scripts/forward-migrate.sh`（`make migrate-forward`）。

@@ -112,3 +112,20 @@ func buildPayload(contentType int, content *string) *Payload {
 // payloadTypeText 对应 octo-lib common.Text（文本消息）。与 reader source.go
 // payloadTypeText / producer extract 口径一致。
 const payloadTypeText = 1
+
+// SafetyFieldsSchemaVersion 是 Kafka 契约（searchmsg.Message）开始携带 reader 必读的
+// 安全/正确性字段（SpaceID + Visibles + MessageSeq）的最小 SchemaVersion。
+//
+// 当前契约 searchmsg.SchemaVersion==1 **不带**这三字段（producer 只抽 content），故实时
+// consumer 路径写出的 doc 这三字段为空——reader 对空 visibles 是 **fail-OPEN**（群系统消息
+// 普通成员能搜出群管才可见消息），对空 spaceId(p2p) fail-closed，对 messageSeq=0 保守隐藏。
+// 把这三字段灌进 Kafka 契约需 octo-lib 升 SchemaVersion 1→2 + octo-server producer 富化
+// （阶段 9 上线前置）。届时 indexer 重 pin 到带这些字段的 octo-lib，SchemaVersion 升到本值，
+// LiveContractCarriesSafetyFields() 自动转 true，实时路径解除写入封锁。
+const SafetyFieldsSchemaVersion = 2
+
+// LiveContractCarriesSafetyFields 报告当前编译进二进制的 Kafka 契约是否已携带 reader 必读的
+// 安全字段（SpaceID/Visibles/MessageSeq）。consumer 据此决定是否允许实时写入（防 V3b fail-OPEN）。
+func LiveContractCarriesSafetyFields() bool {
+	return searchmsg.SchemaVersion >= SafetyFieldsSchemaVersion
+}
