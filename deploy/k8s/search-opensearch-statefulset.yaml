@@ -1,0 +1,131 @@
+# OpenSearch 2.17.0 + analysis-ik (中文分词), single-node, security 关闭。
+# 翻译自 harness/docker-compose.yml 的 opensearch 服务 (镜像由 harness/opensearch-ik.Dockerfile 构建)。
+#
+# 路线 B: 自带隔离 OS, DISABLE_SECURITY_PLUGIN=true → es-indexer / reader 走明文 http,
+#   规避现网共享 OS 的 https 自签证书校验阻塞 (PlanBot §3b / STOP#3b)。
+#   污染面=0 (完全不碰现网 wukongim-messages-* 共享集群)。
+#
+# ⚠️ 存疑点 (PlanBot STOP#1 · eklet serverless), apply 后需重点验证:
+#   1. memlock (bootstrap.memory_lock=true): eklet 上容器能否拿到 IPC_LOCK / ulimit memlock=unlimited
+#      【未验证】。k8s 无 compose 的 ulimits: memlock 等价物 — 这里给了 securityContext
+#      capabilities: IPC_LOCK, 但 eklet (virtual-kubelet) 是否尊重该 cap + 放开 memlock rlimit 存疑。
+#      若 memlock 锁不住, OS 会启动失败或刷 warning; 备选: 关 bootstrap.memory_lock (改 "false")。
+#   2. vm.max_map_count>=262144: OS 要求的内核 sysctl。eklet 上无 DaemonSet / privileged initContainer
+#      调内核的常规手段是否可用【未验证】。若 OS 报 "max virtual memory areas vm.max_map_count [65530] is too low"
+#      → 需 Coda 评估 eklet 是否预置了该值, 或加 privileged sysctl initContainer (eklet 可能拒)。
+#   3. PVC (cbs 块存储) + StatefulSet 稳定身份在 eklet 上能否起稳【未验证, 同 STOP#1】。
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: search-opensearch
+  labels:
+    app: search-opensearch
+spec:
+  serviceName: search-opensearch
+  replicas: 1
+  selector:
+    matchLabels:
+      app: search-opensearch
+  template:
+    metadata:
+      labels:
+        app: search-opensearch
+    spec:
+      securityContext:
+        fsGroup: 1000           # opensearch 进程 uid 1000, PVC 目录可写
+      # 免推方案: 用公开官方镜像 opensearchproject/opensearch:2.17.0 (集群直拉),
+      #   initContainer 运行时装 analysis-ik 到共享 emptyDir plugins 卷,
+      #   主容器挂同一卷 → 带 IK 中文分词。避免推 2.35GB 定制镜像 (腾讯 TCR 传不动)。
+      # ⚠️ 依赖 pod 能访问 release.infinilabs.com (公网)。集群有公网出口(能拉 docker.io),
+      #   但 infinilabs 具体连通性 apply 时由本 initContainer 成败自然验证(失败=Phase1 STOP)。
+      initContainers:
+        - name: install-ik
+          image: opensearchproject/opensearch:2.17.0   # 经 kustomize images: 公开镜像
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -e
+              IKVER=2.17.0
+              if [ -d /shared-plugins/analysis-ik ]; then
+                echo "analysis-ik already present, skip"; exit 0
+              fi
+              echo "installing analysis-ik ${IKVER} into shared plugins volume"
+              # 装到临时 OPENSEARCH_PATH_PLUGINS, 再 copy 进共享卷
+              /usr/share/opensearch/bin/opensearch-plugin install --batch \
+                https://release.infinilabs.com/analysis-ik/stable/opensearch-analysis-ik-${IKVER}.zip
+              cp -r /usr/share/opensearch/plugins/analysis-ik /shared-plugins/
+              echo "analysis-ik installed:"; ls -la /shared-plugins/analysis-ik | head
+          volumeMounts:
+            - name: plugins
+              mountPath: /shared-plugins
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+      containers:
+        - name: opensearch
+          image: octo-search-opensearch-ik:2.17.0-ik   # 经 kustomize images: 重写为公开 opensearchproject/opensearch:2.17.0
+          securityContext:
+            capabilities:
+              add: ["IPC_LOCK"]   # bootstrap.memory_lock 需要; eklet 是否尊重见上 ⚠️
+          ports:
+            - name: http
+              containerPort: 9200
+            - name: transport
+              containerPort: 9300
+          env:
+            # --- 沿用 compose environment ---
+            - name: discovery.type
+              value: "single-node"
+            - name: bootstrap.memory_lock
+              value: "true"        # ⚠️ eklet 上能否生效存疑 (见上); 起不来可改 false
+            - name: OPENSEARCH_JAVA_OPTS
+              value: "-Xms512m -Xmx512m"
+            - name: DISABLE_SECURITY_PLUGIN
+              value: "true"        # 隔离栈: 关 security, 明文 http (路线 B 核心)
+            - name: DISABLE_INSTALL_DEMO_CONFIG
+              value: "true"
+          resources:
+            # PlanBot §5: OS req 500m/1Gi, lim 2/2Gi。
+            # 注: limits.memory(2Gi) 须 > heap(Xmx 512m)*2 余量给 off-heap/lucene mmap。
+            requests:
+              cpu: 500m
+              memory: 1Gi
+            limits:
+              cpu: "2"
+              memory: 2Gi
+          volumeMounts:
+            - name: data
+              mountPath: /usr/share/opensearch/data
+            - name: plugins
+              mountPath: /usr/share/opensearch/plugins/analysis-ik
+              subPath: analysis-ik   # 把 initContainer 装好的 IK 挂进主容器 plugins 目录
+          readinessProbe:
+            httpGet:
+              path: /_cluster/health
+              port: 9200
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            failureThreshold: 12
+          livenessProbe:
+            httpGet:
+              path: /_cluster/health
+              port: 9200
+            initialDelaySeconds: 90
+            periodSeconds: 20
+      volumes:
+        - name: plugins
+          emptyDir: {}            # initContainer 装 IK 到这 → 主容器 subPath 挂载
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: cbs
+        resources:
+          requests:
+            storage: 20Gi          # PlanBot §5: OS PVC 20Gi

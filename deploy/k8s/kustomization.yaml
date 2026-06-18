@@ -1,0 +1,45 @@
+# YUJ-5039 — dmwork-test 隔离实时索引栈 (路线 B: 自带 OpenSearch, 无 security)
+#
+# 这套 bundle 把 harness/docker-compose.yml 的本地全链路栈
+# (Kafka KRaft 单节点 + OpenSearch-IK single-node DISABLE_SECURITY_PLUGIN
+#  + es-indexer consumer) 翻译成可 apply 到腾讯 EKS dmwork-test 的 k8s manifest。
+#
+# ⚠️ 本目录只出物料, 不部署。apply 由 Coda review 后做 (YUJ-5034 Phase 1-3)。
+# ⚠️ 不含 octo-server 改动 (开 Kafka.On / reader 接 OS 是后续 Phase, Coda 做)。
+#
+# 命名: 全部加 search- / es-indexer 前缀, 避免与 dmwork-test 现有服务冲突
+#   (octo-server / octo-search-batch / octo-messages-sync / octo-redis / octo-wukongim)。
+# 互联: 全走 dmwork-test 内部 service DNS 明文, 不暴露外网。
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: dmwork-test
+
+labels:
+  - includeSelectors: true
+    pairs:
+      app.kubernetes.io/part-of: octo-search-realtime
+      octo.search/bundle: yuj-5039
+
+resources:
+  - search-kafka-statefulset.yaml
+  - search-kafka-service.yaml
+  - search-kafka-topic-init-job.yaml
+  - search-opensearch-statefulset.yaml
+  - search-opensearch-service.yaml
+  - es-indexer-deployment.yaml
+
+images:
+  # es-indexer 是我们自己的代码镜像, 公开仓没有, 必须推 (已推成功 32MB)。
+  - name: octo-search-indexer
+    newName: tbj7-xtiao-tcr1.tencentcloudcr.com/xtiao-release/dmwork/octo-search-indexer
+    newTag: d2c7cc3
+    digest: sha256:3913a36f54686df87729e81d628dd377d7aa852f9eb2da1320e2774a9a6903d0
+  # kafka = 公开镜像, 集群直拉 (已验证 apache/kafka:3.8.0 14.6s 拉成功)。不推 TCR。
+  - name: apache-kafka
+    newName: apache/kafka
+    newTag: "3.8.0"
+  # OpenSearch = 公开官方镜像 + initContainer 运行时装 IK (见 statefulset)。不推 2.35GB 定制镜像。
+  - name: octo-search-opensearch-ik
+    newName: opensearchproject/opensearch
+    newTag: "2.17.0"

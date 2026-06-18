@@ -1,0 +1,103 @@
+# Kafka KRaft 单节点 (broker+controller 合一), 翻译自 harness/docker-compose.yml 的 kafka 服务。
+# 单副本, replication=1, 仅用于隔离验证 (非生产 HA)。
+#
+# ⚠️ 存疑点 (PlanBot STOP#1 · eklet serverless):
+#   dmwork-test 节点是 eklet (virtual-kubelet, serverless), 非真实节点。
+#   StatefulSet 的稳定网络标识 (search-kafka-0.search-kafka) + PVC (cbs 块存储)
+#   挂载 + 重启后 KRaft 数据目录身份持久化, 在 eklet 上能否起稳【未验证】。
+#   本票只出 manifest 不验真起。apply 后若 PVC Pending / Pod CrashLoop>3
+#   或 hostname 不稳 → 命中 STOP#1, 停并评估备选 (现成 broker / emptyDir 临时验证)。
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: search-kafka
+  labels:
+    app: search-kafka
+spec:
+  serviceName: search-kafka          # 必须匹配 headless service 名 (稳定 DNS)
+  replicas: 1
+  selector:
+    matchLabels:
+      app: search-kafka
+  template:
+    metadata:
+      labels:
+        app: search-kafka
+    spec:
+      securityContext:
+        # apache/kafka:3.8.0 以 uid 1000 (appuser) 运行; PVC 目录需可写。
+        fsGroup: 1000
+      containers:
+        - name: kafka
+          image: apache-kafka:3.8.0   # 经 kustomize images: 重写为 TCR digest
+          ports:
+            - name: internal
+              containerPort: 9092      # PLAINTEXT broker (集群内互联)
+            - name: controller
+              containerPort: 9093      # CONTROLLER (KRaft quorum, 仅本机)
+          env:
+            # --- KRaft 单节点 broker+controller (沿用 compose KAFKA_*) ---
+            - name: KAFKA_NODE_ID
+              value: "1"
+            - name: KAFKA_PROCESS_ROLES
+              value: "broker,controller"
+            # k8s 内不需要 EXTERNAL listener (compose 用它做 host 端口映射); 去掉只留 PLAINTEXT+CONTROLLER。
+            - name: KAFKA_LISTENERS
+              value: "PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093"
+            # advertised 用 headless service 的稳定 Pod DNS, 让 es-indexer / octo-server 连得到。
+            - name: KAFKA_ADVERTISED_LISTENERS
+              value: "PLAINTEXT://search-kafka-0.search-kafka.dmwork-test.svc.cluster.local:9092"
+            - name: KAFKA_LISTENER_SECURITY_PROTOCOL_MAP
+              value: "PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT"
+            - name: KAFKA_CONTROLLER_QUORUM_VOTERS
+              value: "1@search-kafka-0.search-kafka.dmwork-test.svc.cluster.local:9093"
+            - name: KAFKA_CONTROLLER_LISTENER_NAMES
+              value: "CONTROLLER"
+            - name: KAFKA_INTER_BROKER_LISTENER_NAME
+              value: "PLAINTEXT"
+            # 单节点: 所有副本因子=1, min ISR=1。
+            - name: KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR
+              value: "1"
+            - name: KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR
+              value: "1"
+            - name: KAFKA_TRANSACTION_STATE_LOG_MIN_ISR
+              value: "1"
+            - name: KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS
+              value: "0"
+            # topic 由 topic-init Job 显式建 (1 分区 1 副本); 关自动建 topic 防 typo 静默建错。
+            - name: KAFKA_AUTO_CREATE_TOPICS_ENABLE
+              value: "false"
+            # KRaft 数据目录 = 挂载的 PVC。
+            - name: KAFKA_LOG_DIRS
+              value: "/var/lib/kafka/data"
+          resources:
+            # PlanBot §5: Kafka ~250m/512Mi。
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/kafka/data
+          readinessProbe:
+            tcpSocket:
+              port: 9092
+            initialDelaySeconds: 20
+            periodSeconds: 10
+            failureThreshold: 6
+          livenessProbe:
+            tcpSocket:
+              port: 9092
+            initialDelaySeconds: 60
+            periodSeconds: 20
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: cbs          # dmwork-test default 块存储 (PlanBot 已核实)
+        resources:
+          requests:
+            storage: 10Gi              # PlanBot §5: Kafka PVC 10Gi

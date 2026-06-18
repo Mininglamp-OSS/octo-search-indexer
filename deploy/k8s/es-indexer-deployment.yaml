@@ -1,0 +1,73 @@
+# es-indexer consumer (Deployment), 翻译自 harness/docker-compose.yml 的 es-indexer 服务。
+# 消费 Kafka octo.message.v1 → 幂等 bulk 写隔离 OpenSearch (doc _id = message_id)。
+#
+# 配置全走 env (cmd/es-indexer/main.go loadConfig)。
+# 🔴 开通条件 (main.go:loadConfig): ES_INDEXER_ENABLED=true 且 KAFKA_BROKERS / ES_ADDRESSES 均非空,
+#    三者缺一 → 服务空转 (idling, 不连后端)。本 manifest 三者齐备 = 真正消费。
+#
+# 全部连集群内 service DNS, 明文:
+#   KAFKA_BROKERS = search-kafka-0.search-kafka:9092 (KRaft 单节点 Pod DNS)
+#   ES_ADDRESSES  = http://search-opensearch:9200    (隔离 OS, 无 security, 故 http 明文)
+#   ES_INDEX      = octo-message                      (es-indexer EnsureIndex 裸 PUT 字面索引)
+#
+# ⚠️ STOP#B1 (PlanBot, octo-server reader 侧, 本票不含):
+#   reader 默认读 alias wukongim-messages-read; 路线 B OS 无 alias。
+#   后续 Coda 开 reader 时需把 OCTO_SEARCH_OS_READ_ALIAS 指到 octo-message (裸索引),
+#   并确认 reader 能把 READ_ALIAS 当索引名直读。本 deployment 不涉及 reader。
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: es-indexer
+  labels:
+    app: es-indexer
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: es-indexer
+  template:
+    metadata:
+      labels:
+        app: es-indexer
+    spec:
+      containers:
+        - name: es-indexer
+          image: octo-search-indexer:d2c7cc3   # 经 kustomize images: 重写为 TCR digest
+          env:
+            - name: ES_INDEXER_ENABLED
+              value: "true"                  # 🔴 必须 true 否则空转 (main.go loadConfig)
+            # --- Kafka (沿用 compose / main.go 默认 topic) ---
+            - name: KAFKA_BROKERS
+              value: "search-kafka-0.search-kafka.dmwork-test.svc.cluster.local:9092"
+            - name: KAFKA_TOPIC
+              value: "octo.message.v1"
+            - name: KAFKA_DLQ_TOPIC
+              value: "octo.message.v1.dlq"
+            - name: KAFKA_GROUP_ID
+              value: "octo-search-indexer"
+            # --- OpenSearch (隔离栈明文 http) ---
+            - name: ES_ADDRESSES
+              value: "http://search-opensearch.dmwork-test.svc.cluster.local:9200"
+            - name: ES_INDEX
+              value: "octo-message"
+            # 隔离 OS 无 security → 不设 ES_USERNAME / ES_PASSWORD。
+            # (路线 A 复用现网 https 自签 OS 才需凭证 + CA/skip-verify, 见 STOP#3b, 本票不走 A。)
+            # --- 调参 (留默认, 显式写出便于 Coda 调) ---
+            - name: INDEXER_BATCH_SIZE
+              value: "500"
+            - name: INDEXER_TRANSIENT_BACKOFF_MS
+              value: "1000"
+            - name: INDEXER_DLQ_MAX_RETRIES
+              value: "5"
+            - name: INDEXER_DLQ_RETRY_BACKOFF_MS
+              value: "200"
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          # ⚠️ es-indexer 阶段 7 才接 /metrics + health endpoint (Dockerfile EXPOSE 9090 占位,
+          #    当前无 HTTP 服务监听)。故此处不配 readiness/liveness HTTP probe —
+          #    配了会因无监听一直失败。观察期靠日志 + OS doccount (PlanBot §8 Phase6)。

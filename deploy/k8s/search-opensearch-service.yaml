@@ -1,0 +1,20 @@
+# ClusterIP Service: es-indexer / octo-server reader 通过它连 OS (内部明文 http)。
+#   http://search-opensearch.dmwork-test.svc.cluster.local:9200
+# 仅集群内, 不暴露外网。
+apiVersion: v1
+kind: Service
+metadata:
+  name: search-opensearch
+  labels:
+    app: search-opensearch
+spec:
+  type: ClusterIP
+  selector:
+    app: search-opensearch
+  ports:
+    - name: http
+      port: 9200
+      targetPort: 9200
+    - name: transport
+      port: 9300
+      targetPort: 9300

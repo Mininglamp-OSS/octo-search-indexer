@@ -1,0 +1,50 @@
+# 一次性 Job: 显式创建实时链路所需 topic (替代 compose 的 KAFKA_AUTO_CREATE_TOPICS_ENABLE)。
+#   - octo.message.v1      : 主消息流 (searchetl producer → es-indexer consumer)
+#   - octo.message.v1.dlq  : 死信 (坏 schema / permanent 4xx)
+# 单节点: partitions=1, replication-factor=1 (验证够用; 生产需扩分区/副本)。
+#
+# 用 kafka pod 内自带的 /opt/kafka/bin/kafka-topics.sh, 连 headless service。
+# restartPolicy: OnFailure + backoffLimit, 等 broker ready 后重试建 topic (幂等: --if-not-exists)。
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: search-kafka-topic-init
+  labels:
+    app: search-kafka
+spec:
+  backoffLimit: 10
+  template:
+    metadata:
+      labels:
+        app: search-kafka-topic-init
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: topic-init
+          image: apache-kafka:3.8.0   # 经 kustomize images: 重写为 TCR digest
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -e
+              BS="search-kafka-0.search-kafka.dmwork-test.svc.cluster.local:9092"
+              echo "waiting for broker ${BS} ..."
+              until /opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server "$BS" >/dev/null 2>&1; do
+                echo "broker not ready, retry in 5s"; sleep 5
+              done
+              echo "broker up; creating topics"
+              /opt/kafka/bin/kafka-topics.sh --bootstrap-server "$BS" \
+                --create --if-not-exists --topic octo.message.v1 \
+                --partitions 1 --replication-factor 1
+              /opt/kafka/bin/kafka-topics.sh --bootstrap-server "$BS" \
+                --create --if-not-exists --topic octo.message.v1.dlq \
+                --partitions 1 --replication-factor 1
+              echo "topics now:"
+              /opt/kafka/bin/kafka-topics.sh --bootstrap-server "$BS" --list
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 250m
+              memory: 256Mi
