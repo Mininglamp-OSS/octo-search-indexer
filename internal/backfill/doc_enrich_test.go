@@ -3,6 +3,8 @@ package backfill
 import (
 	"encoding/json"
 	"testing"
+
+	"github.com/Mininglamp-OSS/octo-lib/contract/searchmsg"
 )
 
 // payloadWith 构造一条带 space_id/visibles 的文本 payload（明文 JSON，模拟 enrichPayloadWithSpaceID 产物）。
@@ -95,103 +97,88 @@ func TestDocFromRow_BadJSONToDLQ(t *testing.T) {
 	}
 }
 
-// TestExtractVisibility_DropsNonStringElements visibles 非字符串元素跳过（与 server visiblesAllows 口径一致）。
-func TestExtractVisibility_DropsNonStringElements(t *testing.T) {
-	raw := []byte(`{"space_id":"s1","visibles":["u1",123,"u2",{"x":1}]}`)
-	sid, vis, err := extractVisibility(raw)
-	if err != nil {
-		t.Fatalf("unexpected err: %v", err)
-	}
-	if sid != "s1" {
-		t.Fatalf("space_id mismatch: %q", sid)
-	}
-	if len(vis) != 2 || vis[0] != "u1" || vis[1] != "u2" {
-		t.Fatalf("non-string visibles elements must be dropped: %+v", vis)
-	}
-}
-
-// TestExtractVisibility_NonStringSpaceIDKeepsVisibles 🔴 V3b fail-OPEN 根因回归门：
-// 某行 payload 的 space_id 是**非字符串** JSON 类型（数字/对象/上游漂移），而 visibles 数据**合法**。
-// 旧实现用 strict struct（SpaceID string）→ 整条 Unmarshal 失败 → 返回 "",nil → 合法 visibles 被
-// 静默清空 → reader fail-OPEN（普通成员搜出群管才可见消息）。修后：space_id 怪异类型退化为空
-// spaceId（reader p2p fail-closed，安全方向），但 visibles **必须**完整保留——绝不产出空 visibles。
-func TestExtractVisibility_NonStringSpaceIDKeepsVisibles(t *testing.T) {
-	cases := []struct {
-		name    string
-		payload string
-	}{
-		{"space_id is number", `{"space_id":123,"visibles":["admin1","admin2"]}`},
-		{"space_id is object", `{"space_id":{"nested":1},"visibles":["admin1","admin2"]}`},
-		{"space_id is bool", `{"space_id":true,"visibles":["admin1","admin2"]}`},
-		{"space_id is null", `{"space_id":null,"visibles":["admin1","admin2"]}`},
-		{"space_id is array", `{"space_id":["x"],"visibles":["admin1","admin2"]}`},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			sid, vis, err := extractVisibility([]byte(tc.payload))
+// TestBackfillRunsSharedFailClosedVectors 🔴 验收门(ii) 同口径锁：backfill 富化路径必须跑
+// **与 producer 完全相同**的 searchmsg.FailClosedVisibilityVectors() 向量，证明两仓用同一个
+// octo-lib searchmsg.ExtractVisibility（票2 共享 fail-closed parser），口径不分叉（防 #1124）。
+//
+// 第一段直接对 searchmsg.ExtractVisibility 跑向量（锁 parser 本体口径）；第二段把每条向量喂进
+// backfill 的 docFromRow（锁 backfill 实际接线：fail-closed 向量必落 DLQ 绝不写空 visibles，
+// 放行向量 visibles 完整落 doc），证明 backfill 没有在 parser 之外再放水。
+func TestBackfillRunsSharedFailClosedVectors(t *testing.T) {
+	for _, v := range searchmsg.FailClosedVisibilityVectors() {
+		t.Run("parser/"+v.Name, func(t *testing.T) {
+			sid, vis, err := searchmsg.ExtractVisibility(v.Payload)
+			if v.WantErr {
+				if err == nil {
+					t.Fatalf("vector %q: want fail-closed (err), got spaceID=%q visibles=%+v", v.Name, sid, vis)
+				}
+				return
+			}
 			if err != nil {
-				t.Fatalf("a weird space_id type must NOT fail visibility parse: %v", err)
+				t.Fatalf("vector %q: want pass, got err=%v", v.Name, err)
 			}
-			if sid != "" {
-				t.Fatalf("non-string space_id must degrade to empty spaceId (p2p fail-closed), got %q", sid)
+			if sid != v.WantSpaceID {
+				t.Fatalf("vector %q: spaceID=%q want %q", v.Name, sid, v.WantSpaceID)
 			}
-			if len(vis) != 2 || vis[0] != "admin1" || vis[1] != "admin2" {
-				t.Fatalf("legitimate visibles must NOT be cleared by a weird space_id (V3b fail-OPEN): %+v", vis)
-			}
-		})
-	}
-}
-
-// TestExtractVisibility_StringSpaceIDStillParsed 字符串 space_id 仍正常取值（容忍类型未破坏正常路径）。
-func TestExtractVisibility_StringSpaceIDStillParsed(t *testing.T) {
-	sid, vis, err := extractVisibility([]byte(`{"space_id":"space-A","visibles":["u1"]}`))
-	if err != nil {
-		t.Fatalf("unexpected err: %v", err)
-	}
-	if sid != "space-A" {
-		t.Fatalf("string space_id must parse: %q", sid)
-	}
-	if len(vis) != 1 || vis[0] != "u1" {
-		t.Fatalf("visibles: %+v", vis)
-	}
-}
-
-// TestExtractVisibility_StructurallyBrokenFailClosed payload 顶层非对象 / visibles 非数组 → err（fail-closed）。
-// 调用方据此落 DLQ，绝不写空 visibles。
-func TestExtractVisibility_StructurallyBrokenFailClosed(t *testing.T) {
-	cases := []struct {
-		name    string
-		payload string
-	}{
-		{"not json", `{not json`},
-		{"top-level array", `["a","b"]`},
-		{"top-level scalar", `42`},
-		{"visibles is object", `{"space_id":"s1","visibles":{"u1":true}}`},
-		{"visibles is string", `{"space_id":"s1","visibles":"u1,u2"}`},
-		{"visibles is number", `{"space_id":"s1","visibles":7}`},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			_, _, err := extractVisibility([]byte(tc.payload))
-			if err == nil {
-				t.Fatalf("structurally broken visibility must fail-closed (err), not silently empty: %q", tc.payload)
+			if !equalStrings(vis, v.WantVisibles) {
+				t.Fatalf("vector %q: visibles=%+v want %+v", v.Name, vis, v.WantVisibles)
 			}
 		})
 	}
 }
 
-// TestExtractVisibility_AbsentVisiblesNoError 缺 visibles / visibles=null → 空切片 + 无错（reader 无 gate，合法）。
-func TestExtractVisibility_AbsentVisiblesNoError(t *testing.T) {
-	for _, p := range []string{`{"space_id":"s1"}`, `{"space_id":"s1","visibles":null}`, `{}`} {
-		sid, vis, err := extractVisibility([]byte(p))
-		if err != nil {
-			t.Fatalf("absent visibles is legitimate (no gate), must not fail-closed: %q err=%v", p, err)
-		}
-		if len(vis) != 0 {
-			t.Fatalf("absent visibles must be empty: %+v", vis)
-		}
-		_ = sid
+// TestDocFromRow_SharedVectorsWiredFailClosed 把共享向量喂进 backfill docFromRow，断言接线正确：
+//   - WantErr 向量（含 valid-but-empty visibles：[] / null / 全非字符串 / 全空串）→ outcomeDLQ，
+//     该行**绝不写入** ES（fail-closed）。这正是验收门(ii) 真正闭合处：旧自实现对 [] / null / 全非
+//     字符串放行 fail-OPEN，共享 parser 一律 fail-closed 落 DLQ。
+//   - 放行向量 → 非 DLQ（OK 或 raw_excluded，取决于 payload 是否带 type=text），且 doc 的
+//     SpaceID/Visibles 与向量期望一致（visibles 被忠实富化进 doc，不放空）。
+//
+// 注：向量是为 ExtractVisibility 本体设计的，部分 payload 不带 type=1 文本正文，故经 extractMessage
+// 内容门后落 raw_excluded（仍写 doc、仍富化 visibles）属预期；本测试只锁「fail-closed 必落 DLQ /
+// 放行必富化 visibles」这条接线不变量，不锁正文 outcome 的 OK/raw_excluded 细分。
+func TestDocFromRow_SharedVectorsWiredFailClosed(t *testing.T) {
+	for _, v := range searchmsg.FailClosedVisibilityVectors() {
+		t.Run(v.Name, func(t *testing.T) {
+			// 非加密文本行（payload = 向量字节），message_id 数值可解析。
+			row := &srcMessageRow{ID: 1, MessageID: "1001", ChannelType: 2, Payload: v.Payload}
+			doc, outcome, err := docFromRow(row)
+			if v.WantErr {
+				// fail-closed：该行必须落 DLQ（永不写入 ES），绝不产出带空 visibles 的可写 doc。
+				if outcome != outcomeDLQ {
+					t.Fatalf("vector %q: fail-closed must route to DLQ (never written), got outcome=%v err=%v doc.Visibles=%+v",
+						v.Name, outcome, err, doc.Visibles)
+				}
+				return
+			}
+			// 放行向量：不得落 DLQ；visibles 必须被富化进 doc（不放空 → reader 不会 fail-OPEN）。
+			if outcome == outcomeDLQ {
+				t.Fatalf("vector %q: legitimate visibility must not DLQ, got err=%v", v.Name, err)
+			}
+			if err != nil {
+				t.Fatalf("vector %q: unexpected err=%v", v.Name, err)
+			}
+			if doc.SpaceID != v.WantSpaceID {
+				t.Fatalf("vector %q: doc.SpaceID=%q want %q", v.Name, doc.SpaceID, v.WantSpaceID)
+			}
+			if !equalStrings(doc.Visibles, v.WantVisibles) {
+				t.Fatalf("vector %q: doc.Visibles=%+v want %+v", v.Name, doc.Visibles, v.WantVisibles)
+			}
+		})
 	}
+}
+
+// equalStrings 比较两个字符串切片（nil 与空切片视为相等：reader 对二者均「无 gate」）。
+func equalStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // TestDocFromRow_NonStringSpaceIDKeepsVisibles 🔴 端到端 V3b：backfill doc 富化路径下，

@@ -1,5 +1,5 @@
-github.com/Mininglamp-OSS/octo-lib v0.0.0-20260614033907-f62e626a34db h1:FudjIbMVhMga/sUsysfzKBI7LTdz0Rgw9EWU2tEJzAo=
-github.com/Mininglamp-OSS/octo-lib v0.0.0-20260614033907-f62e626a34db/go.mod h1:uOCTTI3QdG0ETKZ6uluRWUZgKexee/pY1pQYWyIEvZ0=
+github.com/Mininglamp-OSS/octo-lib v0.0.0-20260618092744-45384c784102 h1:Alkam9eQ9y2alz9Y0vo3TRVoyc3OMpgaLQgTmgg1RKU=
+github.com/Mininglamp-OSS/octo-lib v0.0.0-20260618092744-45384c784102/go.mod h1:uOCTTI3QdG0ETKZ6uluRWUZgKexee/pY1pQYWyIEvZ0=
 github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c=
 github.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
 github.com/go-sql-driver/mysql v1.7.1 h1:lUIinVbN1DY0xBg0eMOzmmtGoHwWBbvnWubQUrtU8EI=

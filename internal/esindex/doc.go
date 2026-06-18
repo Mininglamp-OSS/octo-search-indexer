@@ -71,13 +71,15 @@ func parseMessageID(messageID string) (int64, error) {
 
 // DocFromMessage 把 Kafka 契约消息（searchmsg.Message）转成 reader 可读 Doc（实时 consumer 路径）。
 //
-// ⚠️ 实时路径的契约局限（阶段 9 上线前置 sibling）：searchmsg.Message **不携带**
-// spaceId / visibles / messageSeq（producer 只抽 content）。故实时路径写出的 Doc 这三字段
-// 为空：reader 对空 spaceId（p2p）走 fail-closed（同 space 不命中），对空 visibles 无 gate，
-// 对 messageSeq=0 保守隐藏——均**安全方向**。要让实时路径填全这三字段，须扩 octo-lib 契约
-// （+SpaceID/+Visibles/+MessageSeq，SchemaVersion 1→2）+ octo-server searchetl producer 富化，
-// 二者随阶段 9 开 Kafka.On 一并上线（本期 Kafka.On=OFF，无实时流量）。
-// 存量数据的这三字段由 backfill 路径（读原始 MySQL payload）自源填全 → 满足 V1(b)/V3b。
+// ✅ 契约已升到 v2（SchemaVersion=2）：searchmsg.Message 携带 reader 必读的安全/正确性字段
+// SpaceID / Visibles / MessageSeq（octo-server searchetl producer 富化后填全）。DocFromMessage
+// 把这三字段从契约逐字段 copy 进 Doc —— 这正是 TestV2Gate_DocFromMessageWiresSafetyFields 钉死
+// 的「v2 bump 必须同步接线」：若解了实时安全闸（LiveContractCarriesSafetyFields）却不接线，
+// 实时路径会写出空 visibles 的 doc → reader fail-OPEN（普通成员搜出群管才可见的系统消息）。
+//
+// 注意：producer 是否对每条消息填非空 visibles 是 producer 侧 fail-closed（空 visibles → DLQ，
+// 不进 Kafka）的职责（票2）；indexer 侧只负责忠实搬运契约已带的字段。存量数据的这三字段由
+// backfill 路径（读原始 MySQL payload + searchmsg.ExtractVisibility）自源填全。
 func DocFromMessage(msg searchmsg.Message) (Doc, error) {
 	id, err := parseMessageID(msg.MessageID)
 	if err != nil {
@@ -86,9 +88,12 @@ func DocFromMessage(msg searchmsg.Message) (Doc, error) {
 	d := Doc{
 		SchemaVersion: msg.SchemaVersion,
 		MessageID:     id,
+		MessageSeq:    msg.MessageSeq,
 		From:          msg.FromUID,
 		ChannelID:     msg.ChannelID,
 		ChannelType:   uint32(msg.ChannelType),
+		SpaceID:       msg.SpaceID,
+		Visibles:      msg.Visibles,
 		Timestamp:     msg.MsgTimestamp,
 		CreatedAt:     msg.CreatedAt,
 		RawExcluded:   msg.RawExcluded,
