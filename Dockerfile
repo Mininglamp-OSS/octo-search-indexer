@@ -8,13 +8,24 @@ COPY go.mod go.sum ./
 RUN go mod download
 
 COPY . .
-RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /es-indexer ./cmd/es-indexer
+# Build all three pipeline binaries:
+#   es-indexer — the long-running Kafka→OpenSearch consumer (default entrypoint).
+#   backfill   — one-shot historical loader (MySQL shards → OpenSearch, bypass Kafka).
+#   reconcile  — MySQL-vs-OpenSearch count/sample correctness gate (exit 2 on mismatch).
+# backfill + reconcile are on-demand ops tools the deployment upgrade flow runs as
+# one-shot jobs; shipping them in the same image means operators do not need a
+# separate Go toolchain or a second image to turn search on.
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /es-indexer ./cmd/es-indexer \
+  && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /backfill ./cmd/backfill \
+  && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /reconcile ./cmd/reconcile
 
 FROM alpine:3.19
 RUN apk add --no-cache ca-certificates tzdata wget \
   && adduser -D -u 10001 appuser
 
 COPY --from=builder /es-indexer /usr/local/bin/es-indexer
+COPY --from=builder /backfill /usr/local/bin/backfill
+COPY --from=builder /reconcile /usr/local/bin/reconcile
 
 USER appuser
 
