@@ -47,18 +47,28 @@ spec:
             - |
               set -e
               IKVER=2.17.0
-              if [ -d /shared-plugins/analysis-ik ]; then
-                echo "analysis-ik already present, skip"; exit 0
+              # YUJ-5101: 守卫改为检测词典文件 (旧守卫只看 plugins 目录存在即 skip,
+              #   重部署会跳过、永不补词典)。须 plugin 目录 + IKAnalyzer.cfg.xml 词典都在才 skip。
+              if [ -f /shared-config/analysis-ik/IKAnalyzer.cfg.xml ] && [ -d /shared-plugins/analysis-ik ]; then
+                echo "analysis-ik plugin + dict already present, skip"; exit 0
               fi
-              echo "installing analysis-ik ${IKVER} into shared plugins volume"
-              # 装到临时 OPENSEARCH_PATH_PLUGINS, 再 copy 进共享卷
+              echo "installing analysis-ik ${IKVER} (plugin + dict) into shared volumes"
+              # opensearch-plugin install 会把 plugin jar 装到 plugins/analysis-ik,
+              #   并把 IK 词典 (main.dic/extra_*.dic/IKAnalyzer.cfg.xml ~8MB) 重定位到
+              #   config/analysis-ik/ —— 两处都要拷进共享卷, 否则主容器缺词典 → bulk 500 NPE。
               /usr/share/opensearch/bin/opensearch-plugin install --batch \
                 https://release.infinilabs.com/analysis-ik/stable/opensearch-analysis-ik-${IKVER}.zip
+              rm -rf /shared-plugins/analysis-ik
               cp -r /usr/share/opensearch/plugins/analysis-ik /shared-plugins/
-              echo "analysis-ik installed:"; ls -la /shared-plugins/analysis-ik | head
+              mkdir -p /shared-config/analysis-ik
+              cp -r /usr/share/opensearch/config/analysis-ik/* /shared-config/analysis-ik/
+              echo "plugin:"; ls -la /shared-plugins/analysis-ik | head
+              echo "dict:"; ls -la /shared-config/analysis-ik | head
           volumeMounts:
             - name: plugins
               mountPath: /shared-plugins
+            - name: ik-config
+              mountPath: /shared-config
           resources:
             requests:
               cpu: 100m
@@ -104,6 +114,9 @@ spec:
             - name: plugins
               mountPath: /usr/share/opensearch/plugins/analysis-ik
               subPath: analysis-ik   # 把 initContainer 装好的 IK 挂进主容器 plugins 目录
+            - name: ik-config
+              mountPath: /usr/share/opensearch/config/analysis-ik
+              subPath: analysis-ik   # YUJ-5101: IK 词典 (config/analysis-ik) 缺它 → bulk 500 NPE
           readinessProbe:
             httpGet:
               path: /_cluster/health
@@ -120,6 +133,8 @@ spec:
       volumes:
         - name: plugins
           emptyDir: {}            # initContainer 装 IK 到这 → 主容器 subPath 挂载
+        - name: ik-config
+          emptyDir: {}            # YUJ-5101: initContainer 装 IK 词典到这 → 主容器 subPath 挂载
   volumeClaimTemplates:
     - metadata:
         name: data
