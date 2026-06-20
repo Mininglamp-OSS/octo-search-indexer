@@ -13,6 +13,8 @@ todos
 /backfill
 /es-indexer
 /reconcile
+/searchetl-producer
+/producer
 
 # Output
 *.out
