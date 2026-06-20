@@ -16,9 +16,11 @@ seeds a controlled message fixture (`seed.sql`), and runs the Go verifier
 1. **poll → enrich → Kafka** — stable rows land on the body topic with the right
    enrichment (text body, `visibles` whitelist, `raw_excluded` for Signal/media),
    and genuine anomalies + fail-closed visibility violations land on the DLQ
-   topic. This is a **field-level** assertion (not a bare doc count): it checks
-   the actual contract contents, including the #1124 fail-closed guard that the
-   empty-`visibles` row must route to DLQ, never to the body topic.
+   topic as forensic **DLQ envelopes** (reason + raw payload + source locator,
+   not bare body contracts). This is a **field-level** assertion (not a bare doc
+   count): it checks the actual contract contents, including the #1124
+   fail-closed guard that the empty-`visibles` row must route to DLQ, never to
+   the body topic.
 2. **Redis lock mutual exclusion** — two concurrent `RunIncremental` calls
    sharing the same lock key never both produce; exactly one wins, the other
    skips.
