@@ -9,10 +9,11 @@ import (
 // Scheduler drives the slow-cursor incremental extraction on a fixed tick.
 //
 // This is the slim mirror of the source module's scheduler: a minute-grade
-// time.Ticker, each tick calling RunIncremental once. Slow cursor only (lag held
-// at the conservative default). Cross-replica mutual exclusion / lock-loss abort
-// is handled inside RunIncremental's Redis run-lock; the scheduler only owns
-// "fire on cadence + lifecycle".
+// time.Ticker, each tick calling RunIncremental once. It runs one round
+// immediately on Start (no wait for the first interval), then ticks on cadence.
+// Slow cursor only (lag held at the conservative default). Cross-replica mutual
+// exclusion / lock-loss abort is handled inside RunIncremental's Redis run-lock;
+// the scheduler only owns "fire on cadence + lifecycle".
 type Scheduler struct {
 	interval time.Duration
 	tables   []string
@@ -60,6 +61,17 @@ func (s *Scheduler) loop(ctx context.Context) {
 	defer close(s.done)
 	t := time.NewTicker(s.interval)
 	defer t.Stop()
+	// 🔵 Run one round immediately on start, before waiting out the first ticker
+	// interval. Otherwise the producer idles for a full tick (default 60s) after
+	// boot before it streams anything — slow first-light on deploy and, more
+	// importantly, a long blind window during the runtime cut-over when the
+	// independent producer is expected to pick up the cursor "within seconds"
+	// (gate A2). The run-lock + cursor CAS + idempotent sink make an extra early
+	// round safe; respect ctx cancellation so a fast SIGTERM right after Start
+	// does not still fire a round.
+	if ctx.Err() == nil {
+		s.tick(ctx)
+	}
 	for {
 		select {
 		case <-ctx.Done():

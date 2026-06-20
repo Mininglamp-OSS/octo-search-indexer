@@ -7,10 +7,12 @@ import "github.com/Mininglamp-OSS/octo-lib/contract/searchmsg"
 // The caller produces main + dlq (all confirmed) THEN advances the cursor to maxID.
 type chunkPlan struct {
 	// main goes to the body topic (outcomeOK bodies + outcomeRawExcluded
-	// content=null messages).
+	// content=null messages) as searchmsg.Message contracts.
 	main []searchmsg.Message
-	// dlq goes to the DLQ topic (outcomeDLQ: genuine anomalies).
-	dlq []searchmsg.Message
+	// dlq goes to the DLQ topic (outcomeDLQ: genuine anomalies) as forensic
+	// DLQEnvelope records (reason + raw payload + source locator), NOT bare body
+	// contracts — the DLQ stream is terminal and optimized for triage/replay.
+	dlq []DLQEnvelope
 	// stableCount is the number of rows in the stable prefix (= len(main)+len(dlq);
 	// used to decide whether the unstable tail was reached).
 	stableCount int
@@ -23,12 +25,15 @@ type chunkPlan struct {
 
 // planChunk applies, over an id-ascending batch: ① the stability gate truncation
 // (C1, cutoff=DB_NOW-lag) → ② per-row extraction three-state routing (OK/Raw →
-// main, DLQ → dlq).
+// main as searchmsg.Message, DLQ → dlq as a forensic DLQEnvelope tagged with the
+// dead-letter reason + source locator).
 //
-// Pure function: rows + cutoff in, plan out, touches no DB/Kafka. The cursor
-// watermark is the last stable-prefix row id regardless of outcome — raw_excluded
-// / DLQ rows are consumed too, their ids must count toward the watermark.
-func planChunk(rows []*srcMessageRow, cutoff int64) chunkPlan {
+// Pure function: rows + cutoff in, plan out, touches no DB/Kafka/clock. The
+// cursor watermark is the last stable-prefix row id regardless of outcome —
+// raw_excluded / DLQ rows are consumed too, their ids must count toward the
+// watermark. The DLQ envelope's produce timestamp is stamped later by the sink so
+// this stays deterministic.
+func planChunk(table string, rows []*srcMessageRow, cutoff int64) chunkPlan {
 	stable := stablePrefix(rows, cutoff)
 	plan := chunkPlan{stableCount: len(stable)}
 	if len(stable) == 0 {
@@ -36,10 +41,10 @@ func planChunk(rows []*srcMessageRow, cutoff int64) chunkPlan {
 	}
 	plan.main = make([]searchmsg.Message, 0, len(stable))
 	for _, row := range stable {
-		msg, outcome := extractMessage(row)
+		msg, outcome, reason := extractMessage(row)
 		switch outcome {
 		case outcomeDLQ:
-			plan.dlq = append(plan.dlq, msg)
+			plan.dlq = append(plan.dlq, newDLQEnvelope(table, row, reason))
 		default: // outcomeOK / outcomeRawExcluded both go to the body stream
 			plan.main = append(plan.main, msg)
 		}

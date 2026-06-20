@@ -191,15 +191,15 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("drain main topic: %w", err)
 	}
-	dlqMsgs, err := drainTopic(ctx, cfg.Brokers, cfg.DLQTopic, 2)
+	dlqEnvelopes, err := drainDLQ(ctx, cfg.Brokers, cfg.DLQTopic, 2)
 	if err != nil {
 		return fmt.Errorf("drain dlq topic: %w", err)
 	}
 	if len(mainMsgs) != 4 {
 		return fmt.Errorf("main topic: want 4 messages, got %d", len(mainMsgs))
 	}
-	if len(dlqMsgs) != 2 {
-		return fmt.Errorf("dlq topic: want 2 messages, got %d", len(dlqMsgs))
+	if len(dlqEnvelopes) != 2 {
+		return fmt.Errorf("dlq topic: want 2 messages, got %d", len(dlqEnvelopes))
 	}
 
 	// Assert enrichment correctness on the main stream.
@@ -228,18 +228,39 @@ func run() error {
 	if _, leaked := byID["1000000000000000006"]; leaked {
 		return fmt.Errorf("SECURITY: empty-visibles row leaked into main topic (fail-OPEN)")
 	}
-	dlqIDs := map[string]bool{}
-	for _, m := range dlqMsgs {
-		dlqIDs[m.MessageID] = true
+	// 🟡 DLQ records are forensic envelopes (reason + raw payload + source locator),
+	// not bare body contracts — assert the triage context survived.
+	dlqByID := map[string]producer.DLQEnvelope{}
+	for _, e := range dlqEnvelopes {
+		dlqByID[e.MessageID] = e
+		if e.SchemaVersion != 1 {
+			return fmt.Errorf("dlq envelope %s wrong schema_version %d", e.MessageID, e.SchemaVersion)
+		}
+		if e.Reason == "" || len(e.RawPayload) == 0 || e.ShardTable == "" || e.SourceID == 0 {
+			return fmt.Errorf("dlq envelope %s missing forensic context: %+v", e.MessageID, e)
+		}
+		if e.ProducedAt == 0 {
+			return fmt.Errorf("dlq envelope %s must be stamped with produced_at", e.MessageID)
+		}
 	}
-	if !dlqIDs["1000000000000000006"] {
-		return fmt.Errorf("empty-visibles row must be routed to DLQ (fail-closed), dlq ids=%v", dlqIDs)
+	if _, ok := dlqByID["1000000000000000006"]; !ok {
+		return fmt.Errorf("empty-visibles row must be routed to DLQ (fail-closed), dlq ids=%v", dlqKeys(dlqByID))
 	}
-	if !dlqIDs["1000000000000000005"] {
-		return fmt.Errorf("bad-json row must be routed to DLQ, dlq ids=%v", dlqIDs)
+	if _, ok := dlqByID["1000000000000000005"]; !ok {
+		return fmt.Errorf("bad-json row must be routed to DLQ, dlq ids=%v", dlqKeys(dlqByID))
 	}
-	log.Printf("invariant ① OK: 4 main (text/visibles/raw×2) + 2 dlq (bad-json + empty-visibles fail-closed)")
+	log.Printf("invariant ① OK: 4 main (text/visibles/raw×2) + 2 dlq envelopes (bad-json + empty-visibles fail-closed, reasons=%q/%q)",
+		dlqByID["1000000000000000005"].Reason, dlqByID["1000000000000000006"].Reason)
 	return nil
+}
+
+// dlqKeys returns the message ids present in a DLQ-envelope map (error messages).
+func dlqKeys(m map[string]producer.DLQEnvelope) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	return out
 }
 
 // countingSink counts produced rows and sleeps to force temporal overlap; it does
@@ -256,9 +277,9 @@ func (s *countingSink) ProduceBatch(_ context.Context, msgs []searchmsg.Message)
 	time.Sleep(s.delay)
 	return nil
 }
-func (s *countingSink) ProduceDLQ(_ context.Context, msgs []searchmsg.Message) error {
-	if len(msgs) > 0 {
-		s.counter.Add(int64(len(msgs)))
+func (s *countingSink) ProduceDLQ(_ context.Context, envelopes []producer.DLQEnvelope) error {
+	if len(envelopes) > 0 {
+		s.counter.Add(int64(len(envelopes)))
 	}
 	return nil
 }
@@ -311,6 +332,41 @@ func drainTopic(ctx context.Context, brokers []string, topic string, want int) (
 			return nil, fmt.Errorf("decode %s offset %d: %w", topic, m.Offset, uerr)
 		}
 		out = append(out, msg)
+	}
+	return out, nil
+}
+
+// drainDLQ reads up to want DLQ records from the DLQ topic and decodes them as
+// producer.DLQEnvelope (the producer-specific forensic shape, NOT the body
+// contract).
+func drainDLQ(ctx context.Context, brokers []string, topic string, want int) ([]producer.DLQEnvelope, error) {
+	r := kafka.NewReader(kafka.ReaderConfig{
+		Brokers:     brokers,
+		Topic:       topic,
+		Partition:   0,
+		StartOffset: kafka.FirstOffset,
+		MinBytes:    1,
+		MaxBytes:    10 << 20,
+	})
+	defer func() {
+		if cerr := r.Close(); cerr != nil {
+			log.Printf("close kafka reader for %s: %v", topic, cerr)
+		}
+	}()
+
+	var out []producer.DLQEnvelope
+	for len(out) < want {
+		rctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		m, err := r.ReadMessage(rctx)
+		cancel()
+		if err != nil {
+			break // idle timeout / no more messages
+		}
+		var env producer.DLQEnvelope
+		if uerr := json.Unmarshal(m.Value, &env); uerr != nil {
+			return nil, fmt.Errorf("decode dlq %s offset %d: %w", topic, m.Offset, uerr)
+		}
+		out = append(out, env)
 	}
 	return out, nil
 }

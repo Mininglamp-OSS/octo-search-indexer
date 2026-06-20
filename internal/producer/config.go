@@ -126,8 +126,16 @@ const (
 var defaultTables = []string{"message", "message1", "message2", "message3", "message4"}
 
 // LoadConfig builds Config from the environment and reports whether the producer
-// is enabled. enabled=false means the binary idles (zero runtime behavior) —
-// PRODUCER_ENABLED must be true AND brokers + DSN + Redis addr present.
+// was REQUESTED via the master switch (PRODUCER_ENABLED=true).
+//
+// 🔴 The returned bool is the master switch ALONE — it deliberately does NOT
+// fold in config completeness. The caller distinguishes two states so a cut-over
+// can never silently no-op:
+//   - requested=false → the producer is intentionally off; idle (zero runtime
+//     behavior, no backend connection).
+//   - requested=true → the operator means for it to run; the caller MUST then
+//     Validate() and fail-fast (loud crashloop) if DSN/brokers/Redis/lag are
+//     missing, rather than idling "ready" while producing nothing.
 func LoadConfig() (Config, bool) {
 	cfg := Config{
 		MySQLDSN: os.Getenv(envMySQLDSN),
@@ -158,9 +166,8 @@ func LoadConfig() (Config, bool) {
 		cfg.DBMaxIdleConns = cfg.DBMaxOpenConns
 	}
 
-	enabled := strings.EqualFold(os.Getenv(envEnabled), "true") &&
-		cfg.MySQLDSN != "" && len(cfg.Brokers) > 0 && cfg.RedisAddr != ""
-	return cfg, enabled
+	requested := strings.EqualFold(os.Getenv(envEnabled), "true")
+	return cfg, requested
 }
 
 // Validate checks an enabled config is internally coherent (fail-fast on boot).

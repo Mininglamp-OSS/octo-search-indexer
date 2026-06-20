@@ -24,6 +24,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"os"
 	"os/signal"
@@ -48,14 +49,24 @@ func main() {
 }
 
 func run(ctx context.Context) error {
-	cfg, enabled := producer.LoadConfig()
-	if !enabled {
-		log.Printf("searchetl-producer: PRODUCER_ENABLED not true (or brokers/DSN/Redis unset); idling (no backend connection)")
+	cfg, requested := producer.LoadConfig()
+	if !requested {
+		log.Printf("searchetl-producer: PRODUCER_ENABLED not true; idling (no backend connection)")
+		// Serve health endpoints even while idling so an orchestrator's
+		// liveness/readiness probes do not crashloop a deliberately-disabled
+		// pod (the opt-in "deployed but off" posture). Both /healthz and /readyz
+		// report 200: per the plan, "idling normally" is a ready state — it lets
+		// the opt-in deploy roll out cleanly without receiving any traffic (the
+		// producer exposes no Service). It connects to no backend.
+		serveIdleObs(ctx, cfg.ObsAddr)
 		<-ctx.Done()
 		return nil
 	}
+	// 🔴 PRODUCER_ENABLED=true means the operator intends this to run. Missing
+	// DSN/brokers/Redis/lag is then a hard error (fail-fast crashloop), NOT a
+	// silent idle — otherwise a cut-over would no-op while reporting healthy.
 	if err := cfg.Validate(); err != nil {
-		return err
+		return fmt.Errorf("searchetl-producer: PRODUCER_ENABLED=true but config invalid (refusing to idle on a requested producer): %w", err)
 	}
 
 	// Source DB with an explicit connection pool (no bare driver defaults).
@@ -138,4 +149,30 @@ func run(ctx context.Context) error {
 	}
 	sched.Stop()
 	return nil
+}
+
+// serveIdleObs starts the observability HTTP server for the idle (disabled)
+// posture: /healthz and /readyz both return 200. Per the plan, "idling
+// normally" is a ready state — this keeps a deliberately-disabled pod
+// (PRODUCER_ENABLED=false, the opt-in "deployed but off" default) from
+// crashlooping under an orchestrator's HTTP probes and lets the opt-in deploy
+// roll out cleanly. It connects to no backend (ready check is nil; the producer
+// exposes no Service so a ready idle pod receives no traffic). A graceful
+// shutdown stops it on ctx cancel.
+func serveIdleObs(ctx context.Context, addr string) {
+	if addr == "" {
+		return
+	}
+	obs := producer.NewObsServer(addr, nil, nil)
+	obs.SetReady(true) // idling normally is a ready state (no backend dialed)
+	obs.Start(log.Printf)
+	go func() {
+		<-ctx.Done()
+		sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if serr := obs.Shutdown(sctx); serr != nil {
+			log.Printf("searchetl-producer: idle obs shutdown: %v", serr)
+		}
+	}()
+	log.Printf("searchetl-producer: idle observability server on %s (/healthz + /readyz 200, idle)", addr)
 }

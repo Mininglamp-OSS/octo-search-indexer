@@ -167,7 +167,7 @@ func runChunk(ctx context.Context, store Store, sink Sink, table string, cutoff 
 			table, bad, rows[bad-1].ID, rows[bad].ID)
 	}
 
-	plan := planChunk(rows, cutoff)
+	plan := planChunk(table, rows, cutoff)
 	if !plan.advanced {
 		// Head row not yet stable: do not advance this round; wait for it to age lag.
 		return plan, 0, nil

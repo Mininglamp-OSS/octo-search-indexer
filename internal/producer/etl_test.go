@@ -75,7 +75,7 @@ func (f *fakeStore) AdvanceCursor(_ context.Context, table string, expected, new
 type fakeSink struct {
 	mu       sync.Mutex
 	main     []searchmsg.Message
-	dlq      []searchmsg.Message
+	dlq      []DLQEnvelope
 	mainErr  error
 	dlqErr   error
 	closeErr error
@@ -91,12 +91,12 @@ func (s *fakeSink) ProduceBatch(_ context.Context, msgs []searchmsg.Message) err
 	return nil
 }
 
-func (s *fakeSink) ProduceDLQ(_ context.Context, msgs []searchmsg.Message) error {
+func (s *fakeSink) ProduceDLQ(_ context.Context, envelopes []DLQEnvelope) error {
 	if s.dlqErr != nil {
 		return s.dlqErr
 	}
 	s.mu.Lock()
-	s.dlq = append(s.dlq, msgs...)
+	s.dlq = append(s.dlq, envelopes...)
 	s.mu.Unlock()
 	return nil
 }
@@ -264,7 +264,7 @@ func (b *blockingSinkT) ProduceBatch(context.Context, []searchmsg.Message) error
 	<-b.release
 	return nil
 }
-func (b *blockingSinkT) ProduceDLQ(context.Context, []searchmsg.Message) error { return nil }
+func (b *blockingSinkT) ProduceDLQ(context.Context, []DLQEnvelope) error { return nil }
 func (b *blockingSinkT) Close() error                                          { return nil }
 
 // TestPlanChunk_DLQRouting: bad-json row routed to dlq, cursor watermark counts it.
@@ -275,11 +275,29 @@ func TestPlanChunk_DLQRouting(t *testing.T) {
 		textRow(1, "ok", cutoff-10),
 		{ID: 2, MessageID: "1002", ChannelType: 2, Payload: []byte("{bad"), CreatedUnix: cutoff - 10},
 	}
-	plan := planChunk(rows, cutoff)
+	plan := planChunk("message", rows, cutoff)
 	if len(plan.main) != 1 || len(plan.dlq) != 1 {
 		t.Fatalf("want 1 main + 1 dlq, got main=%d dlq=%d", len(plan.main), len(plan.dlq))
 	}
 	if plan.maxID != 2 || !plan.advanced {
 		t.Fatalf("watermark must include the DLQ row id=2, got maxID=%d advanced=%v", plan.maxID, plan.advanced)
+	}
+	// 🟡 The DLQ entry must be a forensic envelope carrying the source locator +
+	// reason + raw payload, not a bare body contract.
+	dl := plan.dlq[0]
+	if dl.ShardTable != "message" || dl.SourceID != 2 || dl.MessageID != "1002" {
+		t.Fatalf("dlq envelope source locator wrong: %+v", dl)
+	}
+	if dl.Reason != dlqReasonPayloadUnparseable {
+		t.Fatalf("dlq reason = %q, want %q", dl.Reason, dlqReasonPayloadUnparseable)
+	}
+	if string(dl.RawPayload) != "{bad" {
+		t.Fatalf("dlq envelope must preserve the raw payload, got %q", dl.RawPayload)
+	}
+	if dl.SchemaVersion != dlqSchemaVersion {
+		t.Fatalf("dlq envelope schema_version = %d, want %d", dl.SchemaVersion, dlqSchemaVersion)
+	}
+	if dl.ProducedAt != 0 {
+		t.Fatalf("planChunk must stay pure (no clock): ProducedAt should be 0, got %d", dl.ProducedAt)
 	}
 }

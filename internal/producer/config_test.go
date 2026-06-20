@@ -5,31 +5,40 @@ import (
 	"testing"
 )
 
-// TestLoadConfig_DisabledByDefault: no env → disabled, idles, no backend connect.
+// TestLoadConfig_DisabledByDefault: no env → not requested, idles, no backend connect.
 func TestLoadConfig_DisabledByDefault(t *testing.T) {
 	t.Setenv(envEnabled, "")
-	_, enabled := LoadConfig()
-	if enabled {
-		t.Fatalf("producer must be disabled by default (zero production risk)")
+	_, requested := LoadConfig()
+	if requested {
+		t.Fatalf("producer must be off by default (zero production risk)")
 	}
 }
 
-// TestLoadConfig_EnabledRequiresAllBackends: enabled flag alone is not enough.
-func TestLoadConfig_EnabledRequiresAllBackends(t *testing.T) {
+// TestLoadConfig_RequestedIsMasterSwitchOnly: PRODUCER_ENABLED alone flips
+// "requested" true — config completeness is the caller's Validate() concern, NOT
+// folded into the master switch (so an enabled-but-misconfigured producer
+// fail-fasts instead of silently idling "ready").
+func TestLoadConfig_RequestedIsMasterSwitchOnly(t *testing.T) {
+	// Enabled but NO backends set: still requested=true (caller must Validate).
 	t.Setenv(envEnabled, "true")
 	t.Setenv(envMySQLDSN, "")
 	t.Setenv(envBrokers, "")
 	t.Setenv(envRedisAddr, "")
-	if _, enabled := LoadConfig(); enabled {
-		t.Fatalf("must stay disabled without DSN/brokers/redis")
+	cfg, requested := LoadConfig()
+	if !requested {
+		t.Fatalf("PRODUCER_ENABLED=true must report requested=true regardless of backend config")
+	}
+	if err := cfg.Validate(); err == nil {
+		t.Fatalf("a requested-but-misconfigured producer must fail Validate (not silently idle)")
 	}
 
+	// All backends set: requested + valid.
 	t.Setenv(envMySQLDSN, "user:pass@tcp(h:3306)/db")
 	t.Setenv(envBrokers, "localhost:9092")
 	t.Setenv(envRedisAddr, "localhost:6379")
-	cfg, enabled := LoadConfig()
-	if !enabled {
-		t.Fatalf("must be enabled when DSN+brokers+redis all set")
+	cfg, requested = LoadConfig()
+	if !requested {
+		t.Fatalf("must be requested when enabled")
 	}
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("validate: %v", err)

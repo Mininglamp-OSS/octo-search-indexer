@@ -60,14 +60,19 @@ type srcMessageRow struct {
 }
 
 // extractMessage enriches one source row into the Kafka body contract
-// (searchmsg.Message) + a three-state outcome.
+// (searchmsg.Message) + a three-state outcome + a dead-letter reason.
+//
+// The third return value is the machine-readable DLQ reason (one of the
+// dlqReason* constants); it is non-empty ONLY when outcome == outcomeDLQ and is
+// "" otherwise. The caller (planChunk) uses it to build a forensic DLQEnvelope —
+// keeping the WHY of a dead-letter next to the row instead of re-deriving it.
 //
 // Branch-for-branch aligned with octo-server/modules/searchetl/payload.go:
 //   - Signal-encrypted (setting bit OR signal column) → raw_excluded (do not try
 //     to parse the ciphertext, avoid misclassifying it as broken JSON → DLQ).
 //     spaceId/visibles stay empty (reader fail-closed, safe — body is excluded).
 //   - non-Signal → payload should be plaintext JSON; parse failure / empty map
-//     (a genuine anomaly) → DLQ.
+//     (a genuine anomaly) → DLQ (reason: payload unparseable).
 //   - on parse success, classify by type (tolerating float64/int/json.Number):
 //     · type=Text with string content → take it as the body (outcomeOK).
 //     · non-Text or non-string content → conservative raw_excluded.
@@ -76,9 +81,10 @@ type srcMessageRow struct {
 // non-encrypted messages we additionally extract SpaceID/Visibles via the SHARED
 // octo-lib searchmsg.ExtractVisibility. If visibility cannot be trusted (payload
 // not a JSON object, visibles present-but-unparseable or valid-but-empty) → the
-// whole row goes to DLQ; we NEVER write empty Visibles (the reader treats empty
-// visibles as fail-OPEN). MessageSeq comes from the message.message_seq column.
-func extractMessage(row *srcMessageRow) (searchmsg.Message, extractOutcome) {
+// whole row goes to DLQ (reason: visibility untrusted); we NEVER write empty
+// Visibles (the reader treats empty visibles as fail-OPEN). MessageSeq comes
+// from the message.message_seq column.
+func extractMessage(row *srcMessageRow) (searchmsg.Message, extractOutcome, string) {
 	msg := searchmsg.Message{
 		SchemaVersion: searchmsg.SchemaVersion,
 		MessageID:     row.MessageID,
@@ -96,14 +102,14 @@ func extractMessage(row *srcMessageRow) (searchmsg.Message, extractOutcome) {
 		// not an anomaly. spaceId/visibles stay empty (reader fail-closed, safe).
 		msg.RawExcluded = true
 		msg.Content = nil
-		return msg, outcomeRawExcluded
+		return msg, outcomeRawExcluded, ""
 	}
 
 	var m map[string]interface{}
 	if err := json.Unmarshal(row.Payload, &m); err != nil || len(m) == 0 {
 		// Non-encrypted message should be plaintext JSON; parse failure / empty
 		// map is a genuine anomaly → DLQ (cursor still advances).
-		return msg, outcomeDLQ
+		return msg, outcomeDLQ, dlqReasonPayloadUnparseable
 	}
 
 	// 🔴 Fail-closed visibility (access-control ACL): if it cannot be trusted →
@@ -111,7 +117,7 @@ func extractMessage(row *srcMessageRow) (searchmsg.Message, extractOutcome) {
 	// type does not drag down valid visibles (ExtractVisibility isolates that).
 	spaceID, visibles, verr := searchmsg.ExtractVisibility(row.Payload)
 	if verr != nil {
-		return msg, outcomeDLQ
+		return msg, outcomeDLQ, dlqReasonVisibilityUntrusted
 	}
 	msg.SpaceID = spaceID
 	msg.Visibles = visibles
@@ -124,7 +130,7 @@ func extractMessage(row *srcMessageRow) (searchmsg.Message, extractOutcome) {
 		// phase, raw_excluded.
 		msg.RawExcluded = true
 		msg.Content = nil
-		return msg, outcomeRawExcluded
+		return msg, outcomeRawExcluded, ""
 	}
 
 	c, ok := m["content"].(string)
@@ -133,12 +139,12 @@ func extractMessage(row *srcMessageRow) (searchmsg.Message, extractOutcome) {
 		// conservative raw_excluded, do not coerce.
 		msg.RawExcluded = true
 		msg.Content = nil
-		return msg, outcomeRawExcluded
+		return msg, outcomeRawExcluded, ""
 	}
 
 	content := c
 	msg.Content = &content
-	return msg, outcomeOK
+	return msg, outcomeOK, ""
 }
 
 // isSignalEncrypted reports whether a message is Signal-encrypted: the setting
