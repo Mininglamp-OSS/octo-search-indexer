@@ -137,22 +137,25 @@ Source of truth: `internal/producer/config.go`.
 | `PRODUCER_BATCH` | `5000` | keyset page size per shard (clamped 100–50000) |
 | `PRODUCER_LAG_SECONDS` | `600` | stability lag window; must be > 0 in prod (lag=0 risks silent missed reads), clamped ≤ 86400 |
 | `PRODUCER_TICK_SECONDS` | `60` | slow-cursor tick period (clamped 5–3600) |
-| `PRODUCER_OBS_ADDR` | `:9090` | observability HTTP addr (`/healthz` `/readyz` `/metrics`); empty disables |
+| `PRODUCER_OBS_ADDR` | `:9090` | observability HTTP addr (`/healthz` `/readyz` `/metrics`) |
 
 > **Opt-in safety contract (zero production risk by construction).** With
 > `PRODUCER_ENABLED` unset/`false` the producer **idles** — it dials no backend
 > and produces nothing (it only serves health probes so a "deployed but off" pod
 > doesn't crashloop). When `PRODUCER_ENABLED=true` the operator means it to run,
 > so the config is validated and the binary **fails fast (crashloops loudly)** if
-> DSN / brokers / Redis / lag are missing — it never idles "ready" while
-> silently producing nothing. The switch is intentionally separate from config
-> completeness so a cut-over can never silently no-op.
+> DSN / brokers / Redis are missing or `lag` is set to 0 — it never idles "ready"
+> while silently producing nothing. The switch is intentionally separate from
+> config completeness so a cut-over can never silently no-op.
 
 ## Backfill & reconciliation (must-run gate)
 
-The backfill job (`cmd/backfill`) loads existing `message` shards into
-OpenSearch, bypassing Kafka, and is the **only** path that fills the reader's
-safety fields (`spaceId`/`visibles`/`messageSeq`) from the raw MySQL payload.
+The backfill job (`cmd/backfill`) loads **historical / pre-existing** `message`
+shards into OpenSearch, bypassing Kafka, and fills the reader's safety fields
+(`spaceId`/`visibles`/`messageSeq`) from the raw MySQL payload for those rows.
+Realtime rows get the same fields enriched by `searchetl-producer` (fail-closed
+enrich) on the Kafka write path — so backfill is the loader for the historical
+back-load slice, not the only writer of these fields.
 
 A count match alone does not prove correctness — it proves only that the row
 *counts* tie, not that each doc's authz/correctness fields are right. **Always run
@@ -169,10 +172,10 @@ make run-recon RECON_FROM=<epoch> RECON_TO=<epoch> RECON_DLQ=<dlq-count> \
   RECON_DLQ_SPILL_DIR=<the backfill -spill-dir>
 ```
 
-The sample gate cross-checks `messageId` (full precision), `channelId`,
-`channelType`, `spaceId`, and **`visibles`** between MySQL and the ES doc, so a
-silently dropped ACL (`visibles`) field surfaces as `sample_mismatch>0` and the
-gate exits non-zero. Rows the backfill deliberately routed to the DLQ (bad
+The sample gate cross-checks `messageId` (full precision), `messageSeq`,
+`channelId`, `channelType`, `spaceId`, and **`visibles`** between MySQL and the ES
+doc, so a silently dropped ACL (`visibles`) field surfaces as `sample_mismatch>0`
+and the gate exits non-zero. Rows the backfill deliberately routed to the DLQ (bad
 payload / non-numeric id / permanent ES reject — already counted in `-dlq`) are
 *expected* to have no ES doc; both reconcile paths exclude them from the sample
 gate (inline reads its in-memory spill, standalone reads the same spill dir via
