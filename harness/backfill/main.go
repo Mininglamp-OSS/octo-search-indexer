@@ -29,14 +29,19 @@ import (
 // Seeded suite shape (kept tiny + explicit so the gate arithmetic is obvious):
 //   - 3 normal text rows (incl. 中文)            → indexed, content present
 //   - 1 Signal-encrypted row (signal column)     → raw_excluded, still 1 ES doc
-//   - 1 non-text (image) row                     → raw_excluded, still 1 ES doc
+//   - 1 non-text (image) row                     → PROJECTED (payload.image.url),
+//     NOT raw_excluded (Plan B / CDC-style: docFromRow now projects every typed
+//     payload from the raw payload整包 and recomputes RawExcluded from whether a
+//     typed sub-object was produced; an image row yields payload.image so it is a
+//     normal projected doc, not a raw-excluded one).
 //   - 1 bad-JSON non-encrypted row (real anomaly)→ DLQ spill, NOT in ES
 //
-// So: source_rows=6, expected ES docs=5 (6 - 1 DLQ), raw_excluded=2.
+// So: source_rows=6, expected ES docs=5 (6 - 1 DLQ), raw_excluded=1 (only the
+// Signal-encrypted row; the image row is projected post-Plan-B).
 const (
 	wantSource      = 6
 	wantESDocs      = 5
-	wantRawExcluded = 2
+	wantRawExcluded = 1
 	wantDLQ         = 1
 )
 
@@ -182,7 +187,7 @@ func verify(ctx context.Context, esURL, index string, base int64) error {
 		log.Printf("FAIL: raw_excluded=%d want %d", rawEx, wantRawExcluded)
 		fail = true
 	} else {
-		log.Printf("PASS: raw_excluded=%d (Signal + non-text, still occupy ES docs)", rawEx)
+		log.Printf("PASS: raw_excluded=%d (only the Signal-encrypted row; image row is projected post-Plan-B)", rawEx)
 	}
 	// Positively assert the bad-JSON row is NOT in ES (it went to DLQ spill).
 	badPresent, err := count(ctx, client, index, idsQuery("3000000000000000006"))
