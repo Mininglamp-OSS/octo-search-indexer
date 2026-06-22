@@ -24,16 +24,30 @@ type alerter interface {
 
 // dlqRecord 是落 DLQ 的记录载荷：原始消息 + 进 DLQ 的原因（便于排查/回灌）。
 type dlqRecord struct {
-	Reason    string `json:"reason"`     // permanent_4xx / unknown_schema_version / ...
+	Reason    string `json:"reason"`     // permanent_4xx / unknown_schema_version / visibility_untrusted
 	Topic     string `json:"topic"`      // 源 topic
 	Partition int    `json:"partition"`  // 源分区
 	Offset    int64  `json:"offset"`     // 源 offset
 	Key       []byte `json:"key"`        // 原始 Kafka key（= message_id）
-	Value     []byte `json:"value"`      // 原始消息字节（原样保留供回灌）
-	Status    int    `json:"status"`     // bulk per-item HTTP 状态（schema 错误为 0）
+	Value     []byte `json:"value"`      // 原始消息字节（原样保留供回灌；超限时截断置 nil，见 PayloadTruncated）
+	Status    int    `json:"status"`     // bulk per-item HTTP 状态（schema/visibility 错误为 0）
 	Detail    string `json:"detail"`     // 失败详情
 	SpilledAt int64  `json:"spilled_at"` // 仅本地 spill 文件记录写入时间（纪元秒）
+	// PayloadTruncated 标记 Value 因超限被截断（§4.4.3 B-5）：带大 RawPayload 的毒丸落 DLQ 时，
+	// 原样保留整条字节经 base64 膨胀会触发 DLQ topic 超限连锁卡死，故截断 Value 保证写入必成功。
+	// 回灌工具读到 true 时须从源 message 表按 messageId(=Key) 重取，而非依赖 DLQ 内字节。
+	PayloadTruncated bool `json:"payload_truncated,omitempty"`
 }
+
+// maxDLQRawValueBytes 是 consumer DLQ 信封里原始消息字节（Value）的截断阈值（§4.4.3 B-5）。
+//
+// 🔴 必须按「marshal 后信封体积」判，不能按原始字节直接拿 1MiB 判：DLQ 实际写出的是
+// json.Marshal(dlqRecord)，Go 把 Value []byte 编成 base64(~1.33x 膨胀) + 信封字段开销。若按
+// len(Value)>1048576 判，则 Value 落在 ~786KB–1MiB 区间时过不了原始字节判定 → 原样保留 →
+// base64 后 JSON 信封 >1MiB（broker message.max.bytes 硬限）→ DLQ 写失败 → 分区卡死。
+// 故取**预留 base64 余量的原始字节阈值** 700KB（700KB×1.33≈931KB + 信封 < 1MiB，留足头部余量）。
+// 与 producer 腿（internal/producer/dlq.go maxDLQRawPayloadBytes）同口径。
+const maxDLQRawValueBytes = 700_000
 
 // dlqConfig 配置 DLQ 投递的有界重试 + 终态逃逸（C4 硬条件）。
 type dlqConfig struct {

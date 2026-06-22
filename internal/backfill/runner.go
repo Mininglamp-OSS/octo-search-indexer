@@ -80,6 +80,13 @@ func (r *Runner) Run(ctx context.Context) (Stats, error) {
 	if err := r.writer.EnsureIndex(ctx); err != nil {
 		return total, fmt.Errorf("backfill: ensure index: %w", err)
 	}
+	// 🔴 mapping-compat fail-closed 断言（§6.4）：方案 B 后 backfill 也写 payloadRaw / richText /
+	// mergeForward.msgs.{from,timestamp}。若目标索引未迁这些字段，dynamic:strict 会**永久拒收**
+	// 这些 doc（spill 进 DLQ + 推进 checkpoint，静默漏灌）。故扫描前与 live consumer 同样做断言，
+	// 缺字段则**拒启动**（不静默向 strict 索引灌 4xx），不在扫描后才发现全量塌。
+	if err := r.writer.AssertLiveMappingCompatible(ctx); err != nil {
+		return total, fmt.Errorf("backfill: mapping-compat assertion: %w", err)
+	}
 	for _, table := range r.cfg.Tables {
 		s, err := r.runTable(ctx, table)
 		total.add(s)

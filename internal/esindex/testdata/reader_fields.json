@@ -1,0 +1,21 @@
+[
+  "messageId",
+  "messageSeq",
+  "channelId",
+  "channelType",
+  "from",
+  "to",
+  "spaceId",
+  "visibles",
+  "timestamp",
+  "payload.type",
+  "payload.text.content",
+  "payload.image.caption",
+  "payload.image.name",
+  "payload.file.caption",
+  "payload.file.name",
+  "payload.file.extension",
+  "payload.mergeForward.msgs.searchText",
+  "payload.mergeForward.msgs.from",
+  "payload.mergeForward.msgs.timestamp"
+]

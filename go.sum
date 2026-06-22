@@ -1,5 +1,5 @@
-github.com/Mininglamp-OSS/octo-lib v0.0.0-20260618092744-45384c784102 h1:Alkam9eQ9y2alz9Y0vo3TRVoyc3OMpgaLQgTmgg1RKU=
-github.com/Mininglamp-OSS/octo-lib v0.0.0-20260618092744-45384c784102/go.mod h1:uOCTTI3QdG0ETKZ6uluRWUZgKexee/pY1pQYWyIEvZ0=
+github.com/Mininglamp-OSS/octo-lib v0.0.0-20260622132305-e8f7feac26e7 h1:Z6rtBRWGXc7zygmjP/8gR+JYz+F/k+JLAxRAIvwlXvU=
+github.com/Mininglamp-OSS/octo-lib v0.0.0-20260622132305-e8f7feac26e7/go.mod h1:uOCTTI3QdG0ETKZ6uluRWUZgKexee/pY1pQYWyIEvZ0=
 github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c=
 github.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
 github.com/fsnotify/fsnotify v1.6.0 h1:n+5WquG0fcWoWp6xPWfHdbskMCQaFnG6PfBrh1Ky4HY=

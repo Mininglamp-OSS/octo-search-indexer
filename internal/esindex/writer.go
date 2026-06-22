@@ -36,6 +36,11 @@ type Writer interface {
 	// EnsureIndex 幂等创建目标索引（不存在则用内嵌 mapping 创建，已存在则不动）。
 	// 供服务启动与 backfill job 复用同一套 mapping bootstrap。
 	EnsureIndex(ctx context.Context) error
+	// AssertLiveMappingCompatible 启动期 fail-closed 断言：GET 目标索引 live mapping，校验本期
+	// 所有新字段路径齐备（payload.mergeForward.msgs.{from,timestamp} / payload.richText.searchText /
+	// payloadRaw enabled:false）。缺则返回 error，调用方拒启动（loud crash），不静默向
+	// dynamic:strict 索引灌 4xx（§6.4 部署竞态防护）。与 EnsureIndex 存在性幂等互相独立。
+	AssertLiveMappingCompatible(ctx context.Context) error
 	// Bulk 幂等写入一批 Kafka 契约消息（实时 consumer 路径）。内部转 reader 可读 Doc 后
 	// bulk upsert；契约 message_id 非数值（无法对齐 reader long messageId）的条目按
 	// **永久错误（4xx 语义，Status=400）**回报，由 consumer 路由 DLQ，绝不静默落 0。
@@ -184,16 +189,92 @@ func (w *osWriter) Bulk(ctx context.Context, msgs []searchmsg.Message) ([]BulkIt
 	return out, nil
 }
 
+// maxBulkBodyBytes 是单次 _bulk 请求体的字节上限（软阈值，留足余量低于 OpenSearch 默认
+// http.max_content_length=100MB）。方案 B 后每条 branch-A doc 内嵌 payloadRaw（可达 ~1MB），
+// 仅按条数批（如 500 条）会让 _bulk body 远超限 → 整批非 2xx → 被当 transient 无限重试 → 卡死
+// ingestion。故按**编码字节**再切子批，每子批独立 _bulk，结果按序拼接，per-item 契约不变。
+// 取 50MB（远低于 100MB 默认 + 余量），足以摊薄大 payloadRaw 又不至于子批过多。
+const maxBulkBodyBytes = 50 << 20 // 50 MiB
+
 // BulkDocs 把一批 reader 可读 Doc 以 _bulk 幂等写入 ES（backfill 富化路径直接调用）。
 // doc _id = 规范化 messageId，与实时 consumer 路径同 _id → 重叠运行幂等去重。
+//
+// 🔴 按字节切子批（codex 补）：payloadRaw 内嵌后单批体积可能远超 http.max_content_length，
+// 整批失败被当 transient 无限重试卡死。故先按 maxBulkBodyBytes 把 docs 切成多个子批，逐子批
+// _bulk，结果按入参顺序拼接返回。任一子批批级失败 → 该子批条目标 transient + 返回 error（与
+// 原单批语义一致：调用方整批退避重试；下一轮同 _id 幂等覆盖已成功子批，无重复 doc）。
 func (w *osWriter) BulkDocs(ctx context.Context, docs []Doc) ([]BulkItemResult, error) {
+	if len(docs) == 0 {
+		return nil, nil
+	}
+
+	out := make([]BulkItemResult, 0, len(docs))
+	var firstErr error
+	for start := 0; start < len(docs); {
+		end := subBatchEnd(docs, start)
+		sub := docs[start:end]
+		// 🔴 单条 doc 自身就超限（end==start+1 且其编码 > 阈值）：发出去会被 ES 在批级 413 拒绝，
+		// 映射成 Status=0(transient) → consumer/backfill 无限重试卡死。改判为 **permanent(413)**，
+		// 让调用方把这条毒丸路由 DLQ（不重试）。实时路径已被 producer 1MB guard 拦下，本兜底主要
+		// 防 backfill 读到异常大的历史 payloadRaw 行。
+		if len(sub) == 1 && encodedDocSize(sub[0]) > maxBulkBodyBytes {
+			out = append(out, BulkItemResult{
+				MessageID: sub[0].idString(),
+				OK:        false,
+				Status:    http.StatusRequestEntityTooLarge, // 413 → Permanent()
+				Err:       fmt.Errorf("esindex: doc %s encoded size exceeds max bulk body %d bytes (poison, routed to DLQ not retried)", sub[0].idString(), maxBulkBodyBytes),
+			})
+			start = end
+			continue
+		}
+		res, err := w.bulkOnce(ctx, sub)
+		out = append(out, res...)
+		if err != nil && firstErr == nil {
+			firstErr = err
+		}
+		start = end
+	}
+	return out, firstErr
+}
+
+// subBatchEnd 返回从 start 起、累计编码字节不超过 maxBulkBodyBytes 的子批结束下标（半开区间）。
+// 至少含 1 条（即便单条 >阈值也单独成批——交给 ES 报错走 per-item，不在此死循环）。
+func subBatchEnd(docs []Doc, start int) int {
+	size := 0
+	for i := start; i < len(docs); i++ {
+		ds := encodedDocSize(docs[i])
+		if i > start && size+ds > maxBulkBodyBytes {
+			return i
+		}
+		size += ds
+	}
+	return len(docs)
+}
+
+// encodedDocSize 估算一条 doc 在 _bulk body 里占的字节（动作行 + 文档行 + 两个换行）。
+// marshal 失败时返回 0（该条会在 bulkOnce 编码时再次失败并按 per-item 处理）。
+func encodedDocSize(d Doc) int {
+	docJSON, err := json.Marshal(d)
+	if err != nil {
+		return 0
+	}
+	// 动作行约 ~40 字节（{"index":{"_id":"<id>"}}）+ 文档行 + 2 换行；动作行用 id 长度近似。
+	return len(docJSON) + len(d.idString()) + 24 + 2
+}
+
+// bulkOnce 执行单次 _bulk（原 BulkDocs 主体），用于 BulkDocs 的按字节子批切分。
+func (w *osWriter) bulkOnce(ctx context.Context, docs []Doc) ([]BulkItemResult, error) {
 	if len(docs) == 0 {
 		return nil, nil
 	}
 
 	body, err := encodeBulkBody(docs)
 	if err != nil {
-		return nil, err
+		// 编码失败也是批级失败：必须返回与 docs 等长、位置对齐的结果切片（batchFailure），
+		// 绝不返回 nil。否则 BulkDocs 的 out 会比 sub 短，上层 Bulk() 按位 docRes[j]↔docIdx[j]
+		// 归属时整体错位 → 一条编码失败 doc 可能被贴上另一条的 success → 误判已索引、既不进 DLQ
+		// 也搜不到（静默丢消息）。标 transient(Status=0) 让调用方整批退避重试。
+		return batchFailure(docs, err), fmt.Errorf("esindex: encode bulk body failed: %w", err)
 	}
 
 	resp, err := w.client.Bulk(ctx, opensearchapi.BulkReq{

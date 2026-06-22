@@ -112,9 +112,24 @@ func extractMessage(row *srcMessageRow) (searchmsg.Message, extractOutcome, stri
 		return msg, outcomeDLQ, dlqReasonPayloadUnparseable
 	}
 
+	// 🔴 Plan B (CDC-style writes): ship the raw payload整包 so the es-indexer
+	// consumer does the full projection + visibility fail-closed parsing itself.
+	// json.RawMessage inlines the original bytes (zero base64 bloat). Only set for
+	// non-encrypted messages (encrypted DMs keep RawPayload=nil — ciphertext never
+	// leaves; see the isSignalEncrypted branch above).
+	msg.RawPayload = json.RawMessage(row.Payload)
+
 	// 🔴 Fail-closed visibility (access-control ACL): if it cannot be trusted →
 	// the whole row goes to DLQ, never write empty Visibles. A weird space_id JSON
 	// type does not drag down valid visibles (ExtractVisibility isolates that).
+	//
+	// Plan B note: the es-indexer consumer is now the AUTHORITATIVE fail-closed
+	// landing point (it re-parses RawPayload in processBatch pre-check). The
+	// producer keeps enriching during the transition (belt-and-suspenders, §3.3):
+	// both legs run the SAME octo-lib parser + FailClosedVisibilityVectors, so the
+	// kou-jing (口径 / contract) never drifts; a row dead-lettered here never reaches
+	// the body topic, so there is no double-DLQ. Producer enrichment is retired in a
+	// separate ticket after the consumer is verified stable.
 	spaceID, visibles, verr := searchmsg.ExtractVisibility(row.Payload)
 	if verr != nil {
 		return msg, outcomeDLQ, dlqReasonVisibilityUntrusted
@@ -126,8 +141,12 @@ func extractMessage(row *srcMessageRow) (searchmsg.Message, extractOutcome, stri
 	msg.ContentType = contentType
 
 	if !isText {
-		// Non-text (media / system / rich structured content): not indexed this
-		// phase, raw_excluded.
+		// Non-text (media / system / rich structured content): the es-indexer
+		// consumer projects it from RawPayload (Plan B). content stays nil here
+		// (the body text field is text-only); RawExcluded is set conservatively for
+		// the transition contract — the consumer recomputes RawExcluded from the
+		// actual projection (§5.5), so a media row with RawPayload still gets a
+		// searchable doc downstream.
 		msg.RawExcluded = true
 		msg.Content = nil
 		return msg, outcomeRawExcluded, ""

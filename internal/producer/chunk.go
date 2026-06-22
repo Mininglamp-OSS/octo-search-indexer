@@ -1,6 +1,16 @@
 package producer
 
-import "github.com/Mininglamp-OSS/octo-lib/contract/searchmsg"
+import (
+	"encoding/json"
+
+	"github.com/Mininglamp-OSS/octo-lib/contract/searchmsg"
+)
+
+// maxKafkaMessageBytes 是单条 Kafka 消息体的体积上限（留头部余量低于 broker
+// message.max.bytes 默认 1MiB=1048576）。方案 B 让 producer 发原始 payload 整包，单条体积可能
+// 逼近硬限；segmentio kafka-go 写侧超限 WriteMessages 失败 → cursor 不前进 → 死循环卡 partition
+// （注：consumer fetch 侧已 10MB，本风险是写侧/broker 侧）。故组装时按本阈值降级。
+const maxKafkaMessageBytes = 1_000_000
 
 // chunkPlan is the delivery plan produced from one batch of read source rows
 // after the stability gate + payload extraction (a pure-function product, no IO).
@@ -46,7 +56,16 @@ func planChunk(table string, rows []*srcMessageRow, cutoff int64) chunkPlan {
 		case outcomeDLQ:
 			plan.dlq = append(plan.dlq, newDLQEnvelope(table, row, reason))
 		default: // outcomeOK / outcomeRawExcluded both go to the body stream
-			plan.main = append(plan.main, msg)
+			// 🔴 Plan B oversize guard (§4.4): the raw payload整包 can push a single
+			// contract message past the Kafka write-side hard limit. Degrade (drop
+			// RawPayload, keep text-only) rather than discard; if still oversized
+			// (rare: plaintext itself >1MB) dead-letter with a TRUNCATED envelope so
+			// the DLQ write cannot itself blow the limit and wedge the partition.
+			if degraded, oversized := degradeIfOversized(msg); oversized {
+				plan.dlq = append(plan.dlq, newOversizeDLQEnvelope(table, row))
+			} else {
+				plan.main = append(plan.main, degraded)
+			}
 		}
 	}
 	plan.maxID = stable[len(stable)-1].ID
@@ -72,6 +91,41 @@ func stablePrefix(rows []*srcMessageRow, cutoff int64) []*srcMessageRow {
 		}
 	}
 	return rows
+}
+
+// degradeIfOversized applies the Plan B oversize guard (§4.4) to one body message
+// before it joins the produce batch:
+//   - fits under maxKafkaMessageBytes → return unchanged (oversized=false).
+//   - else DEGRADE not discard: drop RawPayload and re-check — keeps the text-only
+//     body searchable (avoids the v0 "discard → plaintext also unsearchable"
+//     regression). Now fits → return the degraded message (oversized=false).
+//   - STILL overflows (rare: plaintext content itself >1MB) → oversized=true; the
+//     caller dead-letters it with a truncated envelope so the DLQ write itself
+//     cannot blow the limit and wedge the partition.
+//
+// Pure function (json.Marshal only, no IO/clock) so planChunk stays deterministic.
+func degradeIfOversized(msg searchmsg.Message) (searchmsg.Message, bool) {
+	if marshaledSize(msg) <= maxKafkaMessageBytes {
+		return msg, false
+	}
+	// Degrade: drop the raw payload整包, keep the text-only body. RawExcluded stays
+	// as extractMessage set it.
+	msg.RawPayload = nil
+	if marshaledSize(msg) <= maxKafkaMessageBytes {
+		return msg, false
+	}
+	return msg, true
+}
+
+// marshaledSize returns the JSON wire size of a contract message (the exact bytes
+// produced for Kafka). On a marshal error (encoding bug, should not happen) it
+// returns over-the-limit so the guard degrades/dead-letters conservatively.
+func marshaledSize(msg searchmsg.Message) int {
+	b, err := json.Marshal(msg)
+	if err != nil {
+		return maxKafkaMessageBytes + 1
+	}
+	return len(b)
 }
 
 // firstNonAscendingByID returns the index of the first row not strictly ascending

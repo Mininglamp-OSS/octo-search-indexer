@@ -87,13 +87,22 @@
                 "properties": {
                   "messageId":  { "type": "long" },
                   "type":       { "type": "integer" },
-                  "searchText": { "type": "text", "analyzer": "ik_max_word", "search_analyzer": "ik_smart" }
+                  "searchText": { "type": "text", "analyzer": "ik_max_word", "search_analyzer": "ik_smart" },
+                  "from":       { "type": "keyword", "ignore_above": 256 },
+                  "timestamp":  { "type": "date", "format": "epoch_second" }
                 }
               }
             }
+          },
+          "richText": {
+            "type": "object",
+            "properties": {
+              "searchText": { "type": "text", "analyzer": "ik_max_word", "search_analyzer": "ik_smart" }
+            }
           }
         }
-      }
+      },
+      "payloadRaw": { "type": "object", "enabled": false }
     }
   }
 }

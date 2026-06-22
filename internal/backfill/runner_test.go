@@ -62,8 +62,9 @@ func newFakeWriter() *fakeWriter {
 	}
 }
 
-func (w *fakeWriter) EnsureIndex(context.Context) error { return w.ensureErr }
-func (w *fakeWriter) Close() error                      { return nil }
+func (w *fakeWriter) EnsureIndex(context.Context) error                 { return w.ensureErr }
+func (w *fakeWriter) AssertLiveMappingCompatible(context.Context) error { return nil }
+func (w *fakeWriter) Close() error                                      { return nil }
 
 // Bulk 不被 backfill 路径调用（backfill 走 BulkDocs(docs)）；提供接口实现。
 func (w *fakeWriter) Bulk(_ context.Context, _ []searchmsg.Message) ([]esindex.BulkItemResult, error) {

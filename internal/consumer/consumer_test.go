@@ -51,6 +51,7 @@ type fakeWriter struct {
 	// 让原地重试循环能收敛）。0 表示不自愈（持续按 statusByID）。
 	healAfter map[string]int
 	bulkCalls int
+	lastBulk  []searchmsg.Message // 最近一次 Bulk 调用的入参（断言 visibility 回填用）
 	mu        sync.Mutex
 }
 
@@ -58,6 +59,7 @@ func (w *fakeWriter) Bulk(ctx context.Context, msgs []searchmsg.Message) ([]esin
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	w.bulkCalls++
+	w.lastBulk = msgs
 	out := make([]esindex.BulkItemResult, len(msgs))
 	for i := range msgs {
 		if w.batchErr != nil {
@@ -92,6 +94,8 @@ func (w *fakeWriter) Bulk(ctx context.Context, msgs []searchmsg.Message) ([]esin
 func (w *fakeWriter) Close() error { return nil }
 
 func (w *fakeWriter) EnsureIndex(ctx context.Context) error { return nil }
+
+func (w *fakeWriter) AssertLiveMappingCompatible(ctx context.Context) error { return nil }
 
 // BulkDocs 不被 consumer 路径调用（consumer 走 Bulk(msgs)）；提供空实现满足接口。
 func (w *fakeWriter) BulkDocs(ctx context.Context, docs []esindex.Doc) ([]esindex.BulkItemResult, error) {

@@ -112,7 +112,11 @@ func (p *Processor) fetchBatch(ctx context.Context) ([]fetchedMessage, error) {
 
 // processBatch 处理一批（C4 核心）：
 //  1. schema_version 校验：未知版本标记为毒丸（不进 bulk，直接 DLQ）。
-//  2. 对**尚未终态**的条目走 esindex bulk；毒丸（schema 非法 + bulk 4xx）按原序送 DLQ。
+//     1b. 🔴 visibility 预检 pass（方案 B §3.4，**visibility 解析的唯一权威落点**）：对分支 A
+//     （len(RawPayload)>0，非加密新形态）逐条调 searchmsg.ExtractVisibility fail-closed；失败者
+//     剔出 bulk + 落 DLQ(reason=visibility_untrusted, status=0)，绝不写空 visibles；成功者把
+//     解析值回填进 parsed[i].SpaceID/Visibles（下游 DocFromMessage 直接消费、不二次解析）。
+//  2. 对**尚未终态**的条目走 esindex bulk；毒丸（schema 非法 + visibility 失败 + bulk 4xx）按原序送 DLQ。
 //  3. 计算**每分区**连续可越过前缀并 commit（多分区各自推进，互不越权）。
 //  4. transient 条目**原地重试同一批**（退避后重跑 bulk，绝不拉新 offset）——直到本批无 transient。
 //     这保证 kafka 单调高水位 commit 永不越过未确认的 transient（杜绝丢消息）。
@@ -121,6 +125,7 @@ func (p *Processor) fetchBatch(ctx context.Context) ([]fetchedMessage, error) {
 func (p *Processor) processBatch(ctx context.Context, batch []fetchedMessage) error {
 	n := len(batch)
 	schemaInvalid := make([]bool, n)
+	visibilityInvalid := make([]bool, n)
 	parsed := make([]searchmsg.Message, n)
 	for i := range batch {
 		msg, ok := decodeAndValidate(batch[i].Value)
@@ -129,6 +134,23 @@ func (p *Processor) processBatch(ctx context.Context, batch []fetchedMessage) er
 			continue
 		}
 		parsed[i] = msg
+	}
+
+	// 🔴 visibility 预检 pass（§3.4，唯一权威解析落点）：只对分支 A（schema 合法且
+	// len(RawPayload)>0 = 非加密新形态；加密 RawPayload==nil 天然不入此集，无须看 RawExcluded）
+	// 跑 ExtractVisibility。失败 → 标 visibilityInvalid 剔出 bulk + 落 DLQ；成功 → 回填解析值。
+	for i := range batch {
+		if schemaInvalid[i] || len(parsed[i].RawPayload) == 0 {
+			continue
+		}
+		spaceID, visibles, verr := searchmsg.ExtractVisibility(parsed[i].RawPayload)
+		if verr != nil {
+			// fail-closed：可见性 ACL 不可信，绝不写空 visibles（reader fail-OPEN，#1124）。落 DLQ。
+			visibilityInvalid[i] = true
+			continue
+		}
+		parsed[i].SpaceID = spaceID
+		parsed[i].Visibles = visibles
 	}
 
 	dispositions := make([]itemDisposition, n)
@@ -149,7 +171,7 @@ func (p *Processor) processBatch(ctx context.Context, batch []fetchedMessage) er
 		}
 
 		// 仅对仍 transient 的条目重跑（已 OK / 已进 DLQ 的不再处理）。
-		changed, err := p.resolvePass(ctx, batch, parsed, schemaInvalid, dispositions)
+		changed, err := p.resolvePass(ctx, batch, parsed, schemaInvalid, visibilityInvalid, dispositions)
 		if err != nil {
 			return err // DLQ 硬停 fatal：停 worker（不静默越过毒丸）
 		}
@@ -169,25 +191,38 @@ func (p *Processor) processBatch(ctx context.Context, batch []fetchedMessage) er
 
 // resolvePass 对仍为 dispTransient 的条目跑一轮 bulk + DLQ 路由，就地更新 dispositions。
 // 返回 changed=是否有条目从 transient 转为终态（OK/DLQResolved）；error 仅当 DLQ 硬停逃逸（fatal）。
-func (p *Processor) resolvePass(ctx context.Context, batch []fetchedMessage, parsed []searchmsg.Message, schemaInvalid []bool, dispositions []itemDisposition) (bool, error) {
+func (p *Processor) resolvePass(ctx context.Context, batch []fetchedMessage, parsed []searchmsg.Message, schemaInvalid []bool, visibilityInvalid []bool, dispositions []itemDisposition) (bool, error) {
 	changed := false
 	// schema 非法的毒丸：直接送 DLQ（不进 bulk）。
 	for i := range batch {
 		if dispositions[i] != dispTransient || !schemaInvalid[i] {
 			continue
 		}
-		if err := p.routePoison(ctx, batch[i], esindex.BulkItemResult{Status: 0}, true); err != nil {
+		if err := p.routePoison(ctx, batch[i], esindex.BulkItemResult{Status: 0}, reasonSchemaInvalid); err != nil {
 			return changed, err
 		}
 		dispositions[i] = dispDLQResolved
 		changed = true
 	}
 
-	// 收集仍 transient 且 schema 合法的条目走 bulk。
+	// 🔴 visibility 失败的毒丸（§3.4）：bulk 之前剔出 + 落 DLQ(visibility_untrusted, status=0)，
+	// 绝不进 bulk、绝不写空 visibles。幂等卫与 schemaInvalid 毒丸块同构（重试每轮重跑，已终态跳过）。
+	for i := range batch {
+		if dispositions[i] != dispTransient || !visibilityInvalid[i] {
+			continue
+		}
+		if err := p.routePoison(ctx, batch[i], esindex.BulkItemResult{Status: 0}, reasonVisibilityUntrusted); err != nil {
+			return changed, err
+		}
+		dispositions[i] = dispDLQResolved
+		changed = true
+	}
+
+	// 收集仍 transient 且非毒丸（schema 合法 + visibility 通过）的条目走 bulk。
 	var toBulk []searchmsg.Message
 	bulkIdx := make([]int, 0, len(batch))
 	for i := range batch {
-		if dispositions[i] == dispTransient && !schemaInvalid[i] {
+		if dispositions[i] == dispTransient && !schemaInvalid[i] && !visibilityInvalid[i] {
 			toBulk = append(toBulk, parsed[i])
 			bulkIdx = append(bulkIdx, i)
 		}
@@ -213,7 +248,7 @@ func (p *Processor) resolvePass(ctx context.Context, batch []fetchedMessage, par
 			dispositions[idx] = dispOK
 			changed = true
 		case permanent:
-			if err := p.routePoison(ctx, batch[idx], res, false); err != nil {
+			if err := p.routePoison(ctx, batch[idx], res, reasonPermanent4xx); err != nil {
 				return changed, err
 			}
 			dispositions[idx] = dispDLQResolved
@@ -226,8 +261,8 @@ func (p *Processor) resolvePass(ctx context.Context, batch []fetchedMessage, par
 }
 
 // routePoison 把一条毒丸送 DLQ。DLQ 终态成功 → nil；硬停逃逸 → 返回 fatal error。
-func (p *Processor) routePoison(ctx context.Context, m fetchedMessage, res esindex.BulkItemResult, schemaInvalid bool) error {
-	rec := buildDLQRecord(schemaInvalid, m, res)
+func (p *Processor) routePoison(ctx context.Context, m fetchedMessage, res esindex.BulkItemResult, reason dlqReason) error {
+	rec := buildDLQRecord(reason, m, res)
 	if err := p.dlq.Send(ctx, rec); err != nil {
 		p.alert.Alert("dlq_hard_stop", fmt.Sprintf("offset=%d: %v", m.Offset, err))
 		return fmt.Errorf("consumer: DLQ terminal escape hard-stop at offset %d: %w", m.Offset, err)
@@ -246,6 +281,32 @@ func (p *Processor) commitPrefixes(ctx context.Context, batch []fetchedMessage, 
 	return nil
 }
 
+// dlqReason 是 consumer 侧毒丸落 DLQ 的机器可读原因（§3.4 把原 schemaInvalid bool 泛化为枚举，
+// 表达第三类「bulk 前 visibility 预检失败」）。
+type dlqReason int
+
+const (
+	reasonSchemaInvalid dlqReason = iota
+	reasonPermanent4xx
+	// reasonVisibilityUntrusted：bulk 前 visibility 预检失败（payload 非对象 / visibles
+	// present-but-empty / 不可信）。是**数据完整性/解析**失败，**不是** HTTP 4xx → status=0
+	// （与 schema-invalid 同档）。命名用 visibility_untrusted（无 producer_ 前缀，与 producer 腿
+	// 的 producer_visibility_untrusted 有意区分来源腿，非笔误）。
+	reasonVisibilityUntrusted
+)
+
+// reasonString 返回 dlqReason 的线格字符串（写进 dlqRecord.Reason）。
+func (r dlqReason) reasonString() string {
+	switch r {
+	case reasonSchemaInvalid:
+		return "unknown_schema_version"
+	case reasonVisibilityUntrusted:
+		return "visibility_untrusted"
+	default:
+		return "permanent_4xx"
+	}
+}
+
 // decodeAndValidate 解析消息字节并做 schema_version 校验（C4：未知版本 → 毒丸进 DLQ，不静默吃）。
 // 返回 (msg, true) 表示通过；(zero, false) 表示 schema 非法。
 func decodeAndValidate(value []byte) (searchmsg.Message, bool) {
@@ -259,19 +320,26 @@ func decodeAndValidate(value []byte) (searchmsg.Message, bool) {
 	return msg, true
 }
 
-// buildDLQRecord 构造一条 DLQ 记录（保留原始字节供回灌）。
-func buildDLQRecord(schemaInvalid bool, m fetchedMessage, res esindex.BulkItemResult) dlqRecord {
-	reason := "permanent_4xx"
+// buildDLQRecord 构造一条 DLQ 记录。
+//
+// 🔴 信封超限对称截断（§4.4.3 B-5）：DLQ 实际写出的是 json.Marshal(dlqRecord)，Go 把
+// Value []byte 编成 base64(~1.33x 膨胀) + 信封字段开销。一条带大 RawPayload 的消息落 consumer DLQ
+// 时，原样保留整条字节会触发 DLQ topic 超限连锁卡死（与 producer 腿同构）。故当原始 Value 体积
+// 超阈值（按预留 base64 余量的原始字节判，见 maxDLQRawValueBytes）时**截断 Value**，只留截断占位
+// + 标记 payload_truncated=true，保证 DLQ 写入必成功（回灌须从源 message 表按 messageId 重取）。
+func buildDLQRecord(reason dlqReason, m fetchedMessage, res esindex.BulkItemResult) dlqRecord {
 	detail := ""
 	status := res.Status
-	if schemaInvalid {
-		reason = "unknown_schema_version"
+	switch reason {
+	case reasonSchemaInvalid, reasonVisibilityUntrusted:
 		status = 0
-	} else if res.Err != nil {
-		detail = res.Err.Error()
+	default:
+		if res.Err != nil {
+			detail = res.Err.Error()
+		}
 	}
-	return dlqRecord{
-		Reason:    reason,
+	rec := dlqRecord{
+		Reason:    reason.reasonString(),
 		Topic:     m.Topic,
 		Partition: m.Partition,
 		Offset:    m.Offset,
@@ -280,4 +348,15 @@ func buildDLQRecord(schemaInvalid bool, m fetchedMessage, res esindex.BulkItemRe
 		Status:    status,
 		Detail:    detail,
 	}
+	// 超限对称截断（§4.4.3）：按 marshal 后 base64 膨胀预留余量的原始字节阈值判。
+	if len(m.Value) > maxDLQRawValueBytes {
+		rec.Value = nil
+		rec.PayloadTruncated = true
+		if rec.Detail != "" {
+			rec.Detail += "; "
+		}
+		rec.Detail += fmt.Sprintf("payload truncated (orig %d bytes > %d); replay must re-fetch from source by messageId(=key)",
+			len(m.Value), maxDLQRawValueBytes)
+	}
+	return rec
 }

@@ -20,26 +20,25 @@ var safetyFieldNames = []struct {
 
 // TestV2Gate_DocFromMessageWiresSafetyFields 🔴 v2-gate latent fail-open 防回归门（Jerry 两轮点名）。
 //
-// 背景：实时安全闸（consumer.Run / LiveContractCarriesSafetyFields）只看 searchmsg.SchemaVersion>=2
-// 就解封实时写入。但 DocFromMessage 当前**不 copy** spaceId/visibles/messageSeq（v1 契约根本没这仨
-// 字段）。隐患：将来有人把 octo-lib bump 到 v2（加字段 + 升 SchemaVersion）解了闸，却忘了同步给
-// DocFromMessage 接线 —— 实时路径就会写出**空** visibles 的 doc，reader 直接 fail-OPEN（普通成员
-// 搜出群管才可见的系统消息）。安全闸开了，但数据是 fail-open 的，比闸关着更危险。
+// 背景（方案 B 后语义，§3）：契约已是 v2（SchemaVersion=2）。DocFromMessage 对**分支 C**（在飞
+// 老 v2 消息：无 RawPayload、非加密）信任契约带的 spaceId/visibles/messageSeq 并 copy 进 Doc。
+// 隐患：若有人删了 DocFromMessage 对这三字段的 copy，分支 C 就会写出**空** visibles 的 doc，
+// reader 直接 fail-OPEN（普通成员搜出群管才可见的系统消息）。本门钉死分支 C 的接线。
 //
-// 本测试用**反射**实现，故在 v1（字段尚不存在）下能正常编译/通过；一旦契约升到 v2：
-//   - 若 searchmsg.Message 没有这三字段 → 报错（契约 bump 不完整）。
-//   - 若有字段但 DocFromMessage 没把它们 copy 进 Doc → 断言失败转红（这正是要拦的 latent fail-open）。
+// 注意区分：**分支 A**（带 RawPayload 的新形态）的 visibility 来自消费侧 processBatch 预检
+// （ExtractVisibility 回填进 msg），DocFromMessage 同样只是 copy 已回填值——本测试不带 RawPayload，
+// 故走分支 C，验证「契约带的安全字段被忠实搬运」。
 //
-// 即「v2 bump 不接线就过不了 CI」。接线（DocFromMessage 填全三字段）后本测试自动转绿。
+// 本测试用**反射**写哨兵值（历史上为兼容 v1 契约无字段而用反射，现 v2 字段已在，反射仍可用）。
 func TestV2Gate_DocFromMessageWiresSafetyFields(t *testing.T) {
 	if !LiveContractCarriesSafetyFields() {
-		// 契约仍是 v1（SchemaVersion<2）：这三字段尚未进 Kafka 契约，实时闸保持关闭（由
-		// TestLiveContractSafetyGate 钉死），此 latent 隐患尚未被激活。本门在 v2 bump 时自动生效。
-		t.Skipf("contract still v1 (SchemaVersion=%d < %d); v2-gate inactive until contract bump",
+		// 契约版本低于 v2 下限（理论上不应发生，当前 SchemaVersion 已 ==2）：实时闸保持关闭
+		// （由 TestLiveContractSafetyGate 钉死）。本门在契约 ≥ v2 时生效。
+		t.Skipf("contract below v2 floor (SchemaVersion=%d < %d); v2-gate inactive",
 			searchmsg.SchemaVersion, SafetyFieldsSchemaVersion)
 	}
 
-	// ── 契约已升到 v2：强制要求 DocFromMessage 把三个安全字段从契约 copy 进 Doc ──
+	// ── 分支 C（无 RawPayload）：强制要求 DocFromMessage 把三个安全字段从契约 copy 进 Doc ──
 	msg := searchmsg.Message{
 		SchemaVersion: searchmsg.SchemaVersion,
 		MessageID:     "123456789012345678",
@@ -47,7 +46,7 @@ func TestV2Gate_DocFromMessageWiresSafetyFields(t *testing.T) {
 		ChannelType:   2,
 	}
 
-	// 反射写入三个安全字段的哨兵值（字段在 v2 契约里才存在，故用反射，避免 v1 下编译失败）。
+	// 反射写入三个安全字段的哨兵值。
 	mv := reflect.ValueOf(&msg).Elem()
 	const (
 		sentSpace = "space-sentinel"
@@ -57,8 +56,7 @@ func TestV2Gate_DocFromMessageWiresSafetyFields(t *testing.T) {
 	for _, f := range safetyFieldNames {
 		fv := mv.FieldByName(f.msgField)
 		if !fv.IsValid() {
-			t.Fatalf("contract bumped to v2 (SchemaVersion=%d) but searchmsg.Message lacks field %q; "+
-				"a v2 bump must add SpaceID/Visibles/MessageSeq to the contract", searchmsg.SchemaVersion, f.msgField)
+			t.Fatalf("v2 contract must carry field %q (SpaceID/Visibles/MessageSeq)", f.msgField)
 		}
 		setSentinel(t, fv, f.msgField, sentSpace, sentVis, sentSeq)
 	}

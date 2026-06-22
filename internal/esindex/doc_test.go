@@ -26,6 +26,22 @@ type readerDoc struct {
 	} `json:"payload"`
 }
 
+// branchAMsg 构造一条方案 B 分支 A 消息（非加密新形态，带 RawPayload 整包）。visibility 由
+// 上游预检回填，这里直接给定（投影测试只关心正文投影；visibility 三分支另有专测）。
+func branchAMsg(id, rawPayload string) searchmsg.Message {
+	return searchmsg.Message{
+		SchemaVersion: searchmsg.SchemaVersion,
+		MessageID:     id,
+		ChannelID:     "g_1",
+		ChannelType:   2,
+		FromUID:       "u_1",
+		MsgTimestamp:  1700000000,
+		CreatedAt:     1700000001,
+		Source:        searchmsg.SourceETLMessageTable,
+		RawPayload:    json.RawMessage(rawPayload),
+	}
+}
+
 func textMsg(id string) searchmsg.Message {
 	c := "你好 world"
 	return searchmsg.Message{
@@ -104,18 +120,20 @@ func TestDocFromMessage_NonNumericIsError(t *testing.T) {
 	}
 }
 
-// TestDocFromMessage_RawExcludedNoText raw_excluded（非文本/加密）→ 无 payload.text，但仍占一个 doc。
+// TestDocFromMessage_RawExcludedNoText raw_excluded（无 RawPayload，加密/老形态）→ 走分支 B：
+// 不投影正文（Payload nil），但仍占一个 doc 且 rawExcluded 标志保留。
 func TestDocFromMessage_RawExcludedNoText(t *testing.T) {
 	m := textMsg("42")
 	m.RawExcluded = true
 	m.Content = nil
 	m.ContentType = 2 // image
+	// 无 RawPayload → 分支 B（加密 DM 形态）：不解析、不投影。
 	d, err := DocFromMessage(m)
 	if err != nil {
 		t.Fatalf("DocFromMessage: %v", err)
 	}
-	if d.Payload == nil || d.Payload.Text != nil {
-		t.Fatalf("raw_excluded must not carry payload.text: %+v", d.Payload)
+	if d.Payload != nil {
+		t.Fatalf("raw_excluded without RawPayload (branch B) must not carry a payload projection: %+v", d.Payload)
 	}
 	if !d.RawExcluded {
 		t.Fatalf("rawExcluded flag must round-trip")
