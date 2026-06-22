@@ -375,6 +375,79 @@ func TestBulkDocs_SplitsByByteSize(t *testing.T) {
 	}
 }
 
+// TestBulkDocs_SubBatchEncodeFailureKeepsAlignment 🔴 (返工 R1)：子批 encodeBulkBody 失败时，
+// bulkOnce 必须返回与子批等长、位置对齐的 batchFailure，绝不返回 nil。否则 BulkDocs 的 out
+// 会比 docs 短，上层 Bulk() 按位 docRes[j]↔docIdx[j] 归属时整体错位 → 一条编码失败 doc 被贴上
+// 另一条的 success → 误判已索引、既不进 DLQ 也搜不到（静默丢消息）。
+//
+// 构造：doc0 大且合法（独占第一子批，成功）；doc1 大且合法 + doc2 非法 payloadRaw（同处第二
+// 子批，encode 失败）。断言结果切片长度与入参对齐、失败条目按入参顺序正确归属、且失败子批不打 ES。
+func TestBulkDocs_SubBatchEncodeFailureKeepsAlignment(t *testing.T) {
+	bulkCalls := 0
+	rt := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		body := readAll(r.Body)
+		n := strings.Count(body, `{"index":`)
+		bulkCalls++
+		var sb strings.Builder
+		sb.WriteString(`{"took":1,"errors":false,"items":[`)
+		for i := 0; i < n; i++ {
+			if i > 0 {
+				sb.WriteByte(',')
+			}
+			sb.WriteString(`{"index":{"status":201}}`)
+		}
+		sb.WriteString(`]}`)
+		return jsonResp(200, sb.String()), nil
+	})
+	w := osWriterFor(t, rt)
+
+	// doc0/doc1 各 ~30MB 合法 → 二者相加 >50MB 阈值 → doc0 独占第一子批。
+	big := make([]byte, 30<<20)
+	for i := range big {
+		big[i] = 'x'
+	}
+	rawBig := mustRawObject(big)
+	// doc2 携带非法 JSON payloadRaw → json.Marshal 失败 → encodeBulkBody 失败；
+	// encodedDocSize 对其返回 0，故它落在 doc1 所在的第二子批里，使该子批整体编码失败。
+	docs := []Doc{
+		{MessageID: 1001, ChannelID: "g", ChannelType: 2, PayloadRaw: rawBig},
+		{MessageID: 1002, ChannelID: "g", ChannelType: 2, PayloadRaw: rawBig},
+		{MessageID: 1003, ChannelID: "g", ChannelType: 2, PayloadRaw: json.RawMessage([]byte("{not valid json"))},
+	}
+
+	res, err := w.BulkDocs(context.Background(), docs)
+	if err == nil {
+		t.Fatalf("expected a batch error from the encode-failing sub-batch, got nil")
+	}
+	// 核心回归守卫：结果切片长度必须与入参对齐（修复前会比 docs 短 → 上层错位丢消息）。
+	if len(res) != len(docs) {
+		t.Fatalf("result slice length must align with input (regression: encode-fail returned nil); got %d want %d", len(res), len(docs))
+	}
+	// 失败条目正确归属：每条结果的 MessageID 必须对应同下标的入参 doc。
+	for i := range docs {
+		if res[i].MessageID != docs[i].idString() {
+			t.Fatalf("result[%d] misattributed: MessageID=%q want %q", i, res[i].MessageID, docs[i].idString())
+		}
+	}
+	// doc0 成功（独占第一子批，已打 ES）。
+	if !res[0].OK {
+		t.Fatalf("doc0 expected OK, got %+v", res[0])
+	}
+	// doc1/doc2 同处编码失败子批 → 全部 transient(Status=0, OK=false)，让调用方整批退避重试。
+	for _, i := range []int{1, 2} {
+		if res[i].OK || res[i].Status != 0 || res[i].Err == nil {
+			t.Fatalf("doc%d expected transient failure (OK=false, Status=0, Err!=nil), got %+v", i, res[i])
+		}
+		if res[i].Permanent() {
+			t.Fatalf("doc%d encode-failure must be transient, not permanent", i)
+		}
+	}
+	// 第二子批在 encode 阶段失败，绝不应打到 ES（只有 doc0 那一次成功请求）。
+	if bulkCalls != 1 {
+		t.Fatalf("encode-failing sub-batch must not hit ES; expected exactly 1 bulk call (doc0), got %d", bulkCalls)
+	}
+}
+
 // mustRawObject 把一段大字节塞进一个合法 JSON 对象的字段值（用于构造大 payloadRaw）。
 func mustRawObject(filler []byte) []byte {
 	// {"type":2,"blob":"<filler>"}

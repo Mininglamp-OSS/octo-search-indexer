@@ -270,7 +270,11 @@ func (w *osWriter) bulkOnce(ctx context.Context, docs []Doc) ([]BulkItemResult, 
 
 	body, err := encodeBulkBody(docs)
 	if err != nil {
-		return nil, err
+		// 编码失败也是批级失败：必须返回与 docs 等长、位置对齐的结果切片（batchFailure），
+		// 绝不返回 nil。否则 BulkDocs 的 out 会比 sub 短，上层 Bulk() 按位 docRes[j]↔docIdx[j]
+		// 归属时整体错位 → 一条编码失败 doc 可能被贴上另一条的 success → 误判已索引、既不进 DLQ
+		// 也搜不到（静默丢消息）。标 transient(Status=0) 让调用方整批退避重试。
+		return batchFailure(docs, err), fmt.Errorf("esindex: encode bulk body failed: %w", err)
 	}
 
 	resp, err := w.client.Bulk(ctx, opensearchapi.BulkReq{
