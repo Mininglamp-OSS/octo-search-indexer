@@ -227,7 +227,7 @@ func DocFromMessage(msg searchmsg.Message) (Doc, error) {
 		}
 		// RawExcluded 重定义（§5.5）：产出了 typed 可搜子对象 → false；未知 type 投不出 → true。
 		d.RawExcluded = !projected
-		// 富文本(type=14)虚拟子文档（v1.10）：按内嵌 image/file block 派生独立子 doc，
+		// 富文本(type=14)虚拟子文档（v1.10）：按内嵌 image block 派生独立子 doc（本期只 image→type=2），
 		// 与父同批原子写入。非富文本返回 nil（函数内部判 Payload.Type==14）。
 		d.Derivatives = richTextDerivatives(d)
 	case msg.RawExcluded:
