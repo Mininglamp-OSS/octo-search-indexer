@@ -2,6 +2,7 @@ package recon
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"strings"
@@ -43,6 +44,48 @@ func TestOSCounter_CleanCount(t *testing.T) {
 	n, err := c.CountDocs(context.Background(), 0, 100)
 	if err != nil || n != 42 {
 		t.Fatalf("want 42,nil got %d,%v", n, err)
+	}
+}
+
+// TestOSCounter_CountDocsExcludesVirtual CountDocs 必须排除 virtual=true 的富文本虚拟子文档：
+// 生成的 _count 查询体须含 must_not {term:{virtual:true}}（同时保留 createdAt range filter）。
+// 否则一条含 N 图的富文本会让 ESDocs 虚高 N → reconcile gate 误报不健康。
+func TestOSCounter_CountDocsExcludesVirtual(t *testing.T) {
+	var gotBody string
+	c := osCounter(t, rtFunc(func(r *http.Request) (*http.Response, error) {
+		b, rerr := io.ReadAll(r.Body)
+		if rerr != nil {
+			t.Fatalf("read body: %v", rerr)
+		}
+		gotBody = string(b)
+		return resp(200, `{"count":5,"_shards":{"total":1,"successful":1,"skipped":0,"failed":0}}`), nil
+	}))
+	if _, err := c.CountDocs(context.Background(), 0, 100); err != nil {
+		t.Fatalf("CountDocs: %v", err)
+	}
+	if !strings.Contains(gotBody, "must_not") || !strings.Contains(gotBody, "virtual") {
+		t.Fatalf("CountDocs query must exclude virtual via must_not term virtual=true: %s", gotBody)
+	}
+	if !strings.Contains(gotBody, "createdAt") {
+		t.Fatalf("CountDocs query must still range-filter createdAt: %s", gotBody)
+	}
+	// 结构断言：virtual term 必须落在 must_not 子句里（而非误放进 filter）。
+	var parsed struct {
+		Query struct {
+			Bool struct {
+				MustNot []map[string]any `json:"must_not"`
+			} `json:"bool"`
+		} `json:"query"`
+	}
+	if err := json.Unmarshal([]byte(gotBody), &parsed); err != nil {
+		t.Fatalf("parse query body: %v", err)
+	}
+	if len(parsed.Query.Bool.MustNot) != 1 {
+		t.Fatalf("want exactly 1 must_not clause (virtual term), got %d: %s", len(parsed.Query.Bool.MustNot), gotBody)
+	}
+	term, _ := parsed.Query.Bool.MustNot[0]["term"].(map[string]any)
+	if term == nil || term["virtual"] != true {
+		t.Fatalf("must_not clause must be {term:{virtual:true}}, got %v", parsed.Query.Bool.MustNot[0])
 	}
 }
 

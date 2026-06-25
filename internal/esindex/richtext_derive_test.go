@@ -122,6 +122,44 @@ func TestRichTextDerivatives_EmptyURLImageSkipped(t *testing.T) {
 	}
 }
 
+// TestRichTextDerivatives_InheritVisiblesSpaceID 安全回归门：子文档必须完整继承父的可见性字段
+// （Visibles 白名单 + SpaceID）。deriveChild 走「复制父再覆盖」，这两个最安全相关的字段不应被漏。
+func TestRichTextDerivatives_InheritVisiblesSpaceID(t *testing.T) {
+	raw := richTextRaw(`[
+		{"type":"text","text":"前言"},
+		{"type":"image","url":"http://x/a.png","name":"a.png","width":100,"height":200}
+	]`)
+	msg := branchAMsg("2062443880774537216", raw)
+	// 构造带非空可见性字段的富文本父消息（branch A 直接消费 msg.SpaceID/msg.Visibles 回填值）。
+	msg.SpaceID = "space_42"
+	msg.Visibles = []string{"u_a", "u_b"}
+
+	d, err := DocFromMessage(msg)
+	if err != nil {
+		t.Fatalf("DocFromMessage: %v", err)
+	}
+	// 父 doc 自身先带上可见性字段（前置校验，确保 fixture 有效）。
+	if d.SpaceID != "space_42" || len(d.Visibles) != 2 {
+		t.Fatalf("setup: parent must carry spaceId+visibles, got spaceId=%q visibles=%v", d.SpaceID, d.Visibles)
+	}
+	if len(d.Derivatives) != 1 {
+		t.Fatalf("want 1 derivative (single image), got %d", len(d.Derivatives))
+	}
+
+	child := d.Derivatives[0]
+	if child.SpaceID != d.SpaceID {
+		t.Fatalf("child must inherit parent spaceId: got %q want %q", child.SpaceID, d.SpaceID)
+	}
+	if len(child.Visibles) != len(d.Visibles) {
+		t.Fatalf("child visibles length mismatch: got %v want %v", child.Visibles, d.Visibles)
+	}
+	for i := range d.Visibles {
+		if child.Visibles[i] != d.Visibles[i] {
+			t.Fatalf("child visibles[%d] mismatch: got %q want %q", i, child.Visibles[i], d.Visibles[i])
+		}
+	}
+}
+
 // TestRichTextDerivatives_TextOnlyNoDerivatives 纯文本富文本（无内嵌媒体）→ 不派生子文档。
 func TestRichTextDerivatives_TextOnlyNoDerivatives(t *testing.T) {
 	raw := richTextRaw(`[{"type":"text","text":"只有文字"}]`)

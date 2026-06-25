@@ -95,9 +95,24 @@ func NewOSCounter(client *opensearchapi.Client, index string) *OSCounter {
 	return &OSCounter{client: client, index: index}
 }
 
-// CountDocs 统计 createdAt ∈ [from,to] 的 doc 数（range query + _count）。
+// CountDocs 统计 createdAt ∈ [from,to] 的「真实消息 doc」数（range filter + must_not virtual）。
+//
+// 🔴 必须排除 virtual=true 的富文本(type=14)虚拟子文档：一条含 N 图的富文本在 MySQL 是 1 行、
+// 在 ES 是 1+N 个 doc（父 + N 个派生子文档）。虚拟子文档是同一条源消息的派生，不是独立源消息，
+// 不应计入与 MySQL 行数对平的总数；否则 ESDocs 虚高 → Diff>0 → reconcile gate 误报不健康。
+//
+// must_not {term:{virtual:true}} 只排除显式 virtual=true 的子文档：普通 doc / 富文本父 doc 的
+// virtual 字段缺省或 false（omitempty），term virtual=true 不匹配它们，故 must_not 后被正确保留。
 func (c *OSCounter) CountDocs(ctx context.Context, fromUnix, toUnix int64) (int64, error) {
-	return c.count(ctx, rangeQuery(fromUnix, toUnix))
+	body := map[string]any{
+		"query": map[string]any{
+			"bool": map[string]any{
+				"filter":   []any{rangeFilter(fromUnix, toUnix)},
+				"must_not": []any{map[string]any{"term": map[string]any{"virtual": true}}},
+			},
+		},
+	}
+	return c.count(ctx, body)
 }
 
 // CountRawExcluded 统计窗内 rawExcluded=true 的 doc 数。
@@ -134,17 +149,6 @@ func (c *OSCounter) count(ctx context.Context, query map[string]any) (int64, err
 			resp.Shards.Total, resp.Shards.Successful, resp.Shards.Failed)
 	}
 	return int64(resp.Count), nil
-}
-
-// rangeQuery 构造 createdAt ∈ [from,to] 的 _count 查询体。
-func rangeQuery(fromUnix, toUnix int64) map[string]any {
-	return map[string]any{
-		"query": map[string]any{
-			"bool": map[string]any{
-				"filter": []any{rangeFilter(fromUnix, toUnix)},
-			},
-		},
-	}
 }
 
 func rangeFilter(fromUnix, toUnix int64) map[string]any {

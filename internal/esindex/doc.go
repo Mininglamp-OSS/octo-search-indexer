@@ -62,7 +62,9 @@ type Doc struct {
 	// **不用 omitempty**：普通 doc 要显式落盘 subSeq=0（reader 不赌「缺失=0」）。
 	SubSeq int `json:"subSeq"`
 
-	// Derivatives 是本父 doc 派生的虚拟子文档（type=14 内嵌 image/file/video block）。
+	// Derivatives 是本父 doc 派生的虚拟子文档（type=14 富文本内嵌 image block → type=2）。
+	// 本期**只派生 image→type=2**（上游契约 richText block 仅 text/image，file/video 全链路未打开）；
+	// payload.type∈{5,8}（video/file）为前瞻预留，待上游契约打开后再扩展。
 	// 仅顶层父 doc 持有；不序列化进 _source（json:"-"）。writer 编码 bulk body 时把每个父 doc
 	// 与它的 Derivatives 编进**同一** _bulk 请求（父子相邻、同批原子），子文档幂等靠复合 _id。
 	Derivatives []Doc `json:"-"`
