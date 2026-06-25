@@ -81,9 +81,18 @@ type srcMessageRow struct {
 //     · type=Text 且 content 为 string → 取该 string 作正文（outcomeOK）。
 //     · 非 Text 或 content 非 string（媒体 / 富文本 / 结构化对象）→ 保守 raw_excluded。
 func extractMessage(row *srcMessageRow) (searchmsg.Message, extractOutcome) {
+	// MessageSeq 必须在此处填入：DocFromMessage 在内部派生富文本虚拟子文档时按值快照父
+	// （deriveChild: child := parent），若在 DocFromMessage 之后才富化父的 messageSeq，
+	// 子文档会停留在 messageSeq=0，违反「子继承父时序字段」契约（见 #26）。
+	// 负数（脏数据）兜 0，与 docFromRow 旧富化口径一致。
+	msgSeq := uint64(0)
+	if row.MessageSeq > 0 {
+		msgSeq = uint64(row.MessageSeq)
+	}
 	msg := searchmsg.Message{
 		SchemaVersion: searchmsg.SchemaVersion,
 		MessageID:     row.MessageID,
+		MessageSeq:    msgSeq,
 		ChannelID:     row.ChannelID,
 		ChannelType:   int(row.ChannelType),
 		FromUID:       row.FromUID,
