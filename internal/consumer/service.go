@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net/http"
 	"time"
 
 	"github.com/Mininglamp-OSS/octo-lib/contract/searchmsg"
@@ -30,6 +31,9 @@ type ServiceConfig struct {
 	ESIndex     string
 	ESUsername  string
 	ESPassword  string
+	// ESTLSInsecureSkipVerify 为 true 时跳过 OpenSearch HTTPS 证书校验
+	// （自签证书场景）。默认 false：使用默认 transport，强制校验，行为不变。
+	ESTLSInsecureSkipVerify bool
 
 	TransientBackoff time.Duration
 	DLQMaxRetries    int
@@ -46,11 +50,17 @@ func (logAlerter) Alert(event string, detail string) {
 
 // NewService 装配真实组件（连 Kafka + OpenSearch）。
 func NewService(cfg ServiceConfig) (*Service, error) {
+	var transport http.RoundTripper
+	if cfg.ESTLSInsecureSkipVerify {
+		// 仅在显式开启时跳过证书校验（自签证书场景）。
+		transport = esindex.InsecureSkipVerifyTransport()
+	}
 	writer, err := esindex.NewWriter(esindex.Config{
 		Addresses: cfg.ESAddresses,
 		Index:     cfg.ESIndex,
 		Username:  cfg.ESUsername,
 		Password:  cfg.ESPassword,
+		Transport: transport,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("consumer: build ES writer: %w", err)

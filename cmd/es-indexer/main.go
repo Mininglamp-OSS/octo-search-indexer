@@ -72,19 +72,20 @@ func run(ctx context.Context) error {
 // 开通条件：ES_INDEXER_ENABLED=true 且 brokers / ES 地址均已配置。
 func loadConfig() (consumer.ServiceConfig, bool) {
 	cfg := consumer.ServiceConfig{
-		Brokers:          splitCSV(os.Getenv("KAFKA_BROKERS")),
-		Topic:            envOr("KAFKA_TOPIC", "octo.message.v1"),
-		DLQTopic:         envOr("KAFKA_DLQ_TOPIC", "octo.message.v1.dlq"),
-		GroupID:          envOr("KAFKA_GROUP_ID", "octo-search-indexer"),
-		BatchSize:        envInt("INDEXER_BATCH_SIZE", 500),
-		ESAddresses:      splitCSV(os.Getenv("ES_ADDRESSES")),
-		ESIndex:          envOr("ES_INDEX", "octo-message"),
-		ESUsername:       os.Getenv("ES_USERNAME"),
-		ESPassword:       os.Getenv("ES_PASSWORD"),
-		TransientBackoff: time.Duration(envInt("INDEXER_TRANSIENT_BACKOFF_MS", 1000)) * time.Millisecond,
-		DLQMaxRetries:    envInt("INDEXER_DLQ_MAX_RETRIES", 5),
-		DLQRetryBackoff:  time.Duration(envInt("INDEXER_DLQ_RETRY_BACKOFF_MS", 200)) * time.Millisecond,
-		DLQSpillDir:      os.Getenv("INDEXER_DLQ_SPILL_DIR"),
+		Brokers:                 splitCSV(os.Getenv("KAFKA_BROKERS")),
+		Topic:                   envOr("KAFKA_TOPIC", "octo.message.v1"),
+		DLQTopic:                envOr("KAFKA_DLQ_TOPIC", "octo.message.v1.dlq"),
+		GroupID:                 envOr("KAFKA_GROUP_ID", "octo-search-indexer"),
+		BatchSize:               envInt("INDEXER_BATCH_SIZE", 500),
+		ESAddresses:             splitCSV(os.Getenv("ES_ADDRESSES")),
+		ESIndex:                 envOr("ES_INDEX", "octo-message"),
+		ESUsername:              os.Getenv("ES_USERNAME"),
+		ESPassword:              os.Getenv("ES_PASSWORD"),
+		ESTLSInsecureSkipVerify: strings.EqualFold(os.Getenv("ES_TLS_INSECURE_SKIP_VERIFY"), "true"),
+		TransientBackoff:        time.Duration(envInt("INDEXER_TRANSIENT_BACKOFF_MS", 1000)) * time.Millisecond,
+		DLQMaxRetries:           envInt("INDEXER_DLQ_MAX_RETRIES", 5),
+		DLQRetryBackoff:         time.Duration(envInt("INDEXER_DLQ_RETRY_BACKOFF_MS", 200)) * time.Millisecond,
+		DLQSpillDir:             os.Getenv("INDEXER_DLQ_SPILL_DIR"),
 	}
 	enabled := strings.EqualFold(os.Getenv("ES_INDEXER_ENABLED"), "true") &&
 		len(cfg.Brokers) > 0 && len(cfg.ESAddresses) > 0

@@ -31,6 +31,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"os/signal"
 	"strings"
@@ -61,6 +62,7 @@ func run() error {
 		esIndex    = flag.String("es-index", envOr("BACKFILL_ES_INDEX", "octo-message"), "OpenSearch index")
 		esUser     = flag.String("es-user", os.Getenv("BACKFILL_ES_USER"), "OpenSearch username")
 		esPass     = flag.String("es-pass", os.Getenv("BACKFILL_ES_PASS"), "OpenSearch password")
+		esTLSSkip  = flag.Bool("es-tls-insecure", envBool("BACKFILL_ES_TLS_INSECURE_SKIP_VERIFY"), "skip TLS cert verification for HTTPS OpenSearch (self-signed); default off")
 		spillDir   = flag.String("spill-dir", envOr("BACKFILL_SPILL_DIR", ""), "REQUIRED: local DLQ spill dir for real anomalies / permanent ES rejects")
 		checkpoint = flag.String("checkpoint", envOr("BACKFILL_CHECKPOINT", ""), "checkpoint file path for resumable cursor (empty = in-memory, not resumable)")
 		batch      = flag.Int("batch", envInt("BACKFILL_BATCH", 1000), "keyset batch size")
@@ -107,6 +109,7 @@ func run() error {
 		Index:     *esIndex,
 		Username:  *esUser,
 		Password:  *esPass,
+		Transport: esTLSTransport(*esTLSSkip),
 	})
 	if err != nil {
 		return fmt.Errorf("build ES writer: %w", err)
@@ -149,7 +152,7 @@ func run() error {
 	}
 
 	if *doRecon {
-		return reconcile(ctx, db, splitCSV(*esAddrs), *esUser, *esPass, *esIndex, tables, *fromUnix, *toUnix, *sampleN, *maxDet, dlq)
+		return reconcile(ctx, db, splitCSV(*esAddrs), *esUser, *esPass, *esIndex, tables, *fromUnix, *toUnix, *sampleN, *maxDet, dlq, esTLSTransport(*esTLSSkip))
 	}
 	log.Printf("backfill complete. Run cmd/reconcile (or re-run with -reconcile -from/-to) to gate correctness. Total DLQ count: %d", dlq.Count())
 	return nil
@@ -166,7 +169,7 @@ func run() error {
 // 正是富化 spaceId/visibles/messageSeq 的唯一路径，这些字段错位最该在 backfill 后立即拦住。
 // sampleN<=0 时退回纯 count 门（与 cmd/reconcile -sample 0 同口径）。
 // 对平退出码 0；不对平返回错误（main 退出码 1）作为 STOP 信号。
-func reconcile(ctx context.Context, db *sql.DB, esAddrs []string, user, pass, index string, tables []string, fromUnix, toUnix int64, sampleN, maxDet int, dlq *backfill.DLQSpill) error {
+func reconcile(ctx context.Context, db *sql.DB, esAddrs []string, user, pass, index string, tables []string, fromUnix, toUnix int64, sampleN, maxDet int, dlq *backfill.DLQSpill, transport http.RoundTripper) error {
 	to := toUnix
 	if to == 0 {
 		to = time.Now().Unix()
@@ -176,7 +179,7 @@ func reconcile(ctx context.Context, db *sql.DB, esAddrs []string, user, pass, in
 	}
 	dlqCount := dlq.CountInWindow(fromUnix, to)
 	osClient, err := opensearchapi.NewClient(opensearchapi.Config{
-		Client: opensearch.Config{Addresses: esAddrs, Username: user, Password: pass},
+		Client: opensearch.Config{Addresses: esAddrs, Username: user, Password: pass, Transport: transport},
 	})
 	if err != nil {
 		return fmt.Errorf("opensearch client: %w", err)
@@ -243,6 +246,20 @@ func envOr(k, def string) string {
 		return v
 	}
 	return def
+}
+
+// envBool 解析布尔型 env（fail-closed：仅 "true"/"TRUE" 等 → true，其余一律 false）。
+func envBool(k string) bool {
+	return strings.EqualFold(os.Getenv(k), "true")
+}
+
+// esTLSTransport 在 skip=true 时返回跳过证书校验的 transport，否则返回 nil
+// （走默认 transport，强校验）。
+func esTLSTransport(skip bool) http.RoundTripper {
+	if !skip {
+		return nil
+	}
+	return esindex.InsecureSkipVerifyTransport()
 }
 
 func envInt(k string, def int) int {

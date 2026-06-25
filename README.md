@@ -108,6 +108,7 @@ Each binary reads its own env namespace; they share no variables.
 | `ES_ADDRESSES` | — | CSV OpenSearch node list |
 | `ES_INDEX` | `octo-message` | target index |
 | `ES_USERNAME` / `ES_PASSWORD` | — | HTTP basic auth |
+| `ES_TLS_INSECURE_SKIP_VERIFY` | `false` | when `true`, skip TLS cert verification for HTTPS OpenSearch (self-signed certs). Unset/`false` keeps full verification — behavior unchanged |
 | `INDEXER_BATCH_SIZE` | `500` | max docs per bulk |
 | `INDEXER_TRANSIENT_BACKOFF_MS` | `1000` | retry backoff on transient |
 | `INDEXER_DLQ_MAX_RETRIES` | `5` | DLQ write retries before escape |
@@ -182,6 +183,13 @@ gate (inline reads its in-memory spill, standalone reads the same spill dir via
 `-dlq-spill-dir` / `RECON_DLQ_SPILL_DIR`) so they never false-fail as
 `sample_missing`. `make run-recon` is **mandatory** before switching the read
 alias to a freshly backfilled index (see `docs/forward-migration-v1.9.md`).
+
+For a self-signed HTTPS OpenSearch cluster, both jobs accept
+`-es-tls-insecure` (or `BACKFILL_ES_TLS_INSECURE_SKIP_VERIFY` /
+`RECON_ES_TLS_INSECURE_SKIP_VERIFY` = `true`) to skip TLS cert verification,
+mirroring the indexer's `ES_TLS_INSECURE_SKIP_VERIFY`. Default off (full
+verification); enabling it disables CA + hostname checks, so use only on a
+trusted private network.
 
 ## Build
 

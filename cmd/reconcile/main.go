@@ -31,6 +31,7 @@ import (
 	"time"
 
 	"github.com/Mininglamp-OSS/octo-search-indexer/internal/backfill"
+	"github.com/Mininglamp-OSS/octo-search-indexer/internal/esindex"
 	"github.com/Mininglamp-OSS/octo-search-indexer/internal/recon"
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/opensearch-project/opensearch-go/v3"
@@ -47,22 +48,23 @@ func main() {
 
 func run() error {
 	var (
-		fromUnix = flag.Int64("from", 0, "window start (epoch seconds, inclusive)")
-		toUnix   = flag.Int64("to", 0, "window end (epoch seconds, inclusive); 0 = now")
-		mysqlDSN = flag.String("mysql-dsn", os.Getenv("RECON_MYSQL_DSN"), "MySQL DSN (or RECON_MYSQL_DSN)")
-		tablesS  = flag.String("tables", envOr("RECON_TABLES", "message,message1,message2,message3,message4"), "comma-separated message shard tables")
-		esAddrs  = flag.String("es", envOr("RECON_ES", "http://localhost:9200"), "comma-separated OpenSearch addresses")
-		esIndex  = flag.String("es-index", envOr("RECON_ES_INDEX", "octo-message"), "OpenSearch index")
-		esUser   = flag.String("es-user", os.Getenv("RECON_ES_USER"), "OpenSearch username")
-		esPass   = flag.String("es-pass", os.Getenv("RECON_ES_PASS"), "OpenSearch password")
-		dlq      = flag.Int64("dlq", 0, "known DLQ count in window (rows that never reached ES body index)")
-		dlqDir   = flag.String("dlq-spill-dir", os.Getenv("RECON_DLQ_SPILL_DIR"), "optional backfill DLQ spill dir (or RECON_DLQ_SPILL_DIR); its message_ids are excluded from the field-level sample gate so legit DLQ rows don't false-fail as sample_missing")
-		sampleN  = flag.Int("sample", envInt("RECON_SAMPLE", 200), "field-level sample size (0 disables sampling)")
-		maxDet   = flag.Int("sample-max-details", envInt("RECON_SAMPLE_MAX_DETAILS", 50), "cap on mismatch detail entries in the report")
-		jsonOut  = flag.Bool("json", false, "emit the structured FullReport as JSON")
-		pushURL  = flag.String("push-url", os.Getenv("RECON_PUSH_URL"), "optional octo-server ingestion URL to POST the search_recon gauge payload")
-		pushTok  = flag.String("push-token", os.Getenv("RECON_PUSH_TOKEN"), "optional bearer token for -push-url")
-		timeout  = flag.Duration("timeout", 60*time.Second, "overall timeout")
+		fromUnix  = flag.Int64("from", 0, "window start (epoch seconds, inclusive)")
+		toUnix    = flag.Int64("to", 0, "window end (epoch seconds, inclusive); 0 = now")
+		mysqlDSN  = flag.String("mysql-dsn", os.Getenv("RECON_MYSQL_DSN"), "MySQL DSN (or RECON_MYSQL_DSN)")
+		tablesS   = flag.String("tables", envOr("RECON_TABLES", "message,message1,message2,message3,message4"), "comma-separated message shard tables")
+		esAddrs   = flag.String("es", envOr("RECON_ES", "http://localhost:9200"), "comma-separated OpenSearch addresses")
+		esIndex   = flag.String("es-index", envOr("RECON_ES_INDEX", "octo-message"), "OpenSearch index")
+		esUser    = flag.String("es-user", os.Getenv("RECON_ES_USER"), "OpenSearch username")
+		esPass    = flag.String("es-pass", os.Getenv("RECON_ES_PASS"), "OpenSearch password")
+		esTLSSkip = flag.Bool("es-tls-insecure", envBool("RECON_ES_TLS_INSECURE_SKIP_VERIFY"), "skip TLS cert verification for HTTPS OpenSearch (self-signed); default off")
+		dlq       = flag.Int64("dlq", 0, "known DLQ count in window (rows that never reached ES body index)")
+		dlqDir    = flag.String("dlq-spill-dir", os.Getenv("RECON_DLQ_SPILL_DIR"), "optional backfill DLQ spill dir (or RECON_DLQ_SPILL_DIR); its message_ids are excluded from the field-level sample gate so legit DLQ rows don't false-fail as sample_missing")
+		sampleN   = flag.Int("sample", envInt("RECON_SAMPLE", 200), "field-level sample size (0 disables sampling)")
+		maxDet    = flag.Int("sample-max-details", envInt("RECON_SAMPLE_MAX_DETAILS", 50), "cap on mismatch detail entries in the report")
+		jsonOut   = flag.Bool("json", false, "emit the structured FullReport as JSON")
+		pushURL   = flag.String("push-url", os.Getenv("RECON_PUSH_URL"), "optional octo-server ingestion URL to POST the search_recon gauge payload")
+		pushTok   = flag.String("push-token", os.Getenv("RECON_PUSH_TOKEN"), "optional bearer token for -push-url")
+		timeout   = flag.Duration("timeout", 60*time.Second, "overall timeout")
 	)
 	flag.Parse()
 
@@ -93,11 +95,16 @@ func run() error {
 		return fmt.Errorf("ping mysql: %w", err)
 	}
 
+	var esTransport http.RoundTripper
+	if *esTLSSkip {
+		esTransport = esindex.InsecureSkipVerifyTransport()
+	}
 	osClient, err := opensearchapi.NewClient(opensearchapi.Config{
 		Client: opensearch.Config{
 			Addresses: splitCSV(*esAddrs),
 			Username:  *esUser,
 			Password:  *esPass,
+			Transport: esTransport,
 		},
 	})
 	if err != nil {
@@ -222,6 +229,11 @@ func envOr(k, def string) string {
 		return v
 	}
 	return def
+}
+
+// envBool 解析布尔型 env（fail-closed：仅 "true"/"TRUE" 等 → true，其余一律 false）。
+func envBool(k string) bool {
+	return strings.EqualFold(os.Getenv(k), "true")
 }
 
 func splitCSV(s string) []string {
