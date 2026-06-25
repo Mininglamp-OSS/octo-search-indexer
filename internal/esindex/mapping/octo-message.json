@@ -22,6 +22,10 @@
       "revoked":       { "type": "boolean" },
       "rawExcluded":   { "type": "boolean" },
       "source":        { "type": "keyword", "ignore_above": 64 },
+      "parentMessageId":   { "type": "long" },
+      "parentPayloadType": { "type": "integer" },
+      "virtual":           { "type": "boolean" },
+      "subSeq":            { "type": "integer" },
       "payload": {
         "type": "object",
         "properties": {

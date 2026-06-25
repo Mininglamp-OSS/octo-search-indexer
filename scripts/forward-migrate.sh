@@ -48,13 +48,14 @@ step2_reindex(){
   # ⚠️ 旧链不写 space_id/visibles/message_seq（Kafka 契约缺），故 reindex 出的新 doc 这三字段为空
   # （reader p2p fail-closed / 无 visibles gate / messageSeq=0 保守）。要填全须走 backfill 重灌
   # （读原始 MySQL payload）——见 docs/forward-migration-v1.9.md「存量富化」。
+  # subSeq 显式置 0：v1.11 契约要求所有 doc 显式落盘 subSeq（reader 不赌「缺失=0」，见 #26）。
   "${CURL[@]}" -XPOST "$ES/_reindex?wait_for_completion=true" -d @- <<JSON | tee /dev/stderr | grep -q '"failures":\[\]'
 {
   "source": { "index": "$OLD_INDEX" },
   "dest":   { "index": "$NEW_INDEX", "op_type": "index" },
   "script": {
     "lang": "painless",
-    "source": "ctx._source.messageId = Long.parseLong(ctx._source.remove('message_id')); def cid = ctx._source.remove('channel_id'); if (cid != null) ctx._source.channelId = cid; def ct = ctx._source.remove('channel_type'); if (ct != null) ctx._source.channelType = ct; def f = ctx._source.remove('from_uid'); if (f != null) ctx._source.from = f; def ts = ctx._source.remove('msg_timestamp'); if (ts != null) ctx._source.timestamp = ts; def ca = ctx._source.remove('created_at'); if (ca != null) ctx._source.createdAt = ca; def re = ctx._source.remove('raw_excluded'); if (re != null) ctx._source.rawExcluded = re; def sv = ctx._source.remove('schema_version'); if (sv != null) ctx._source.schemaVersion = sv; def cont = ctx._source.remove('content'); def cty = ctx._source.remove('content_type'); def p = ['type': cty]; if (cont != null) p.text = ['content': cont]; ctx._source.payload = p;"
+    "source": "ctx._source.messageId = Long.parseLong(ctx._source.remove('message_id')); def cid = ctx._source.remove('channel_id'); if (cid != null) ctx._source.channelId = cid; def ct = ctx._source.remove('channel_type'); if (ct != null) ctx._source.channelType = ct; def f = ctx._source.remove('from_uid'); if (f != null) ctx._source.from = f; def ts = ctx._source.remove('msg_timestamp'); if (ts != null) ctx._source.timestamp = ts; def ca = ctx._source.remove('created_at'); if (ca != null) ctx._source.createdAt = ca; def re = ctx._source.remove('raw_excluded'); if (re != null) ctx._source.rawExcluded = re; def sv = ctx._source.remove('schema_version'); if (sv != null) ctx._source.schemaVersion = sv; def cont = ctx._source.remove('content'); def cty = ctx._source.remove('content_type'); def p = ['type': cty]; if (cont != null) p.text = ['content': cont]; ctx._source.payload = p; ctx._source.subSeq = 0;"
   }
 }
 JSON

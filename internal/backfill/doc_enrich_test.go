@@ -168,6 +168,44 @@ func TestDocFromRow_SharedVectorsWiredFailClosed(t *testing.T) {
 	}
 }
 
+// TestDocFromRow_RichTextChildrenInheritMessageSeq 🔴 #26：backfill 路径下，富文本(type=14)
+// 内嵌 image 派生的虚拟子文档必须继承父的 messageSeq。
+//
+// 回归点：deriveChild 在 DocFromMessage 内部按值快照父（child := parent），故 messageSeq 必须
+// 在 DocFromMessage 之前就位（现在在 extractMessage 构造 searchmsg.Message 时填）。修复前 backfill
+// 是在 DocFromMessage 之后才富化父 messageSeq，子文档停留 0 → 本测试会红。
+func TestDocFromRow_RichTextChildrenInheritMessageSeq(t *testing.T) {
+	// type=14 富文本：1 文本 + 1 image block（image 必填 url/width/height，对齐上游契约）。
+	raw := []byte(`{"type":14,"content":[{"type":"text","text":"图文混排"},{"type":"image","url":"https://x/a.png","width":640,"height":480,"name":"a.png"}],"plain":"图文混排[图片]"}`)
+	row := &srcMessageRow{ID: 20, MessageID: "3001", MessageSeq: 999, ChannelType: 2, Payload: raw}
+	doc, outcome, err := docFromRow(row)
+	if err != nil {
+		t.Fatalf("docFromRow: %v", err)
+	}
+	if outcome == outcomeDLQ {
+		t.Fatalf("richtext row must not DLQ, got %v", outcome)
+	}
+	// 父 doc 带 messageSeq。
+	if doc.MessageSeq != 999 {
+		t.Fatalf("parent messageSeq not carried: %d", doc.MessageSeq)
+	}
+	// 必须派生出 1 个 image 虚拟子文档。
+	if len(doc.Derivatives) != 1 {
+		t.Fatalf("want 1 derived image child, got %d", len(doc.Derivatives))
+	}
+	child := doc.Derivatives[0]
+	if !child.Virtual {
+		t.Fatalf("derived child must be virtual: %+v", child)
+	}
+	// 🔴 核心断言：子文档继承父 messageSeq（修复前为 0）。
+	if child.MessageSeq != 999 {
+		t.Fatalf("derived child did not inherit parent messageSeq (#26): got %d want 999", child.MessageSeq)
+	}
+	if child.MessageID != doc.MessageID {
+		t.Fatalf("derived child messageId must equal parent: child=%d parent=%d", child.MessageID, doc.MessageID)
+	}
+}
+
 // equalStrings 比较两个字符串切片（nil 与空切片视为相等：reader 对二者均「无 gate」）。
 func equalStrings(a, b []string) bool {
 	if len(a) != len(b) {

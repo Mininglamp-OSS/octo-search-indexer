@@ -166,7 +166,7 @@ KAFKA_BROKERS="$KAFKA_EXTERNAL" KAFKA_TOPIC=octo.message.v1 "$GAPTABLE_BIN"
 # and 3 fail-closed into the DLQ (V2 empty / V3 null / V4 non-string visibles).
 # Wait until BOTH signals settle — every expected doc is queryable AND the DLQ
 # fence has advanced by exactly 3 — so a slow Docker host/CI no longer flakes.
-EXPECT_DOCS="3000000000000000001 3000000000000000002 3000000000000000003 3000000000000000004 3000000000000000005 3000000000000000006 3000000000000000007 3000000000000000010 3000000000000000014 3000000000000000020"
+EXPECT_DOCS="3000000000000000001 3000000000000000002 3000000000000000003 3000000000000000004 3000000000000000005 3000000000000000006 3000000000000000007 3000000000000000008 3000000000000000010 3000000000000000014 3000000000000000020"
 dlq_count(){ docker exec octo-harness-kafka /opt/kafka/bin/kafka-get-offsets.sh --bootstrap-server localhost:9092 --topic octo.message.v1.dlq 2>/dev/null | awk -F: '{s+=$3} END{print s+0}'; }
 docs_present(){
   local n=0 id
@@ -184,10 +184,10 @@ for _ in $(seq 1 40); do
   dlq_now="$(dlq_count)" || dlq_now="$DLQ_START"
   dlq_delta=$(( dlq_now - DLQ_START ))
   present="$(docs_present)" || present=0
-  { [ "$present" -ge 10 ] && [ "$dlq_delta" -ge 3 ]; } && break
+  { [ "$present" -ge 11 ] && [ "$dlq_delta" -ge 3 ]; } && break
   sleep 1
 done
-echo "[gaptable] ingestion settled: indexed=${present}/10 dlq_delta=${dlq_delta}"
+echo "[gaptable] ingestion settled: indexed=${present}/11 dlq_delta=${dlq_delta}"
 curl -s -XPOST "$ES_URL/$NEW_INDEX/_refresh" >/dev/null
 
 echo "[gaptable] === STEP 3: gap-table reader-DSL recall ==="
@@ -220,6 +220,21 @@ for id in 3000000000000000011 3000000000000000012 3000000000000000013; do
 done
 src 3000000000000000014 | python3 -c "import json,sys;d=json.load(sys.stdin);sys.exit(0 if d['found'] and not d['_source'].get('visibles') else 1)" && ok "broadcast (no visibles key) allowed, no gate" || no "broadcast allowed"
 src 3000000000000000020 | python3 -c "import json,sys;d=json.load(sys.stdin);s=d.get('_source',{});sys.exit(0 if d['found'] and s.get('rawExcluded') and not s.get('payload') and not s.get('visibles') else 1)" && ok "encrypted DM parity (rawExcluded, no payload, empty visibles)" || no "encrypted DM parity"
+
+echo "[gaptable] === STEP 5: richtext embedded-media virtual sub-documents (B2) ==="
+# 父富文本 doc：subSeq=0，不是 virtual。
+src 3000000000000000008 | python3 -c "import json,sys;d=json.load(sys.stdin);s=d['_source'];sys.exit(0 if d['found'] and s['payload']['type']==14 and s.get('subSeq',0)==0 and not s.get('virtual') else 1)" && ok "richtext parent doc (type=14, subSeq=0, not virtual)" || no "richtext parent doc"
+# 子文档 rt1 = 第二个 block(image, idx1) → payload.type=2, virtual, parentMessageId=父, subSeq=2, 继承 channelId。
+src 3000000000000000008-rt1 | python3 -c "import json,sys;d=json.load(sys.stdin);s=d['_source'];p=s['payload'];sys.exit(0 if d['found'] and p['type']==2 and p['image']['name']=='虚拟图一.png' and s['virtual'] is True and s['parentMessageId']==3000000000000000008 and s['parentPayloadType']==14 and s['subSeq']==2 and s['messageId']==3000000000000000008 and s['channelId']=='g_gap' else 1)" && ok "virtual child rt1 (image type=2, virtual, parentMessageId, subSeq=2, inherits parent)" || no "virtual child rt1"
+# 负向：file block(idx2) 不派生（octo-lib/octo-web 契约：file 未打开）→ rt2 不存在。
+src 3000000000000000008-rt2 | python3 -c "import json,sys;d=json.load(sys.stdin);sys.exit(0 if d.get('found') is False else 1)" && ok "file block (idx2) not derived (rt2 absent, file contract closed)" || no "file block wrongly derived"
+# 子文档 rt3 = 第四个 block(image, idx3) → payload.type=2, subSeq=4（跨过被忽略的 file idx2，_id/subSeq 仍用原始 block 下标）。
+src 3000000000000000008-rt3 | python3 -c "import json,sys;d=json.load(sys.stdin);s=d['_source'];p=s['payload'];sys.exit(0 if d['found'] and p['type']==2 and p['image']['name']=='虚拟图二.png' and s['virtual'] is True and s['subSeq']==4 else 1)" && ok "virtual child rt3 (image type=2, subSeq=4, original block idx preserved)" || no "virtual child rt3"
+# 负向：text block(idx0) 不派生 → rt0 不存在。
+src 3000000000000000008-rt0 | python3 -c "import json,sys;d=json.load(sys.stdin);sys.exit(0 if d.get('found') is False else 1)" && ok "text block (idx0) not derived (rt0 absent)" || no "text block wrongly derived"
+# reader 媒体端点语义：payload.type=2 且 virtual=true 的子文档可被媒体检索白名单命中。
+recall "virtual image recall (payload.type=2)" '{"query":{"bool":{"filter":[{"term":{"payload.type":2}},{"term":{"virtual":true}},{"term":{"parentMessageId":3000000000000000008}}]}}}' 3000000000000000008-rt1
+
 
 DLQ_END="$(docker exec octo-harness-kafka /opt/kafka/bin/kafka-get-offsets.sh --bootstrap-server localhost:9092 --topic octo.message.v1.dlq 2>/dev/null | awk -F: '{s+=$3} END{print s+0}')"
 DLQ_NEW=$(( DLQ_END - DLQ_START ))

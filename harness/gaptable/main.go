@@ -101,6 +101,11 @@ func vectors(base int64) []kafka.Message {
 	// G7 text top-level fields anchor (messageId/messageSeq/channelId/channelType/from/timestamp/spaceId)
 	out = append(out, rawMsg("3000000000000000007", "g_gap", 2, "u_top", 17, base,
 		`{"type":1,"content":"顶层字段锚定庚","space_id":"space_top"}`))
+	// G8 richtext embedded-media virtual sub-documents (B2): 1 text + 2 images + 1 file block
+	// → 只派生 2 个 image 虚拟子文档（type=2）；file block 被忽略（octo-lib/octo-web 契约：file 未打开）。
+	// _id=<父>-rt<i>（i 为原始 block 序号）：image 在 idx1/idx3；subSeq=i+1（父独占 0）。
+	out = append(out, rawMsg("3000000000000000008", "g_gap", 2, "u_rich2", 18, base,
+		`{"type":14,"content":[{"type":"text","text":"多图富文本辛"},{"type":"image","name":"虚拟图一.png","url":"https://x/v1.png","width":640,"height":480},{"type":"file","name":"虚拟附件.pdf","url":"https://x/v.pdf","size":2048,"extension":"pdf"},{"type":"image","name":"虚拟图二.png","url":"https://x/v2.png","width":100,"height":120}]}`))
 
 	// ---- P0 visibility fail-closed vectors (group, non-encrypted) ----
 	// V1 valid visibles → indexed with visibles populated

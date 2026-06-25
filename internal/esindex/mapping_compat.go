@@ -30,6 +30,12 @@ var requiredMappingFieldPaths = []string{
 	"payload.mergeForward.msgs.from",
 	"payload.mergeForward.msgs.timestamp",
 	"payload.richText.searchText",
+	// v1.10：富文本虚拟子文档三字段（derivatives 指向父 + virtual 标记）。
+	"parentMessageId",
+	"parentPayloadType",
+	"virtual",
+	// v1.11：subSeq 排序第三键 tiebreaker（search_after 不丢同 tuple 兄弟）。
+	"subSeq",
 }
 
 // requiredDisabledObjectPaths 是必须以 enabled:false object 形态存在的留底字段（payloadRaw）。

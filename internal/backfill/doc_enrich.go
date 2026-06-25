@@ -50,10 +50,8 @@ func docFromRow(row *srcMessageRow) (esindex.Doc, extractOutcome, error) {
 		return esindex.Doc{}, outcomeDLQ, err
 	}
 
-	// 富化 messageSeq（仅 backfill 可从 message 表自源填）。
-	doc.MessageSeq = uint64(row.MessageSeq)
-	if row.MessageSeq < 0 {
-		doc.MessageSeq = 0
-	}
+	// messageSeq 已在 extractMessage 构造 searchmsg.Message 时填入（见 #26）：必须在
+	// DocFromMessage 之前就位，否则派生的富文本虚拟子文档会快照到 messageSeq=0。
+	// 此处不再事后补值，避免父填了、子没填的口径分叉。
 	return doc, outcome, nil
 }

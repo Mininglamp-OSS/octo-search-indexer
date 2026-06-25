@@ -253,7 +253,19 @@ func subBatchEnd(docs []Doc, start int) int {
 
 // encodedDocSize 估算一条 doc 在 _bulk body 里占的字节（动作行 + 文档行 + 两个换行）。
 // marshal 失败时返回 0（该条会在 bulkOnce 编码时再次失败并按 per-item 处理）。
+// 含父 doc 的虚拟子文档（Derivatives）体积：父子必须同一 _bulk 请求提交、不拆批（传输
+// 层同批；OpenSearch _bulk 本身是 per-item、不保证跨 doc 原子），故子 doc
+// 体积并入父 doc（subBatchEnd 依此不会把父子切到两个子批）。
 func encodedDocSize(d Doc) int {
+	size := encodedSingleDocSize(d)
+	for i := range d.Derivatives {
+		size += encodedSingleDocSize(d.Derivatives[i])
+	}
+	return size
+}
+
+// encodedSingleDocSize 估算单条 doc（不含其 Derivatives）在 _bulk body 里的字节。
+func encodedSingleDocSize(d Doc) int {
 	docJSON, err := json.Marshal(d)
 	if err != nil {
 		return 0
@@ -290,26 +302,41 @@ func (w *osWriter) bulkOnce(ctx context.Context, docs []Doc) ([]BulkItemResult, 
 }
 
 // encodeBulkBody 把 Doc 序列化为 _bulk NDJSON（每条：index 动作行 + 文档行）。
+// 每个父 doc 编码后紧接把它的 Derivatives（虚拟子文档）编进同一 body（父子相邻），
+// 使父子同 _bulk 请求提交、不被切批（传输层同批；OS _bulk 为 per-item，非跨 doc 原子）。
 func encodeBulkBody(docs []Doc) ([]byte, error) {
 	var buf bytes.Buffer
 	for i := range docs {
-		id := docs[i].idString()
-		var action bulkActionLine
-		action.Index.ID = id
-		actionJSON, err := json.Marshal(action)
-		if err != nil {
-			return nil, fmt.Errorf("esindex: marshal bulk action for %s: %w", id, err)
+		if err := writeBulkDoc(&buf, docs[i]); err != nil {
+			return nil, err
 		}
-		docJSON, err := json.Marshal(docs[i])
-		if err != nil {
-			return nil, fmt.Errorf("esindex: marshal doc for %s: %w", id, err)
+		for j := range docs[i].Derivatives {
+			if err := writeBulkDoc(&buf, docs[i].Derivatives[j]); err != nil {
+				return nil, err
+			}
 		}
-		buf.Write(actionJSON)
-		buf.WriteByte('\n')
-		buf.Write(docJSON)
-		buf.WriteByte('\n')
 	}
 	return buf.Bytes(), nil
+}
+
+// writeBulkDoc 向 buf 写一条 doc 的 index 动作行 + 文档行。
+func writeBulkDoc(buf *bytes.Buffer, d Doc) error {
+	id := d.idString()
+	var action bulkActionLine
+	action.Index.ID = id
+	actionJSON, err := json.Marshal(action)
+	if err != nil {
+		return fmt.Errorf("esindex: marshal bulk action for %s: %w", id, err)
+	}
+	docJSON, err := json.Marshal(d)
+	if err != nil {
+		return fmt.Errorf("esindex: marshal doc for %s: %w", id, err)
+	}
+	buf.Write(actionJSON)
+	buf.WriteByte('\n')
+	buf.Write(docJSON)
+	buf.WriteByte('\n')
+	return nil
 }
 
 // batchFailure 在批级失败时把每条标为 transient（Status=0, OK=false）。
@@ -321,44 +348,64 @@ func batchFailure(docs []Doc, err error) []BulkItemResult {
 	return out
 }
 
-// mapBulkResults 把 _bulk 响应逐项映射回结果切片（顺序与入参一致）。
-// _bulk 响应 Items 顺序与请求顺序一致，按下标对齐；防御性校验长度与 _id。
+// mapBulkResults 把 _bulk 响应映射回结果切片（顺序与入参一致，**只返回父 doc 结果**）。
+//
+// 🔴 虚拟子文档：body 里每个父 doc 后跟着它的 N 个 Derivatives，故响应 Items 数 = Σ(1+N)。
+// 本函数按父 doc 顺序推进响应游标 respIdx，每个父消费 1+N 个响应项，只为父写一条结果：
+//   - 父本身失败 → 父结果失败（原语义）。
+//   - 父 OK 但任一子失败 → 把父也判失败（父子结果绑定：返回非 OK 让调用方整批 retry 或路由 DLQ，
+//     下轮同 _id 幂等覆盖，不会重复）。注：OS _bulk 是 per-item、可部分成功，这里不是 OS 层原子，
+//     而是结果层「任一子败则父败 + 整批 retry 幂等」语义。
 func mapBulkResults(docs []Doc, resp *opensearchapi.BulkResp) []BulkItemResult {
 	out := make([]BulkItemResult, len(docs))
+	respIdx := 0
 	for i := range docs {
-		id := docs[i].idString()
-		res := BulkItemResult{MessageID: id}
-		if i >= len(resp.Items) {
-			// 响应条目缺失（理论上不应发生）：标 transient 让整批重试，绝不静默当成功。
-			res.OK = false
-			res.Status = 0
-			res.Err = fmt.Errorf("esindex: missing bulk response item for %s", id)
-			out[i] = res
-			continue
-		}
-		item, ok := resp.Items[i]["index"]
-		if !ok {
-			res.OK = false
-			res.Status = 0
-			res.Err = fmt.Errorf("esindex: bulk response item for %s has no index action", id)
-			out[i] = res
-			continue
-		}
-		res.Status = item.Status
-		if item.Status >= 200 && item.Status < 300 {
-			res.OK = true
-		} else {
-			res.OK = false
-			if item.Error != nil {
-				res.Err = fmt.Errorf("esindex: bulk item %s status=%d type=%s reason=%s",
-					id, item.Status, item.Error.Type, item.Error.Reason)
-			} else {
-				res.Err = fmt.Errorf("esindex: bulk item %s status=%d", id, item.Status)
+		parentID := docs[i].idString()
+		res := bulkItemResult(parentID, resp, respIdx)
+		respIdx++
+		for j := range docs[i].Derivatives {
+			childID := docs[i].Derivatives[j].idString()
+			cr := bulkItemResult(childID, resp, respIdx)
+			respIdx++
+			if res.OK && !cr.OK {
+				// 父表面 OK 但子失败：把父降为子的失败状态，整批重试/路由。
+				res.OK = false
+				res.Status = cr.Status
+				res.Err = fmt.Errorf("esindex: virtual child %s failed (parent %s): %w", childID, parentID, cr.Err)
 			}
 		}
 		out[i] = res
 	}
 	return out
+}
+
+// bulkItemResult 解析 _bulk 响应第 idx 项，返回单条 BulkItemResult（MessageID=id）。
+// 响应缺项/无 index 动作 → transient(Status=0) 让整批重试，绝不静默当成功。
+func bulkItemResult(id string, resp *opensearchapi.BulkResp, idx int) BulkItemResult {
+	res := BulkItemResult{MessageID: id}
+	if idx >= len(resp.Items) {
+		res.Status = 0
+		res.Err = fmt.Errorf("esindex: missing bulk response item for %s", id)
+		return res
+	}
+	item, ok := resp.Items[idx]["index"]
+	if !ok {
+		res.Status = 0
+		res.Err = fmt.Errorf("esindex: bulk response item for %s has no index action", id)
+		return res
+	}
+	res.Status = item.Status
+	if item.Status >= 200 && item.Status < 300 {
+		res.OK = true
+		return res
+	}
+	if item.Error != nil {
+		res.Err = fmt.Errorf("esindex: bulk item %s status=%d type=%s reason=%s",
+			id, item.Status, item.Error.Type, item.Error.Reason)
+	} else {
+		res.Err = fmt.Errorf("esindex: bulk item %s status=%d", id, item.Status)
+	}
+	return res
 }
 
 // Close 释放底层 ES 客户端资源。opensearch-go 客户端无显式 Close；预留接口对齐。

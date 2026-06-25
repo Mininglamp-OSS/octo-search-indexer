@@ -48,6 +48,29 @@ type Doc struct {
 	// 不索引）。仅当 payload 顶层是 JSON 对象时写（非对象在 visibility 预检即 fail-closed 落 DLQ，
 	// 不会走到这里）。用 json.RawMessage 内联存原始字节（不二次转义）。
 	PayloadRaw json.RawMessage `json:"payloadRaw,omitempty"`
+
+	// 富文本(type=14)虚拟子文档字段（v1.10）。普通消息这三者为零值（omitempty 不输出）。
+	// 子文档 payload.type∈{2,5,8}，结构与普通图片/视频/文件消息一致，让 reader 媒体/文件端点
+	// 白名单（payload.type∈{2,5,8}）直接命中。撤回/编辑联动本期不做（路线甲：reader 用
+	// parentMessageId 回 MySQL join 判可见性）。
+	ParentMessageID   int64 `json:"parentMessageId,omitempty"`   // = 父 messageId（reader 可见性判定）
+	ParentPayloadType int   `json:"parentPayloadType,omitempty"` // 父原 payload.type（=14）
+	Virtual           bool  `json:"virtual,omitempty"`           // 标记本 doc 由富文本派生
+	// SubSeq 是 reader 排序第三键（tiebreaker），保证 (messageId, subSeq) 全局唯一 →
+	// (timestamp, messageId, subSeq) 唯一，search_after 不再丢同 tuple 的兄弟。
+	// 普通 doc / 富文本父 doc = 0；富文本虚拟子文档从 1 递增（block 序号 i+1，父独占 0）。
+	// **不用 omitempty**：普通 doc 要显式落盘 subSeq=0（reader 不赌「缺失=0」）。
+	SubSeq int `json:"subSeq"`
+
+	// Derivatives 是本父 doc 派生的虚拟子文档（type=14 富文本内嵌 image block → type=2）。
+	// 本期**只派生 image→type=2**（上游契约 richText block 仅 text/image，file/video 全链路未打开）；
+	// payload.type∈{5,8}（video/file）为前瞻预留，待上游契约打开后再扩展。
+	// 仅顶层父 doc 持有；不序列化进 _source（json:"-"）。writer 编码 bulk body 时把每个父 doc
+	// 与它的 Derivatives 编进**同一** _bulk 请求（父子相邻、同批原子），子文档幂等靠复合 _id。
+	Derivatives []Doc `json:"-"`
+	// idOverride 非空时作为 ES _id（子文档用复合键 "<父messageId>-rt<i>"）。普通 doc 留空，
+	// idString() 回退到数值 messageId。json:"-" 不进 _source。
+	idOverride string `json:"-"`
 }
 
 // Payload 是结构化正文投影（镜像 reader Doc.Payload + RichText 前瞻）。方案 B 后照搬 CDC
@@ -135,6 +158,9 @@ type RichTextPayload struct {
 // idString 返回 ES `_id`（= 规范化 message_id）。messageId 为数值 snowflake，
 // FormatInt(ParseInt(s)) 与原串一致，保证 backfill 与实时 consumer 写同一 _id（幂等）。
 func (d Doc) idString() string {
+	if d.idOverride != "" {
+		return d.idOverride
+	}
 	return strconv.FormatInt(d.MessageID, 10)
 }
 
@@ -201,6 +227,9 @@ func DocFromMessage(msg searchmsg.Message) (Doc, error) {
 		}
 		// RawExcluded 重定义（§5.5）：产出了 typed 可搜子对象 → false；未知 type 投不出 → true。
 		d.RawExcluded = !projected
+		// 富文本(type=14)虚拟子文档（v1.10）：按内嵌 image block 派生独立子 doc（本期只 image→type=2），
+		// 与父同批原子写入。非富文本返回 nil（函数内部判 Payload.Type==14）。
+		d.Derivatives = richTextDerivatives(d)
 	case msg.RawExcluded:
 		// 分支 B：加密 DM（RawPayload=nil + RawExcluded=true）。跳过解析、不投影、visibles 留空。
 		d.Payload = nil
