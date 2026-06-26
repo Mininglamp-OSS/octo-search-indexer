@@ -47,9 +47,9 @@ var requiredDisabledObjectPaths = []string{"payloadRaw"}
 // 新字段路径齐备（可索引字段 + payloadRaw enabled:false object）。缺任一 → 返回 error，调用方
 // 据此拒启动（loud crash），绝不静默向 dynamic:strict 索引灌 4xx。
 //
-// 🔴 与 EnsureIndex 的存在性幂等**互相独立、不打架**（eng-review §4 额外发现）：EnsureIndex 把
-// resource_already_exists 当成功以防 CrashLoop（索引存在即放行）；本断言只校验**字段路径齐备**，
-// 缺字段才 loud crash。即「索引存在」仍幂等容忍，「字段缺失」才拒启动——二者方向不冲突。
+// 🔴 与 EnsureIndex 的存在性校验**互相独立、不打架**（eng-review §4 额外发现）：EnsureIndex 只判
+// 索引是否存在（存在即放行，缺失则拒启动）；本断言只校验**字段路径齐备**，缺字段才 loud crash。
+// 即「索引存在」放行，「字段缺失」才拒启动——二者方向不冲突。
 func (w *osWriter) AssertLiveMappingCompatible(ctx context.Context) error {
 	return assertLiveMappingCompatible(ctx, w.client, w.index)
 }

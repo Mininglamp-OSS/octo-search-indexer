@@ -110,13 +110,14 @@ func (s *Service) Run(ctx context.Context) error {
 			"ExtractVisibility pre-check, not from this gate)",
 			searchmsg.SchemaVersion, esindex.SafetyFieldsSchemaVersion)
 	}
+	// 先校验目标索引已存在，缺失则拒启动（不再自动创建，避免裸建丢 ISM/shards/replicas/aliases，见 issue #29）。
 	if err := s.writer.EnsureIndex(ctx); err != nil {
 		return fmt.Errorf("consumer: ensure index: %w", err)
 	}
 	// 🔴 mapping-compat fail-closed 断言（§6.4）：方案 B 新增 payloadRaw / richText /
 	// mergeForward.msgs.{from,timestamp}，dynamic:strict 下若漏迁这些字段会启动后每条 bulk 4xx
 	// 静默全量塌。启动期校验 live mapping 含本期所有新字段路径，缺则**拒启动**（loud crash），
-	// 不静默灌 4xx。与 EnsureIndex 的存在性幂等独立（存在仍幂等容忍，字段缺失才拒启动）。
+	// 不静默灌 4xx。与 EnsureIndex 的存在性校验独立（存在即放行，字段缺失才拒启动）。
 	if err := s.writer.AssertLiveMappingCompatible(ctx); err != nil {
 		return fmt.Errorf("consumer: mapping-compat assertion: %w", err)
 	}

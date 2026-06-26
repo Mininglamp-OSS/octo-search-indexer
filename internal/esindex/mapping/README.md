@@ -1,8 +1,10 @@
 # octo-message index mapping (v1.11 — reader-aligned)
 
 `octo-message.json` is the **canonical index mapping + analyzer** the `es-indexer`
-writes against, embedded into the binary (`//go:embed`) and used by
-`esindex.EnsureIndex` to bootstrap the index idempotently when it does not yet exist.
+writes against, embedded into the binary (`//go:embed`). The index must be
+**pre-created manually** with this mapping (plus ISM/lifecycle policy, shards/replicas
+and aliases) — `esindex.EnsureIndex` only **verifies the index exists** at startup and
+**refuses to start** if it is missing (auto-create intentionally disabled, see issue #29).
 
 ## v1.11 subSeq 排序 tiebreaker（配套 B2 虚拟子文档）
 
@@ -53,7 +55,7 @@ v1.9 收敛索引契约到 **octo-server reader** 读的形态
 - 新增 reader 必读字段：`spaceId`(keyword) / `visibles`(keyword[]) / `messageSeq`(long)。
 - sort 字段 `timestamp`(epoch_second) + `messageId` 与 reader cursor sort 口径一致。
 - reader 读 **alias `wukongim-messages-read`**（pattern `wukongim-messages-*`）。**本 mapping 不再内嵌该
-  alias**（v1.9 R2）：`EnsureIndex` 用本文件裸 PUT 建索引，若内嵌 alias 会让新索引一建好就被 reader
+  alias**（v1.9 R2）：人工预建索引用本文件 PUT，若内嵌 alias 会让新索引一建好就被 reader
   读到（reindex/backfill 完成前的半量数据）。alias 改由迁移脚本步骤③在对账通过后单独原子挂。
 
 完整迁移说明见 `docs/forward-migration-v1.9.md`。

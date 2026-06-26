@@ -164,7 +164,25 @@ down() {
   compose down -v --remove-orphans || true
 }
 
+# create_index pre-creates the target index from the embedded canonical mapping.
+# The indexer no longer auto-creates a missing index (it fail-fasts on 404, see
+# issue #29), so the harness must provision it explicitly — mirroring how a real
+# deployment pre-creates the index with mapping/ISM/shards/aliases. Idempotent:
+# tolerate 200 (created) and a 400 already-exists; anything else fails loud.
+create_index() {
+  echo "[harness] pre-creating index $ES_INDEX from embedded mapping..."
+  local code
+  code="$(curl -s -o /dev/null -w "%{http_code}" -XPUT "$ES_URL/$ES_INDEX" \
+    -H 'Content-Type: application/json' \
+    -d @"$ROOT/internal/esindex/mapping/octo-message.json")"
+  if [[ "$code" != "200" && "$code" != "400" ]]; then
+    echo "[harness] FATAL: creating index $ES_INDEX failed (HTTP $code)" >&2
+    exit 1
+  fi
+}
+
 run_indexer() {
+  create_index
   echo "[harness] starting es-indexer (background)..."
   ( cd "$ROOT" && \
     ES_INDEXER_ENABLED=true \

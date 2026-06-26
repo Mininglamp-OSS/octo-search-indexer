@@ -70,7 +70,7 @@ binaries distinct from `octo-server`.
 | `cmd/backfill/`       | One-shot historical loader: MySQL shards → OpenSearch, bypassing Kafka |
 | `internal/producer/`  | Producer internals: slow-cursor scheduler, keyset extraction, fail-closed enrich, Kafka sink + DLQ, Redis run-lock, obs server (`config.go` is the env SoT) |
 | `internal/consumer/`  | Kafka consumer: FetchMessage + manual commit, ordered-prefix offset, DLQ routing + terminal escape (C4) |
-| `internal/esindex/`   | Reusable ES bulk writer + index mapping bootstrap (imported by both the service and the backfill job) |
+| `internal/esindex/`   | Reusable ES bulk writer + startup index existence check (index must be pre-created manually; service refuses to start if missing — see issue #29) |
 | `internal/esindex/mapping/` | Canonical `octo-message` index mapping + 中文 analyzer (single source for the octo-deployment change) |
 | `harness/producer/`   | Local docker-compose e2e harness for the producer (see its own `README.md`) |
 

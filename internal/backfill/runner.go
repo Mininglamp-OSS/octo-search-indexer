@@ -72,7 +72,7 @@ func NewRunner(cfg Config, src SourceReader, writer esindex.Writer, cp *Checkpoi
 	}
 }
 
-// Run 执行整个 backfill：先幂等确保索引存在（mapping / 中文分词），再逐分表回灌。
+// Run 执行整个 backfill：先校验索引已存在（mapping / 中文分词），缺失则拒启动（不自动创建，见 issue #29），再逐分表回灌。
 // 返回累计 Stats。任一 fail-closed 条件（DLQ spill 写失败 / checkpoint 持久化失败 /
 // ES 永久错误无法落地）触发即返回错误并 STOP（绝不静默吞行破坏对账）。
 func (r *Runner) Run(ctx context.Context) (Stats, error) {

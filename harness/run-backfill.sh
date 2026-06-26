@@ -54,8 +54,23 @@ down() {
   docker rm -f octo-bf-os octo-bf-mysql >/dev/null 2>&1 || true
 }
 
+# create_index pre-creates the target index from the embedded canonical mapping.
+# cmd/backfill no longer auto-creates a missing index (fail-fasts on 404, see
+# issue #29), so the harness provisions it explicitly. Idempotent: tolerate 200
+# (created) and 400 already-exists; anything else fails loud.
+create_index() {
+  echo "[backfill-harness] pre-creating index $ES_INDEX from embedded mapping..."
+  local code
+  code="$(curl -s -o /dev/null -w "%{http_code}" -XPUT "$ES_URL/$ES_INDEX" \
+    -H 'Content-Type: application/json' \
+    -d @"$ROOT/internal/esindex/mapping/octo-message.json")"
+  if [[ "$code" != "200" && "$code" != "400" ]]; then
+    echo "[backfill-harness] FATAL: creating index $ES_INDEX failed (HTTP $code)" >&2
+    exit 1
+  fi
+}
+
 seed() {
-  echo "[backfill-harness] seeding MySQL message shards..."
   BASE_TS="$(date +%s)"
   export BASE_TS
   go run ./harness/backfill -mode seed -mysql-dsn "$MYSQL_DSN" -tables "$TABLES" -base-ts "$BASE_TS"
@@ -86,6 +101,7 @@ case "${1:-all}" in
   all)
     up
     trap 'if [[ "${KEEP_UP:-0}" != "1" ]]; then down; fi' EXIT
+    create_index
     seed
     backfill
     verify

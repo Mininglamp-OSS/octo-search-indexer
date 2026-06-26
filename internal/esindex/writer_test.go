@@ -218,30 +218,25 @@ func osWriterFor(t *testing.T, rt http.RoundTripper) *osWriter {
 	return w
 }
 
-// TestEnsureIndex_CreatesWhenMissing 索引不存在(404) → 发 PUT 创建，body 为内嵌 mapping。
-func TestEnsureIndex_CreatesWhenMissing(t *testing.T) {
-	var createBody string
-	var createCalled bool
+// TestEnsureIndex_MissingFailsFastNoCreate 索引不存在(404) → 拒启动报错，绝不发 PUT 自动创建（issue #29）。
+func TestEnsureIndex_MissingFailsFastNoCreate(t *testing.T) {
+	createCalled := false
 	rt := roundTripFunc(func(r *http.Request) (*http.Response, error) {
-		if r.Method == http.MethodHead || (r.Method == http.MethodGet) {
+		if r.Method == http.MethodHead || r.Method == http.MethodGet {
 			return jsonResp(404, `{"error":"index_not_found"}`), nil
 		}
 		if r.Method == http.MethodPut {
 			createCalled = true
-			createBody = readAll(r.Body)
 			return jsonResp(200, `{"acknowledged":true}`), nil
 		}
 		return jsonResp(200, `{}`), nil
 	})
 	w := osWriterFor(t, rt)
-	if err := w.EnsureIndex(context.Background()); err != nil {
-		t.Fatalf("EnsureIndex: %v", err)
+	if err := w.EnsureIndex(context.Background()); err == nil {
+		t.Fatalf("missing index (404) must fail fast, got nil error")
 	}
-	if !createCalled {
-		t.Fatalf("expected index create (PUT) when missing")
-	}
-	if !strings.Contains(createBody, "ik_max_word") || !strings.Contains(createBody, `"content"`) {
-		t.Fatalf("create body must carry embedded mapping/analyzer, got: %s", createBody)
+	if createCalled {
+		t.Fatalf("must NOT auto-create a missing index")
 	}
 }
 
