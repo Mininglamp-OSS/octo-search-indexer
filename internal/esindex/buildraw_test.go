@@ -89,6 +89,22 @@ func TestProject_Image(t *testing.T) {
 	}
 }
 
+// TestProject_Image_OverflowDimensionsClamp type=2 普通图片 width/height 超 int32 → 钳为 0（#31）。
+// 复现 DLQ permanent_4xx：payload.image.{width,height} 为历史脏数据（如 4293001688）超 ES `integer`。
+func TestProject_Image_OverflowDimensionsClamp(t *testing.T) {
+	rd := projectViaDoc(t, `{"type":2,"url":"https://x/y.png","width":4293001688,"height":2424569856}`)
+	img := rd.Payload.Image
+	if img == nil {
+		t.Fatalf("image payload missing")
+	}
+	if img.Width != 0 {
+		t.Fatalf("oversize image width must clamp to 0 (int32-safe), got %d", img.Width)
+	}
+	if img.Height != 0 {
+		t.Fatalf("oversize image height must clamp to 0 (int32-safe), got %d", img.Height)
+	}
+}
+
 // TestProject_GIF type=3 留底 gif.url。
 func TestProject_GIF(t *testing.T) {
 	rd := projectViaDoc(t, `{"type":3,"url":"https://x/a.gif"}`)
@@ -111,6 +127,19 @@ func TestProject_Video(t *testing.T) {
 	v := rd.Payload.Video
 	if v == nil || v.URL != "https://x/v.mp4" || v.Cover != "https://x/c.jpg" || v.Width != 1920 || v.Height != 1080 || v.Second != 42 {
 		t.Fatalf("video not fully projected: %+v", v)
+	}
+}
+
+// TestProject_Video_OverflowDimensionsClamp type=5 video width/height/second 超 int32 → 钳为 0（#31）。
+// issue #31 只点名 width/height，但 second 同为 ES `integer`，一并防护。
+func TestProject_Video_OverflowDimensionsClamp(t *testing.T) {
+	rd := projectViaDoc(t, `{"type":5,"url":"https://x/v.mp4","width":4293001688,"height":3997107456,"second":2424569856}`)
+	v := rd.Payload.Video
+	if v == nil {
+		t.Fatalf("video payload missing")
+	}
+	if v.Width != 0 || v.Height != 0 || v.Second != 0 {
+		t.Fatalf("oversize video dims must clamp to 0 (int32-safe), got w=%d h=%d s=%d", v.Width, v.Height, v.Second)
 	}
 }
 

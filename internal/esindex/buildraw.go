@@ -89,11 +89,12 @@ func buildPayloadFromRaw(rawPayload json.RawMessage) (payload *Payload, rawForSt
 		if n, ok := raw["name"].(string); ok {
 			p.Name = n
 		}
+		// width/height 钳进 int32（ES `integer`）；异常 payload 超界会触发 _bulk 永久 4xx（见 #26 / #31）。
 		if w, ok := extractInt(raw, "width"); ok {
-			p.Width = w
+			p.Width = clampInt32(w)
 		}
 		if h, ok := extractInt(raw, "height"); ok {
-			p.Height = h
+			p.Height = clampInt32(h)
 		}
 		parsed.Image = p
 	case payloadTypeGIF:
@@ -116,14 +117,15 @@ func buildPayloadFromRaw(rawPayload json.RawMessage) (payload *Payload, rawForSt
 		if c, ok := raw["cover"].(string); ok {
 			p.Cover = c
 		}
+		// width/height/second 均映射为 ES `integer`（int32），异常 payload 超界会触发 _bulk 永久 4xx（见 #31）。
 		if w, ok := extractInt(raw, "width"); ok {
-			p.Width = w
+			p.Width = clampInt32(w)
 		}
 		if h, ok := extractInt(raw, "height"); ok {
-			p.Height = h
+			p.Height = clampInt32(h)
 		}
 		if s, ok := extractInt(raw, "second"); ok {
-			p.Second = s
+			p.Second = clampInt32(s)
 		}
 		parsed.Video = p
 	case payloadTypeFile:
