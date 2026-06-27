@@ -1,87 +1,140 @@
 package producer
 
 import (
-	"fmt"
-	"sort"
-	"strings"
-	"sync"
-	"sync/atomic"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
 )
 
-// Metrics is the minimal observability set the plan moved back into scope:
-// produced counts, per-shard cursor position, tick health. Rendered as a tiny
-// Prometheus text exposition (no prometheus client dep in this slim image).
+// metricsNamespace prefixes every producer series (kept stable across the SDK
+// migration: callers/dashboards still see searchetl_producer_*).
+const metricsNamespace = "searchetl_producer"
+
+// latencyBuckets is the shared Histogram bucketing (5ms~5s) for both the
+// producer and consumer legs.
+var latencyBuckets = []float64{.005, .01, .025, .05, .1, .25, .5, 1, 2.5, 5}
+
+// Metrics is the producer observability set, backed by the prometheus
+// client_golang SDK on a private registry (no global default registry — the two
+// binaries must never cross-register each other's series).
+//
+// Series (all prefixed searchetl_producer_):
+//   - produced_total{stream}          counter   messages produced by stream (main/dlq)
+//   - cursor_position{shard}          gauge     per-shard cursor watermark (message.id)
+//   - ticks_total{result}            counter   slow-cursor ticks by result (ok/error)
+//   - tick_duration_seconds          histogram whole-tick latency
+//   - read_batch_duration_seconds    histogram single ReadStableBatchTx latency
+//   - dlq_total{reason}              counter   dead-lettered envelopes by reason
+//   - produce_errors_total           counter   Kafka WriteMessages failures
+//   - lock_renew_failures_total      counter   run-lock renew failures
 type Metrics struct {
-	producedMain atomic.Int64
-	producedDLQ  atomic.Int64
-	ticks        atomic.Int64
-	tickErrors   atomic.Int64
-	lastTickUnix atomic.Int64
+	reg *prometheus.Registry
 
-	mu      sync.Mutex
-	cursors map[string]int64
+	produced       *prometheus.CounterVec
+	cursor         *prometheus.GaugeVec
+	ticks          *prometheus.CounterVec
+	tickDuration   prometheus.Histogram
+	readBatchDur   prometheus.Histogram
+	dlq            *prometheus.CounterVec
+	produceErrors  prometheus.Counter
+	lockRenewFails prometheus.Counter
 }
 
-// NewMetrics constructs a Metrics.
+// NewMetrics constructs a Metrics bound to its own registry.
 func NewMetrics() *Metrics {
-	return &Metrics{cursors: map[string]int64{}}
+	reg := prometheus.NewRegistry()
+	m := &Metrics{
+		reg: reg,
+		produced: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Name:      "produced_total",
+			Help:      "Messages produced to Kafka by stream.",
+		}, []string{"stream"}),
+		cursor: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: metricsNamespace,
+			Name:      "cursor_position",
+			Help:      "Per-shard cursor watermark (message.id).",
+		}, []string{"shard"}),
+		ticks: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Name:      "ticks_total",
+			Help:      "Slow-cursor ticks fired by result.",
+		}, []string{"result"}),
+		tickDuration: prometheus.NewHistogram(prometheus.HistogramOpts{
+			Namespace: metricsNamespace,
+			Name:      "tick_duration_seconds",
+			Help:      "Whole slow-cursor tick latency.",
+			Buckets:   latencyBuckets,
+		}),
+		readBatchDur: prometheus.NewHistogram(prometheus.HistogramOpts{
+			Namespace: metricsNamespace,
+			Name:      "read_batch_duration_seconds",
+			Help:      "Single ReadStableBatchTx latency (DB read round-trip).",
+			Buckets:   latencyBuckets,
+		}),
+		dlq: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Name:      "dlq_total",
+			Help:      "Dead-lettered envelopes produced by reason.",
+		}, []string{"reason"}),
+		produceErrors: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Name:      "produce_errors_total",
+			Help:      "Kafka WriteMessages failures (main + dlq).",
+		}),
+		lockRenewFails: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Name:      "lock_renew_failures_total",
+			Help:      "Run-lock renew failures (error or ownership lost).",
+		}),
+	}
+	reg.MustRegister(
+		m.produced, m.cursor, m.ticks, m.tickDuration, m.readBatchDur,
+		m.dlq, m.produceErrors, m.lockRenewFails,
+	)
+	return m
 }
+
+// Registry exposes the private registry for the obs /metrics handler.
+func (m *Metrics) Registry() *prometheus.Registry { return m.reg }
 
 // AddProduced records produced message counts for a tick.
 func (m *Metrics) AddProduced(main, dlq int64) {
-	m.producedMain.Add(main)
-	m.producedDLQ.Add(dlq)
+	if main != 0 {
+		m.produced.WithLabelValues("main").Add(float64(main))
+	}
+	if dlq != 0 {
+		m.produced.WithLabelValues("dlq").Add(float64(dlq))
+	}
 }
 
-// SetCursor records the latest cursor watermark for a shard (cursor position log
-// + metric: the plan requires cursor-position observability).
+// SetCursor records the latest cursor watermark for a shard.
 func (m *Metrics) SetCursor(table string, id int64) {
-	m.mu.Lock()
-	m.cursors[table] = id
-	m.mu.Unlock()
+	m.cursor.WithLabelValues(table).Set(float64(id))
 }
 
-// MarkTick records a tick fired.
-func (m *Metrics) MarkTick() {
-	m.ticks.Add(1)
-	m.lastTickUnix.Store(time.Now().Unix())
+// MarkTick records a tick outcome (result ∈ {ok, error}).
+func (m *Metrics) MarkTick(result string) {
+	m.ticks.WithLabelValues(result).Inc()
 }
 
-// MarkTickError records a tick that returned an error.
-func (m *Metrics) MarkTickError() { m.tickErrors.Add(1) }
-
-// Render returns the Prometheus text exposition.
-func (m *Metrics) Render() string {
-	var b strings.Builder
-	fmt.Fprintf(&b, "# HELP searchetl_producer_produced_total Messages produced to Kafka by stream.\n")
-	fmt.Fprintf(&b, "# TYPE searchetl_producer_produced_total counter\n")
-	fmt.Fprintf(&b, "searchetl_producer_produced_total{stream=\"main\"} %d\n", m.producedMain.Load())
-	fmt.Fprintf(&b, "searchetl_producer_produced_total{stream=\"dlq\"} %d\n", m.producedDLQ.Load())
-
-	fmt.Fprintf(&b, "# HELP searchetl_producer_ticks_total Slow-cursor ticks fired.\n")
-	fmt.Fprintf(&b, "# TYPE searchetl_producer_ticks_total counter\n")
-	fmt.Fprintf(&b, "searchetl_producer_ticks_total %d\n", m.ticks.Load())
-
-	fmt.Fprintf(&b, "# HELP searchetl_producer_tick_errors_total Slow-cursor ticks that errored.\n")
-	fmt.Fprintf(&b, "# TYPE searchetl_producer_tick_errors_total counter\n")
-	fmt.Fprintf(&b, "searchetl_producer_tick_errors_total %d\n", m.tickErrors.Load())
-
-	fmt.Fprintf(&b, "# HELP searchetl_producer_last_tick_unixtime Unix time of the last tick.\n")
-	fmt.Fprintf(&b, "# TYPE searchetl_producer_last_tick_unixtime gauge\n")
-	fmt.Fprintf(&b, "searchetl_producer_last_tick_unixtime %d\n", m.lastTickUnix.Load())
-
-	m.mu.Lock()
-	tables := make([]string, 0, len(m.cursors))
-	for t := range m.cursors {
-		tables = append(tables, t)
-	}
-	sort.Strings(tables)
-	fmt.Fprintf(&b, "# HELP searchetl_producer_cursor_position Per-shard cursor watermark (message.id).\n")
-	fmt.Fprintf(&b, "# TYPE searchetl_producer_cursor_position gauge\n")
-	for _, t := range tables {
-		fmt.Fprintf(&b, "searchetl_producer_cursor_position{shard=%q} %d\n", t, m.cursors[t])
-	}
-	m.mu.Unlock()
-	return b.String()
+// ObserveTickDuration records whole-tick latency.
+func (m *Metrics) ObserveTickDuration(d time.Duration) {
+	m.tickDuration.Observe(d.Seconds())
 }
+
+// ObserveReadBatch records a single ReadStableBatchTx latency.
+func (m *Metrics) ObserveReadBatch(d time.Duration) {
+	m.readBatchDur.Observe(d.Seconds())
+}
+
+// MarkDLQ records one dead-lettered envelope by reason.
+func (m *Metrics) MarkDLQ(reason string) {
+	m.dlq.WithLabelValues(reason).Inc()
+}
+
+// MarkProduceError records one Kafka WriteMessages failure.
+func (m *Metrics) MarkProduceError() { m.produceErrors.Inc() }
+
+// MarkLockRenewFailure records one run-lock renew failure.
+func (m *Metrics) MarkLockRenewFailure() { m.lockRenewFails.Inc() }

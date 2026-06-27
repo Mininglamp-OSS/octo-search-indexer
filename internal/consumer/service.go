@@ -17,6 +17,7 @@ type Service struct {
 	source  *kafkaSource
 	dlqSink *kafkaDLQSink
 	writer  esindex.Writer
+	metrics *Metrics
 }
 
 // ServiceConfig 是 es-indexer 服务的运行配置（由 cmd 从环境装配）。
@@ -41,10 +42,32 @@ type ServiceConfig struct {
 	DLQSpillDir      string
 }
 
-// logAlerter 是占位 alerter：记日志（阶段 7 接 Prometheus 计数 + 告警规则）。
-type logAlerter struct{}
+// metricsAlerter is the production alerter: it maps alert events to Prometheus
+// counters and still logs every event. The Alert(event, detail) interface is
+// unchanged — only the implementation moved from pure logging to logging +
+// counting (no alerting/priority semantics; the counters are plain).
+type metricsAlerter struct {
+	metrics *Metrics
+}
 
-func (logAlerter) Alert(event string, detail string) {
+func (a metricsAlerter) Alert(event string, detail string) {
+	switch event {
+	case "bulk_batch_error":
+		if a.metrics != nil {
+			a.metrics.MarkBulkError()
+		}
+	case "dlq_hard_stop":
+		// 真实硬停：仅在 routePoison 拿到 DLQ 终态逃逸 err 时触发一次（无 spill），语义精确。
+		if a.metrics != nil {
+			a.metrics.MarkDLQHardStop()
+		}
+	case "dlq_write_exhausted":
+		// DLQ 写重试耗尽（无论之后硬停还是 spill 越过都会触发）——独立信号，不并入 hard_stop
+		// 否则会让 hard_stop 双计（硬停时 exhausted+hard_stop 各一次）+ spill 假阳性。
+		if a.metrics != nil {
+			a.metrics.MarkDLQWriteExhausted()
+		}
+	}
 	log.Printf("[ALERT] %s: %s", event, detail)
 }
 
@@ -66,16 +89,18 @@ func NewService(cfg ServiceConfig) (*Service, error) {
 		return nil, fmt.Errorf("consumer: build ES writer: %w", err)
 	}
 
+	metrics := NewMetrics()
+
 	source, err := newKafkaSource(KafkaSourceConfig{
 		Brokers: cfg.Brokers,
 		Topic:   cfg.Topic,
 		GroupID: cfg.GroupID,
-	})
+	}, metrics)
 	if err != nil {
 		return nil, err
 	}
 
-	dlqSink, err := newKafkaDLQSink(cfg.Brokers, cfg.DLQTopic)
+	dlqSink, err := newKafkaDLQSink(cfg.Brokers, cfg.DLQTopic, metrics)
 	if err != nil {
 		// 避免已建好的 source reader 泄漏（P2-4：构造器后段出错须回收前段资源）。
 		if cerr := source.Close(); cerr != nil {
@@ -84,7 +109,7 @@ func NewService(cfg ServiceConfig) (*Service, error) {
 		return nil, err
 	}
 
-	alert := logAlerter{}
+	alert := metricsAlerter{metrics: metrics}
 	dlqCfg := defaultDLQConfig()
 	if cfg.DLQMaxRetries > 0 {
 		dlqCfg.MaxRetries = cfg.DLQMaxRetries
@@ -98,10 +123,13 @@ func NewService(cfg ServiceConfig) (*Service, error) {
 	proc := NewProcessor(source, writer, dlq, alert, Config{
 		BatchSize:        cfg.BatchSize,
 		TransientBackoff: cfg.TransientBackoff,
-	})
+	}, metrics)
 
-	return &Service{proc: proc, source: source, dlqSink: dlqSink, writer: writer}, nil
+	return &Service{proc: proc, source: source, dlqSink: dlqSink, writer: writer, metrics: metrics}, nil
 }
+
+// Metrics exposes the service's metrics registry holder (for the obs server).
+func (s *Service) Metrics() *Metrics { return s.metrics }
 
 // Run 运行消费循环直到 ctx 取消。启动时先幂等确保目标索引存在（带 mapping/中文分词），
 // 再做 mapping-compat fail-closed 断言（§6.4）。

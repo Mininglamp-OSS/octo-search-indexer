@@ -1,4 +1,4 @@
-package producer
+package consumer
 
 import (
 	"context"
@@ -15,13 +15,13 @@ import (
 // a broken client connection on a health/metrics endpoint is not actionable.
 func writeBody(w http.ResponseWriter, body string) {
 	if _, err := w.Write([]byte(body)); err != nil {
-		log.Printf("producer: obs write: %v", err)
+		log.Printf("consumer: obs write: %v", err)
 	}
 }
 
 // ObsServer serves the minimal observability endpoints: /healthz (liveness),
-// /readyz (readiness — backends reachable), /metrics (Prometheus text). It uses
-// only net/http so the slim image gains no new dependency.
+// /readyz (readiness), /metrics (Prometheus via promhttp). It mirrors the
+// producer leg's obs server.
 type ObsServer struct {
 	srv     *http.Server
 	metrics *Metrics
@@ -77,7 +77,7 @@ func (o *ObsServer) SetReady(v bool) { o.ready.Store(v) }
 func (o *ObsServer) Start(logf func(string, ...any)) {
 	go func() {
 		if err := o.srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			logf("producer: obs server error: %v", err)
+			logf("consumer: obs server error: %v", err)
 		}
 	}()
 }

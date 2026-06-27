@@ -48,8 +48,12 @@ func main() {
 // run 装配并运行索引器服务。未配置后端时空转到信号（零运行期行为）。
 func run(ctx context.Context) error {
 	cfg, enabled := loadConfig()
+	obsAddr := envOr("INDEXER_OBS_ADDR", ":9090")
 	if !enabled {
 		log.Printf("es-indexer: ES_INDEXER_ENABLED not true (or brokers/ES unset); idling (no backend connection)")
+		// 对齐 producer：空转态也起 obs server（/healthz + /readyz 200），让被刻意停用的 pod
+		// 不在编排器 HTTP 探针下 crashloop。不连任何后端（metrics=nil）。
+		serveIdleObs(ctx, obsAddr)
 		<-ctx.Done()
 		return nil
 	}
@@ -64,8 +68,44 @@ func run(ctx context.Context) error {
 		}
 	}()
 
-	log.Printf("es-indexer running: topic=%s group=%s es_index=%s", cfg.Topic, cfg.GroupID, cfg.ESIndex)
+	// Observability server（healthz/readyz/metrics）。readyz 在运行循环启动后置 ready。
+	var obs *consumer.ObsServer
+	if obsAddr != "" {
+		obs = consumer.NewObsServer(obsAddr, svc.Metrics(), nil)
+		obs.Start(log.Printf)
+		obs.SetReady(true)
+		defer func() {
+			sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if serr := obs.Shutdown(sctx); serr != nil {
+				log.Printf("es-indexer: obs shutdown: %v", serr)
+			}
+		}()
+	}
+
+	log.Printf("es-indexer running: topic=%s group=%s es_index=%s obs=%s", cfg.Topic, cfg.GroupID, cfg.ESIndex, obsAddr)
 	return svc.Run(ctx)
+}
+
+// serveIdleObs 在空转（停用）态起 obs HTTP server：/healthz 与 /readyz 均返回 200，
+// /metrics 空。对齐 producer 的 idle obs，保证被刻意停用的 pod 在编排器探针下不 crashloop。
+// 不连任何后端（metrics=nil），ctx 取消时优雅停机。
+func serveIdleObs(ctx context.Context, addr string) {
+	if addr == "" {
+		return
+	}
+	obs := consumer.NewObsServer(addr, nil, nil)
+	obs.SetReady(true) // 空转正常即 ready（未拨任何后端）
+	obs.Start(log.Printf)
+	go func() {
+		<-ctx.Done()
+		sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if serr := obs.Shutdown(sctx); serr != nil {
+			log.Printf("es-indexer: idle obs shutdown: %v", serr)
+		}
+	}()
+	log.Printf("es-indexer: idle observability server on %s (/healthz + /readyz 200, idle)", addr)
 }
 
 // loadConfig 从环境读取配置。返回 enabled=false 时服务空转（未开通）。

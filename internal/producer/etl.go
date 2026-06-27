@@ -82,7 +82,7 @@ func (e *ETL) RunIncremental(ctx context.Context, tables []string) error {
 	}
 	defer e.running.Store(false)
 
-	return runLocked(ctx, e.lock, e.renewInterval, e.logf, func(lockCtx context.Context) error {
+	return runLocked(ctx, e.lock, e.renewInterval, e.logf, e.metrics, func(lockCtx context.Context) error {
 		return e.runTick(lockCtx, tables)
 	})
 }
@@ -115,7 +115,7 @@ func (e *ETL) runTick(ctx context.Context, tables []string) error {
 				e.logf("producer: lock lost / ctx cancelled, abort in-flight tick (table=%s): %v", table, cerr)
 				return cerr
 			}
-			plan, n, cerr := runChunk(ctx, e.store, sink, table, cutoff, e.batch, e.logf)
+			plan, n, cerr := runChunk(ctx, e.store, sink, table, cutoff, e.batch, e.logf, e.metrics)
 			if cerr != nil {
 				return cerr
 			}
@@ -150,8 +150,12 @@ func (e *ETL) runTick(ctx context.Context, tables []string) error {
 //
 // Returns the stable-prefix row count (for the "reached the unstable tail" check).
 // Any failure returns an error and leaves the cursor un-advanced.
-func runChunk(ctx context.Context, store Store, sink Sink, table string, cutoff int64, batch int, logf func(string, ...any)) (chunkPlan, int, error) {
+func runChunk(ctx context.Context, store Store, sink Sink, table string, cutoff int64, batch int, logf func(string, ...any), metrics *Metrics) (chunkPlan, int, error) {
+	readStart := time.Now()
 	cursor, rows, err := store.ReadStableBatchTx(ctx, table, batch)
+	if metrics != nil {
+		metrics.ObserveReadBatch(time.Since(readStart))
+	}
 	if err != nil {
 		return chunkPlan{}, 0, err
 	}
@@ -180,6 +184,13 @@ func runChunk(ctx context.Context, store Store, sink Sink, table string, cutoff 
 	}
 	if err = sink.ProduceDLQ(ctx, plan.dlq); err != nil {
 		return plan, 0, err
+	}
+	// dlq_total{reason}: count each dead-lettered envelope only after the DLQ
+	// produce is confirmed (planChunk stays pure — no side effects there).
+	if metrics != nil {
+		for i := range plan.dlq {
+			metrics.MarkDLQ(plan.dlq[i].Reason)
+		}
 	}
 
 	// Best-effort early-out on lock loss: stop sooner, do less redundant advancing.

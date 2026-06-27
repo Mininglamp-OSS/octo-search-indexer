@@ -90,13 +90,13 @@ func TestMetrics_Render(t *testing.T) {
 	m := NewMetrics()
 	m.AddProduced(5, 1)
 	m.SetCursor("message", 42)
-	m.MarkTick()
-	out := m.Render()
+	m.MarkTick("ok")
+	out := dumpMetrics(t, m)
 	for _, want := range []string{
 		`searchetl_producer_produced_total{stream="main"} 5`,
 		`searchetl_producer_produced_total{stream="dlq"} 1`,
 		`searchetl_producer_cursor_position{shard="message"} 42`,
-		"searchetl_producer_ticks_total 1",
+		`searchetl_producer_ticks_total{result="ok"} 1`,
 	} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("metrics missing %q in:\n%s", want, out)

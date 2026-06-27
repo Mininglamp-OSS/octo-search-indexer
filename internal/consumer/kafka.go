@@ -3,6 +3,7 @@ package consumer
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/segmentio/kafka-go"
 )
@@ -12,7 +13,8 @@ import (
 // 🔴 C4：Reader 必须 CommitInterval=0（同步手动提交），且只用 FetchMessage（不用 ReadMessage，
 // 后者会按 CommitInterval 自动提交，违反「连续成功前缀才 commit」）。GroupID 启用消费组协调。
 type kafkaSource struct {
-	reader *kafka.Reader
+	reader  *kafka.Reader
+	metrics *Metrics
 }
 
 // KafkaSourceConfig 配置消费侧 Kafka Reader。
@@ -26,7 +28,7 @@ type KafkaSourceConfig struct {
 }
 
 // newKafkaSource 建一个手动提交的消费组 Reader（C4 提交语义）。
-func newKafkaSource(cfg KafkaSourceConfig) (*kafkaSource, error) {
+func newKafkaSource(cfg KafkaSourceConfig, metrics *Metrics) (*kafkaSource, error) {
 	if len(cfg.Brokers) == 0 {
 		return nil, fmt.Errorf("consumer: kafka brokers required")
 	}
@@ -50,12 +52,20 @@ func newKafkaSource(cfg KafkaSourceConfig) (*kafkaSource, error) {
 		MinBytes:       minBytes,
 		MaxBytes:       maxBytes,
 	})
-	return &kafkaSource{reader: r}, nil
+	return &kafkaSource{reader: r, metrics: metrics}, nil
 }
 
 func (k *kafkaSource) Fetch(ctx context.Context) (fetchedMessage, error) {
+	start := time.Now()
 	m, err := k.reader.FetchMessage(ctx)
+	if k.metrics != nil {
+		k.metrics.ObserveIO("kafka_fetch", time.Since(start))
+	}
 	if err != nil {
+		// ctx 取消是正常停机信号，不计 IO 错误；其余才计。
+		if k.metrics != nil && ctx.Err() == nil {
+			k.metrics.MarkIOError("kafka_fetch")
+		}
 		return fetchedMessage{}, err
 	}
 	return fetchedMessage{
@@ -81,13 +91,14 @@ func (k *kafkaSource) Close() error {
 
 // kafkaDLQSink 用 kafka-go Writer 把毒丸消息写入 DLQ topic（实现 dlqSink）。
 type kafkaDLQSink struct {
-	writer *kafka.Writer
+	writer  *kafka.Writer
+	metrics *Metrics
 }
 
 // newKafkaDLQSink 建 DLQ producer（RequireAll，保证 DLQ 持久化；失败由 dlqHandler 重试/逃逸）。
 // AllowAutoTopicCreation=false：DLQ topic 须由部署侧预建——避免 topic 名拼错时静默建出错误 topic
 // 把毒丸写进黑洞（P2-3）。
-func newKafkaDLQSink(brokers []string, dlqTopic string) (*kafkaDLQSink, error) {
+func newKafkaDLQSink(brokers []string, dlqTopic string, metrics *Metrics) (*kafkaDLQSink, error) {
 	if len(brokers) == 0 || dlqTopic == "" {
 		return nil, fmt.Errorf("consumer: DLQ brokers and topic required")
 	}
@@ -99,11 +110,19 @@ func newKafkaDLQSink(brokers []string, dlqTopic string) (*kafkaDLQSink, error) {
 		Async:                  false,
 		AllowAutoTopicCreation: false,
 	}
-	return &kafkaDLQSink{writer: w}, nil
+	return &kafkaDLQSink{writer: w, metrics: metrics}, nil
 }
 
 func (s *kafkaDLQSink) WriteDLQ(ctx context.Context, key []byte, value []byte) error {
-	return s.writer.WriteMessages(ctx, kafka.Message{Key: key, Value: value})
+	start := time.Now()
+	err := s.writer.WriteMessages(ctx, kafka.Message{Key: key, Value: value})
+	if s.metrics != nil {
+		s.metrics.ObserveIO("dlq_send", time.Since(start))
+		if err != nil {
+			s.metrics.MarkIOError("dlq_send")
+		}
+	}
+	return err
 }
 
 func (s *kafkaDLQSink) Close() error {

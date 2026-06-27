@@ -157,7 +157,7 @@ func randomToken() (string, error) {
 //   - release: CAS-DEL at the end (token mismatch never deletes a successor's lock).
 //
 // run receives lockCtx, which is canceled on lock loss.
-func runLocked(ctx context.Context, lock RunLock, interval time.Duration, logf func(string, ...any), run func(context.Context) error) error {
+func runLocked(ctx context.Context, lock RunLock, interval time.Duration, logf func(string, ...any), metrics *Metrics, run func(context.Context) error) error {
 	token, err := randomToken()
 	if err != nil {
 		return err
@@ -180,7 +180,7 @@ func runLocked(ctx context.Context, lock RunLock, interval time.Duration, logf f
 	renewDone := make(chan struct{})
 	go func() {
 		defer close(renewDone)
-		renewUntilDone(lock, token, interval, cancel, done, logf)
+		renewUntilDone(lock, token, interval, cancel, done, logf, metrics)
 	}()
 
 	defer func() {
@@ -197,7 +197,7 @@ func runLocked(ctx context.Context, lock RunLock, interval time.Duration, logf f
 // renewUntilDone renews periodically until done closes (tick finished) or renew
 // fails. On failure (err or ownership lost) it cancels lockCtx to abort the
 // in-flight batch and stops renewing.
-func renewUntilDone(lock RunLock, token string, interval time.Duration, cancel context.CancelFunc, done <-chan struct{}, logf func(string, ...any)) {
+func renewUntilDone(lock RunLock, token string, interval time.Duration, cancel context.CancelFunc, done <-chan struct{}, logf func(string, ...any), metrics *Metrics) {
 	t := time.NewTicker(interval)
 	defer t.Stop()
 	for {
@@ -208,11 +208,17 @@ func renewUntilDone(lock RunLock, token string, interval time.Duration, cancel c
 			ok, err := lock.Renew(token)
 			if err != nil {
 				logf("producer: renew run-lock failed, abort in-flight tick: %v", err)
+				if metrics != nil {
+					metrics.MarkLockRenewFailure()
+				}
 				cancel()
 				return
 			}
 			if !ok {
 				logf("producer: run-lock ownership lost, abort in-flight tick")
+				if metrics != nil {
+					metrics.MarkLockRenewFailure()
+				}
 				cancel()
 				return
 			}

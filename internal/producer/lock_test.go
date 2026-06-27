@@ -62,7 +62,7 @@ func TestRunLocked_MutualExclusion(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if err := runLocked(context.Background(), lock, time.Hour, func(string, ...any) {}, work); err != nil {
+			if err := runLocked(context.Background(), lock, time.Hour, func(string, ...any) {}, nil, work); err != nil {
 				t.Errorf("runLocked: %v", err)
 			}
 		}()
@@ -88,7 +88,7 @@ func TestRunLocked_RenewFailureAborts(t *testing.T) {
 		<-ctx.Done() // must be cancelled by renew failure
 		return ctx.Err()
 	}
-	err := runLocked(context.Background(), lock, 10*time.Millisecond, func(string, ...any) {}, work)
+	err := runLocked(context.Background(), lock, 10*time.Millisecond, func(string, ...any) {}, nil, work)
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("expected context.Canceled after renew failure, got %v", err)
 	}
@@ -106,7 +106,7 @@ func (l *losingLock) Release(string) error         { return nil }
 func TestRunLocked_AcquireErrorReturns(t *testing.T) {
 	lock := &errLock{}
 	ran := false
-	err := runLocked(context.Background(), lock, time.Hour, func(string, ...any) {}, func(context.Context) error {
+	err := runLocked(context.Background(), lock, time.Hour, func(string, ...any) {}, nil, func(context.Context) error {
 		ran = true
 		return nil
 	})

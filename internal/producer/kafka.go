@@ -39,11 +39,20 @@ type KafkaProducer struct {
 	dlqWriter *kafka.Writer
 	topic     string
 	dlqTopic  string
+	// metrics is an optional observer; produce_errors_total is incremented on
+	// every WriteMessages failure (main + dlq).
+	metrics *Metrics
 }
 
 // NewKafkaProducer builds the Kafka writers. Only called when the producer is
 // enabled (idle path never connects to Kafka).
 func NewKafkaProducer(cfg Config) *KafkaProducer {
+	return NewKafkaProducerWithMetrics(cfg, nil)
+}
+
+// NewKafkaProducerWithMetrics builds the Kafka writers with an optional metrics
+// observer for produce-error counting.
+func NewKafkaProducerWithMetrics(cfg Config, metrics *Metrics) *KafkaProducer {
 	mk := func(topic string) *kafka.Writer {
 		return &kafka.Writer{
 			Addr:     kafka.TCP(cfg.Brokers...),
@@ -66,6 +75,7 @@ func NewKafkaProducer(cfg Config) *KafkaProducer {
 		dlqWriter: mk(cfg.DLQTopic),
 		topic:     cfg.Topic,
 		dlqTopic:  cfg.DLQTopic,
+		metrics:   metrics,
 	}
 }
 
@@ -73,7 +83,13 @@ func NewKafkaProducer(cfg Config) *KafkaProducer {
 // error so the caller leaves the cursor un-advanced and re-produces next tick
 // (deduplicated by message_id idempotency, C2).
 func (p *KafkaProducer) ProduceBatch(ctx context.Context, msgs []searchmsg.Message) error {
-	return produce(ctx, p.writer, p.topic, msgs)
+	if err := produce(ctx, p.writer, p.topic, msgs); err != nil {
+		if p.metrics != nil {
+			p.metrics.MarkProduceError()
+		}
+		return err
+	}
+	return nil
 }
 
 // ProduceDLQ produces a DLQ batch of forensic envelopes. A DLQ write failure also
@@ -97,6 +113,9 @@ func (p *KafkaProducer) ProduceDLQ(ctx context.Context, envelopes []DLQEnvelope)
 		kmsgs = append(kmsgs, kafka.Message{Key: []byte(envelopes[i].MessageID), Value: b})
 	}
 	if err := p.dlqWriter.WriteMessages(ctx, kmsgs...); err != nil {
+		if p.metrics != nil {
+			p.metrics.MarkProduceError()
+		}
 		return fmt.Errorf("producer: produce dlq batch to %s: %w", p.dlqTopic, err)
 	}
 	return nil

@@ -86,14 +86,18 @@ func (s *Scheduler) loop(ctx context.Context) {
 // tick fires one slow-cursor round. Errors are logged, not fatal (next tick
 // retries; cross-replica / lock-loss safety is RunIncremental's responsibility).
 func (s *Scheduler) tick(ctx context.Context) {
+	start := time.Now()
+	err := s.tickFn(ctx, s.tables)
 	if s.metrics != nil {
-		s.metrics.MarkTick()
-	}
-	if err := s.tickFn(ctx, s.tables); err != nil {
-		s.logf("producer: scheduled incremental failed: %v", err)
-		if s.metrics != nil {
-			s.metrics.MarkTickError()
+		s.metrics.ObserveTickDuration(time.Since(start))
+		if err != nil {
+			s.metrics.MarkTick("error")
+		} else {
+			s.metrics.MarkTick("ok")
 		}
+	}
+	if err != nil {
+		s.logf("producer: scheduled incremental failed: %v", err)
 	}
 }
 

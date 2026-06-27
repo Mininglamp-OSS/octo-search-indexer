@@ -102,7 +102,7 @@ func run(ctx context.Context) error {
 
 	etl := producer.NewETL(producer.ETLDeps{
 		Store:   store,
-		NewSink: func() producer.Sink { return producer.NewKafkaProducer(cfg) },
+		NewSink: func() producer.Sink { return producer.NewKafkaProducerWithMetrics(cfg, metrics) },
 		Lock:    lock,
 		Batch:   cfg.Batch,
 		Lag:     cfg.LagSeconds,

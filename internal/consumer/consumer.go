@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"time"
 
 	"github.com/Mininglamp-OSS/octo-lib/contract/searchmsg"
@@ -37,6 +38,7 @@ type Processor struct {
 	writer    esindex.Writer
 	dlq       *dlqHandler
 	alert     alerter
+	metrics   *Metrics
 	batchSize int
 	// transientBackoff 是整批含 transient 时、原地退避重试的间隔基（指数+抖动，offset 不前进）。
 	transientBackoff time.Duration
@@ -54,7 +56,7 @@ func defaultConfig() Config {
 }
 
 // NewProcessor 组装 Processor。
-func NewProcessor(src messageSource, writer esindex.Writer, dlq *dlqHandler, alert alerter, cfg Config) *Processor {
+func NewProcessor(src messageSource, writer esindex.Writer, dlq *dlqHandler, alert alerter, cfg Config, metrics *Metrics) *Processor {
 	if cfg.BatchSize <= 0 {
 		cfg.BatchSize = defaultConfig().BatchSize
 	}
@@ -66,6 +68,7 @@ func NewProcessor(src messageSource, writer esindex.Writer, dlq *dlqHandler, ale
 		writer:           writer,
 		dlq:              dlq,
 		alert:            alert,
+		metrics:          metrics,
 		batchSize:        cfg.BatchSize,
 		transientBackoff: cfg.TransientBackoff,
 		sleep:            sleepCtx,
@@ -202,6 +205,7 @@ func (p *Processor) resolvePass(ctx context.Context, batch []fetchedMessage, par
 			return changed, err
 		}
 		dispositions[i] = dispDLQResolved
+		p.markDisposition(dispDLQResolved)
 		changed = true
 	}
 
@@ -215,6 +219,7 @@ func (p *Processor) resolvePass(ctx context.Context, batch []fetchedMessage, par
 			return changed, err
 		}
 		dispositions[i] = dispDLQResolved
+		p.markDisposition(dispDLQResolved)
 		changed = true
 	}
 
@@ -231,8 +236,15 @@ func (p *Processor) resolvePass(ctx context.Context, batch []fetchedMessage, par
 		return changed, nil
 	}
 
+	bulkStart := time.Now()
 	bulkRes, bulkErr := p.writer.Bulk(ctx, toBulk)
+	if p.metrics != nil {
+		p.metrics.ObserveIO("es_bulk", time.Since(bulkStart))
+	}
 	if bulkErr != nil {
+		if p.metrics != nil {
+			p.metrics.MarkIOError("es_bulk")
+		}
 		p.alert.Alert("bulk_batch_error", bulkErr.Error())
 	}
 	for j, idx := range bulkIdx {
@@ -246,26 +258,48 @@ func (p *Processor) resolvePass(ctx context.Context, batch []fetchedMessage, par
 		switch {
 		case ok:
 			dispositions[idx] = dispOK
+			p.markDisposition(dispOK)
 			changed = true
 		case permanent:
 			if err := p.routePoison(ctx, batch[idx], res, reasonPermanent4xx); err != nil {
 				return changed, err
 			}
 			dispositions[idx] = dispDLQResolved
+			p.markDisposition(dispDLQResolved)
 			changed = true
 		default:
 			dispositions[idx] = dispTransient // 仍 transient，下轮原地重试
+			p.markDisposition(dispTransient)
 		}
 	}
 	return changed, nil
+}
+
+// markDisposition 把内部处置类别映射为 disposition_total{disp} 计数（ok/dlq/transient）。
+func (p *Processor) markDisposition(disp itemDisposition) {
+	if p.metrics == nil {
+		return
+	}
+	switch disp {
+	case dispOK:
+		p.metrics.MarkDisposition("ok")
+	case dispDLQResolved:
+		p.metrics.MarkDisposition("dlq")
+	default:
+		p.metrics.MarkDisposition("transient")
+	}
 }
 
 // routePoison 把一条毒丸送 DLQ。DLQ 终态成功 → nil；硬停逃逸 → 返回 fatal error。
 func (p *Processor) routePoison(ctx context.Context, m fetchedMessage, res esindex.BulkItemResult, reason dlqReason) error {
 	rec := buildDLQRecord(reason, m, res)
 	if err := p.dlq.Send(ctx, rec); err != nil {
+		// dlq_hard_stop_total 由 alerter 映射统一计数（"dlq_hard_stop" 事件），此处不重复 Inc。
 		p.alert.Alert("dlq_hard_stop", fmt.Sprintf("offset=%d: %v", m.Offset, err))
 		return fmt.Errorf("consumer: DLQ terminal escape hard-stop at offset %d: %w", m.Offset, err)
+	}
+	if p.metrics != nil {
+		p.metrics.MarkDLQ(reason.reasonString())
 	}
 	return nil
 }
@@ -273,9 +307,20 @@ func (p *Processor) routePoison(ctx context.Context, m fetchedMessage, res esind
 // commitPrefixes 按分区提交各自连续前缀末（多分区正确，kafka 高水位语义）。
 func (p *Processor) commitPrefixes(ctx context.Context, batch []fetchedMessage, dispositions []itemDisposition) error {
 	for _, point := range partitionCommitPoints(batch, dispositions) {
-		if err := p.src.Commit(ctx, point); err != nil {
+		commitStart := time.Now()
+		err := p.src.Commit(ctx, point)
+		if p.metrics != nil {
+			p.metrics.ObserveIO("kafka_commit", time.Since(commitStart))
+		}
+		if err != nil {
+			if p.metrics != nil {
+				p.metrics.MarkIOError("kafka_commit")
+			}
 			return fmt.Errorf("consumer: commit offset failed (partition=%d offset=%d): %w",
 				point.Partition, point.Offset, err)
+		}
+		if p.metrics != nil {
+			p.metrics.SetCommittedOffset(strconv.Itoa(point.Partition), point.Offset)
 		}
 	}
 	return nil
