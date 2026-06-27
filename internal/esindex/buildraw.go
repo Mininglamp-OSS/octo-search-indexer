@@ -90,10 +90,10 @@ func buildPayloadFromRaw(rawPayload json.RawMessage) (payload *Payload, rawForSt
 			p.Name = n
 		}
 		if w, ok := extractInt(raw, "width"); ok {
-			p.Width = w
+			p.Width = clampInt32(w)
 		}
 		if h, ok := extractInt(raw, "height"); ok {
-			p.Height = h
+			p.Height = clampInt32(h)
 		}
 		parsed.Image = p
 	case payloadTypeGIF:
@@ -117,10 +117,10 @@ func buildPayloadFromRaw(rawPayload json.RawMessage) (payload *Payload, rawForSt
 			p.Cover = c
 		}
 		if w, ok := extractInt(raw, "width"); ok {
-			p.Width = w
+			p.Width = clampInt32(w)
 		}
 		if h, ok := extractInt(raw, "height"); ok {
-			p.Height = h
+			p.Height = clampInt32(h)
 		}
 		if s, ok := extractInt(raw, "second"); ok {
 			p.Second = s
