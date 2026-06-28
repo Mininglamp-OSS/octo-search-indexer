@@ -89,6 +89,42 @@ func TestProject_Image(t *testing.T) {
 	}
 }
 
+// TestProject_ImageOverflowClamped type=2 image with width/height exceeding int32 max → clamped to 0 (see #31).
+func TestProject_ImageOverflowClamped(t *testing.T) {
+	rd := projectViaDoc(t, `{"type":2,"name":"x.png","url":"https://x/y.png","width":4293001688,"height":3997107456}`)
+	img := rd.Payload.Image
+	if img == nil {
+		t.Fatal("image payload must not be nil")
+	}
+	if img.Width != 0 {
+		t.Fatalf("image width should be clamped to 0 for int32 overflow, got %d", img.Width)
+	}
+	if img.Height != 0 {
+		t.Fatalf("image height should be clamped to 0 for int32 overflow, got %d", img.Height)
+	}
+	if img.URL != "https://x/y.png" {
+		t.Fatalf("image url must still be projected: %s", img.URL)
+	}
+}
+
+// TestProject_VideoOverflowClamped type=5 video with width/height exceeding int32 max → clamped to 0 (see #31).
+func TestProject_VideoOverflowClamped(t *testing.T) {
+	rd := projectViaDoc(t, `{"type":5,"url":"https://x/v.mp4","width":2424569856,"height":3997107456,"second":30}`)
+	v := rd.Payload.Video
+	if v == nil {
+		t.Fatal("video payload must not be nil")
+	}
+	if v.Width != 0 {
+		t.Fatalf("video width should be clamped to 0 for int32 overflow, got %d", v.Width)
+	}
+	if v.Height != 0 {
+		t.Fatalf("video height should be clamped to 0 for int32 overflow, got %d", v.Height)
+	}
+	if v.Second != 30 {
+		t.Fatalf("video second must still be projected: %d", v.Second)
+	}
+}
+
 // TestProject_GIF type=3 留底 gif.url。
 func TestProject_GIF(t *testing.T) {
 	rd := projectViaDoc(t, `{"type":3,"url":"https://x/a.gif"}`)
