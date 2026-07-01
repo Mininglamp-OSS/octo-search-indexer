@@ -21,6 +21,7 @@ var latencyBuckets = []float64{.005, .01, .025, .05, .1, .25, .5, 1, 2.5, 5}
 // Series (all prefixed searchetl_producer_):
 //   - produced_total{stream}          counter   messages produced by stream (main/dlq)
 //   - cursor_position{shard}          gauge     per-shard cursor watermark (message.id)
+//   - source_max_id{shard}           gauge     per-shard MySQL MAX(id) (lag = source_max_id - cursor_position)
 //   - ticks_total{result}            counter   slow-cursor ticks by result (ok/error)
 //   - tick_duration_seconds          histogram whole-tick latency
 //   - read_batch_duration_seconds    histogram single ReadStableBatchTx latency
@@ -32,6 +33,7 @@ type Metrics struct {
 
 	produced       *prometheus.CounterVec
 	cursor         *prometheus.GaugeVec
+	sourceMaxID    *prometheus.GaugeVec
 	ticks          *prometheus.CounterVec
 	tickDuration   prometheus.Histogram
 	readBatchDur   prometheus.Histogram
@@ -54,6 +56,11 @@ func NewMetrics() *Metrics {
 			Namespace: metricsNamespace,
 			Name:      "cursor_position",
 			Help:      "Per-shard cursor watermark (message.id).",
+		}, []string{"shard"}),
+		sourceMaxID: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: metricsNamespace,
+			Name:      "source_max_id",
+			Help:      "Per-shard MySQL MAX(id) (source watermark for lag).",
 		}, []string{"shard"}),
 		ticks: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: metricsNamespace,
@@ -89,7 +96,7 @@ func NewMetrics() *Metrics {
 		}),
 	}
 	reg.MustRegister(
-		m.produced, m.cursor, m.ticks, m.tickDuration, m.readBatchDur,
+		m.produced, m.cursor, m.sourceMaxID, m.ticks, m.tickDuration, m.readBatchDur,
 		m.dlq, m.produceErrors, m.lockRenewFails,
 	)
 	return m
@@ -111,6 +118,11 @@ func (m *Metrics) AddProduced(main, dlq int64) {
 // SetCursor records the latest cursor watermark for a shard.
 func (m *Metrics) SetCursor(table string, id int64) {
 	m.cursor.WithLabelValues(table).Set(float64(id))
+}
+
+// SetSourceMaxID records the latest source MAX(id) watermark for a shard.
+func (m *Metrics) SetSourceMaxID(table string, id int64) {
+	m.sourceMaxID.WithLabelValues(table).Set(float64(id))
 }
 
 // MarkTick records a tick outcome (result ∈ {ok, error}).

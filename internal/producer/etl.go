@@ -129,6 +129,15 @@ func (e *ETL) runTick(ctx context.Context, tables []string) error {
 				break
 			}
 		}
+		// source_max_id{shard}: best-effort lag watermark. Observability only —
+		// a query failure must never fail the tick, just log and continue.
+		if e.metrics != nil {
+			if maxID, merr := e.store.MaxID(ctx, table); merr != nil {
+				e.logf("producer: max id query failed (table=%s): %v", table, merr)
+			} else {
+				e.metrics.SetSourceMaxID(table, maxID)
+			}
+		}
 	}
 
 	if e.metrics != nil {

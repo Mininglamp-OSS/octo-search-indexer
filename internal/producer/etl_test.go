@@ -9,7 +9,19 @@ import (
 	"time"
 
 	"github.com/Mininglamp-OSS/octo-lib/contract/searchmsg"
+	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
 )
+
+// gaugeValue reads the current value of a labelled gauge for assertions.
+func gaugeValue(t *testing.T, g prometheus.Gauge) float64 {
+	t.Helper()
+	var m dto.Metric
+	if err := g.Write(&m); err != nil {
+		t.Fatalf("gauge write: %v", err)
+	}
+	return m.GetGauge().GetValue()
+}
 
 // fakeStore is an in-memory Store: one shard with rows + a cursor, plus a CAS
 // advance. Used to validate the chunk pipeline without a real MySQL.
@@ -20,6 +32,7 @@ type fakeStore struct {
 	cursor   map[string]int64
 	readErr  error
 	advErr   error
+	maxErr   error
 	advCalls int
 }
 
@@ -69,6 +82,21 @@ func (f *fakeStore) AdvanceCursor(_ context.Context, table string, expected, new
 	}
 	f.cursor[table] = newID
 	return true, nil
+}
+
+func (f *fakeStore) MaxID(_ context.Context, table string) (int64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.maxErr != nil {
+		return 0, f.maxErr
+	}
+	var max int64
+	for _, r := range f.rows[table] {
+		if r.ID > max {
+			max = r.ID
+		}
+	}
+	return max, nil
 }
 
 // fakeSink records produced batches.
@@ -265,7 +293,7 @@ func (b *blockingSinkT) ProduceBatch(context.Context, []searchmsg.Message) error
 	return nil
 }
 func (b *blockingSinkT) ProduceDLQ(context.Context, []DLQEnvelope) error { return nil }
-func (b *blockingSinkT) Close() error                                          { return nil }
+func (b *blockingSinkT) Close() error                                    { return nil }
 
 // TestPlanChunk_DLQRouting: bad-json row routed to dlq, cursor watermark counts it.
 func TestPlanChunk_DLQRouting(t *testing.T) {
@@ -299,5 +327,52 @@ func TestPlanChunk_DLQRouting(t *testing.T) {
 	}
 	if dl.ProducedAt != 0 {
 		t.Fatalf("planChunk must stay pure (no clock): ProducedAt should be 0, got %d", dl.ProducedAt)
+	}
+}
+
+// TestRunIncremental_SetsSourceMaxID: source_max_id gauge is set to MAX(id).
+func TestRunIncremental_SetsSourceMaxID(t *testing.T) {
+	now := int64(10_000)
+	store := newFakeStore(now)
+	store.rows["message"] = []*srcMessageRow{
+		textRow(1, "a", now-1000), textRow(2, "b", now-1000), textRow(3, "c", now-1000),
+	}
+	metrics := NewMetrics()
+	etl := NewETL(ETLDeps{
+		Store: store, NewSink: func() Sink { return &fakeSink{} },
+		Lock: &fakeLock{acquireOK: true, renewOK: true}, Batch: 100, Lag: 600,
+		RenewInterval: time.Hour, Metrics: metrics,
+	})
+	if err := etl.RunIncremental(context.Background(), []string{"message"}); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if got := gaugeValue(t, metrics.sourceMaxID.WithLabelValues("message")); got != 3 {
+		t.Fatalf("source_max_id must be 3, got %v", got)
+	}
+}
+
+// TestRunIncremental_MaxIDFailDoesNotFailTick: MaxID error is logged, the tick
+// still succeeds and the cursor advances.
+func TestRunIncremental_MaxIDFailDoesNotFailTick(t *testing.T) {
+	now := int64(10_000)
+	store := newFakeStore(now)
+	store.maxErr = errors.New("max id boom")
+	store.rows["message"] = []*srcMessageRow{
+		textRow(1, "a", now-1000), textRow(2, "b", now-1000), textRow(3, "c", now-1000),
+	}
+	metrics := NewMetrics()
+	etl := NewETL(ETLDeps{
+		Store: store, NewSink: func() Sink { return &fakeSink{} },
+		Lock: &fakeLock{acquireOK: true, renewOK: true}, Batch: 100, Lag: 600,
+		RenewInterval: time.Hour, Metrics: metrics,
+	})
+	if err := etl.RunIncremental(context.Background(), []string{"message"}); err != nil {
+		t.Fatalf("MaxID failure must not fail the tick, got %v", err)
+	}
+	if store.cursor["message"] != 3 {
+		t.Fatalf("cursor must still advance to 3, got %d", store.cursor["message"])
+	}
+	if got := gaugeValue(t, metrics.sourceMaxID.WithLabelValues("message")); got != 0 {
+		t.Fatalf("source_max_id must stay unset (0) on MaxID failure, got %v", got)
 	}
 }

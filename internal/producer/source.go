@@ -26,6 +26,9 @@ type Store interface {
 	// AdvanceCursor advances the watermark from expected to newID via an optimistic
 	// CAS (WHERE last_id=expected). Returns whether a row was actually updated.
 	AdvanceCursor(ctx context.Context, table string, expected, newID int64) (bool, error)
+	// MaxID returns COALESCE(MAX(id),0) of the shard table — the source watermark
+	// for lag (MAX(id) - cursor_position). Observability only.
+	MaxID(ctx context.Context, table string) (int64, error)
 }
 
 // MySQLStore implements Store over database/sql (keyset pagination, no OFFSET).
@@ -130,6 +133,19 @@ func (s *MySQLStore) AdvanceCursor(ctx context.Context, table string, expected, 
 		return false, err
 	}
 	return n == 1, nil
+}
+
+// MaxID returns COALESCE(MAX(id),0) of the shard table (source watermark for lag).
+func (s *MySQLStore) MaxID(ctx context.Context, table string) (int64, error) {
+	if !safeTableName(table) {
+		return 0, fmt.Errorf("producer: unsafe table name %q", table)
+	}
+	var maxID int64
+	q := fmt.Sprintf("SELECT COALESCE(MAX(id),0) FROM `%s`", table)
+	if err := s.db.QueryRowContext(ctx, q).Scan(&maxID); err != nil {
+		return 0, fmt.Errorf("producer: max id %s: %w", table, err)
+	}
+	return maxID, nil
 }
 
 // OpenMySQL opens the source DB with an explicit connection pool (no bare driver
