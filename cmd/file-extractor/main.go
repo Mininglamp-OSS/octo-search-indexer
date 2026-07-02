@@ -132,6 +132,13 @@ func loadConfig() (fileextract.ServiceConfig, bool) {
 		// 测试专用；httptest.NewServer 走 127.0.0.1 需 test cfg 直接设 true，无 env 通道防止
 		// 生产误开或运维在紧急情况下 hot-toggle 打开攻击面。
 		SSRFAllowLoopback: false,
+
+		// v1.13 P2-1 fix (yujiawei review) — DLQ 有界重试 + 本地 spill 逃逸。SpillDir 生产建议
+		// 挂 K8s emptyDir 或 PVC（示例 /var/lib/file-extractor/dlq-spill），未设时走硬停 pattern
+		// （DLQ 写耗尽 → errDLQHardStop → K8s 重启保 offset 不推进 + 告警 page 运维）。
+		DLQMaxRetries:   envInt("DLQ_MAX_RETRIES", 0),
+		DLQRetryBackoff: time.Duration(envInt("DLQ_RETRY_BACKOFF_MS", 0)) * time.Millisecond,
+		DLQSpillDir:     os.Getenv("DLQ_SPILL_DIR"),
 	}
 	enabledFlag, err := strconv.ParseBool(os.Getenv("FILE_EXTRACTOR_ENABLED"))
 	if err != nil {

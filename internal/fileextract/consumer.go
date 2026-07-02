@@ -30,6 +30,7 @@ import (
 type Processor struct {
 	source    messageSource
 	dlqSink   dlqSink
+	dlq       *dlqHandler // v1.13 P2-1：DLQ 投递有界重试 + spill 逃逸（yujiawei review fix）
 	metrics   *counters
 	extractor extractorService
 	cfg       ServiceConfig
@@ -60,9 +61,18 @@ func NewProcessor(src messageSource, dlq dlqSink, ext extractorService, cfg Serv
 	if cfg.TransientBackoffMax <= 0 {
 		cfg.TransientBackoffMax = defaultBackoffMax
 	}
+	// v1.13 P2-1：dlqHandler 有界重试 + spill 逃逸（yujiawei review fix）。缺 SpillDir 时
+	// DLQ 写耗尽 → errDLQHardStop → outcomeFatal → Run 停 worker + K8s 重启（保 offset 不推进）。
+	// 配 SpillDir 后转成落盘 + 告警 + offset 越过（绝不永久卡 partition）。
+	handler := newDLQHandler(dlq, newLogAlerter(log.Printf), dlqHandlerConfig{
+		MaxRetries:   cfg.DLQMaxRetries,
+		RetryBackoff: cfg.DLQRetryBackoff,
+		SpillDir:     cfg.DLQSpillDir,
+	})
 	return &Processor{
 		source:    src,
 		dlqSink:   dlq,
+		dlq:       handler,
 		metrics:   &counters{},
 		extractor: ext,
 		cfg:       cfg,
@@ -311,7 +321,10 @@ func (p *Processor) processOne(ctx context.Context, m fetchedMessage) error {
 // 的 sentinel。生产路径不会返 —— processBatch 状态机内部消化 transient 语义。仅供 test 断言。
 var errTransientNeedsRetry = errors.New("fileextract: transient error needs in-place retry")
 
-// writeDLQ 序列化 dlqRecord → 投 DLQ topic。key 用原消息 key（=messageId）保证分区一致性。
+// writeDLQ 构造 dlqRecord → 通过 dlqHandler 有界重试 + spill 逃逸投递到 DLQ topic。
+// 返回 nil 表示已终态处理（投递成功 or spill 落盘）—— caller 可放心越过 offset；返回 error 表示
+// 硬停（errDLQHardStop：未配 SpillDir 且 DLQ 写耗尽）—— caller 应走 outcomeFatal 让 Run 停 worker。
+// key 用原消息 key（=messageId）保证分区一致性 + spill 文件命名有意义。
 func (p *Processor) writeDLQ(ctx context.Context, m fetchedMessage, reason, messageID string, fp *filePayload, cause error) error {
 	value, truncated := truncateValueIfNeeded(m.Value)
 	rec := dlqRecord{
@@ -332,9 +345,5 @@ func (p *Processor) writeDLQ(ctx context.Context, m fetchedMessage, reason, mess
 	if cause != nil {
 		rec.Detail = cause.Error()
 	}
-	body, err := json.Marshal(rec)
-	if err != nil {
-		return fmt.Errorf("marshal dlq record: %w", err)
-	}
-	return p.dlqSink.WriteDLQ(ctx, m.Key, body)
+	return p.dlq.Send(ctx, rec)
 }

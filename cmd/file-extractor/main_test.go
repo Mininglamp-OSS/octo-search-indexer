@@ -155,6 +155,42 @@ func TestLoadConfig_V113ConfigOverride(t *testing.T) {
 	}
 }
 
+// TestLoadConfig_DLQEnvOverride v1.13 P2-1 (yujiawei review) — DLQ 有界重试/spill 三个 env 挂载。
+// SpillDir 默认空 → 硬停 pattern；生产设 emptyDir/PVC 路径转成 spill 逃逸。
+func TestLoadConfig_DLQEnvOverride(t *testing.T) {
+	resetEnv(t)
+	t.Setenv("FILE_EXTRACTOR_ENABLED", "true")
+	t.Setenv("KAFKA_BROKERS", "kafka:9092")
+	t.Setenv("ES_ADDRESSES", "http://os:9200")
+
+	// 默认 unset → cfg 都是 zero，由 dlqHandler 内部 default 兜底
+	cfg, _ := loadConfig()
+	if cfg.DLQMaxRetries != 0 {
+		t.Errorf("DLQMaxRetries default: got %d want 0 (handler kicks default 5)", cfg.DLQMaxRetries)
+	}
+	if cfg.DLQRetryBackoff != 0 {
+		t.Errorf("DLQRetryBackoff default: got %v want 0 (handler kicks default 200ms)", cfg.DLQRetryBackoff)
+	}
+	if cfg.DLQSpillDir != "" {
+		t.Errorf("DLQSpillDir default: got %q want empty (hard-stop pattern)", cfg.DLQSpillDir)
+	}
+
+	// 设 env → cfg 载入
+	t.Setenv("DLQ_MAX_RETRIES", "3")
+	t.Setenv("DLQ_RETRY_BACKOFF_MS", "150")
+	t.Setenv("DLQ_SPILL_DIR", "/var/lib/file-extractor/dlq-spill")
+	cfg2, _ := loadConfig()
+	if cfg2.DLQMaxRetries != 3 {
+		t.Errorf("DLQMaxRetries: got %d want 3", cfg2.DLQMaxRetries)
+	}
+	if cfg2.DLQRetryBackoff != 150*time.Millisecond {
+		t.Errorf("DLQRetryBackoff: got %v want 150ms", cfg2.DLQRetryBackoff)
+	}
+	if cfg2.DLQSpillDir != "/var/lib/file-extractor/dlq-spill" {
+		t.Errorf("DLQSpillDir: got %q", cfg2.DLQSpillDir)
+	}
+}
+
 // TestLoadConfig_ProdTopicOverride 覆盖 topic/DLQ topic 到 .prod 后缀（部署时环境变量注入）。
 func TestLoadConfig_ProdTopicOverride(t *testing.T) {
 	resetEnv(t)

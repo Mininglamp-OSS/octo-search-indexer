@@ -7,9 +7,6 @@
   },
   "mappings": {
     "dynamic": "strict",
-    "_source": {
-      "excludes": ["payload.file.content"]
-    },
     "properties": {
       "schemaVersion": { "type": "integer" },
       "messageId":     { "type": "long" },

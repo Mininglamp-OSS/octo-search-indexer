@@ -66,4 +66,15 @@ type ServiceConfig struct {
 	// 生产**必须 false**（默认）：loopback 是 SSRF 目标之一（内网服务）。test 场景
 	// httptest.NewServer 走 127.0.0.1 才需打开。
 	SSRFAllowLoopback bool
+
+	// v1.13 P2-1 fix (yujiawei review) — DLQ 投递有界重试 + 本地 spill 逃逸。
+	// 老代码 writeDLQ 直接调 dlqSink.WriteDLQ 失败即 outcomeFatal 全 worker 停 —— 与 consumer
+	// 侧成熟的「有界重试 → spill 落盘 → 越过 offset」pattern 不对称。补齐同 pattern。
+	// DLQMaxRetries：DLQ 投递自身 transient 失败的有界重试次数（默认 5）。
+	DLQMaxRetries int
+	// DLQRetryBackoff：DLQ 重试退避基（指数 + 满抖动，默认 200ms）。
+	DLQRetryBackoff time.Duration
+	// DLQSpillDir：DLQ 写耗尽时本地落地目录。为空 → 硬停返 errDLQHardStop（K8s 重启保 offset）；
+	// 非空 → 落盘 + 告警 + 越过 offset（绝不永久卡 partition，回灌工具从此读文件重投）。
+	DLQSpillDir string
 }

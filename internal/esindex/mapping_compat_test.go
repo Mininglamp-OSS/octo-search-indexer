@@ -194,3 +194,111 @@ func TestRequiredMappingFieldPaths_IncludesV112Fields(t *testing.T) {
 		}
 	}
 }
+
+// liveMappingBodyWithExcludes 包装 properties + _source.excludes（v1.13 Blocker #3 复发回归）。
+func liveMappingBodyWithExcludes(t *testing.T, propsJSON string, excludes []string) string {
+	t.Helper()
+	excJSON, err := json.Marshal(excludes)
+	if err != nil {
+		t.Fatalf("marshal excludes: %v", err)
+	}
+	return `{"octo-message":{"mappings":{"dynamic":"strict","_source":{"excludes":` + string(excJSON) + `},"properties":` + propsJSON + `}}}`
+}
+
+// TestMappingCompat_SourceExcludesContentFails 🔴 v1.13 Blocker #3 复发回归 (P2-2)：live mapping
+// `_source.excludes` 里含 payload.file.content → scripted_upsert preserve 语义失效
+// （script 从 ctx._source 读永远 null）→ AssertLiveMappingCompatible 必须 loud crash。
+func TestMappingCompat_SourceExcludesContentFails(t *testing.T) {
+	var embedded struct {
+		Mappings struct {
+			Properties json.RawMessage `json:"properties"`
+		} `json:"mappings"`
+	}
+	if err := json.Unmarshal(IndexMappingJSON(), &embedded); err != nil {
+		t.Fatalf("parse embedded mapping: %v", err)
+	}
+	rt := &mappingTransport{body: liveMappingBodyWithExcludes(t, string(embedded.Mappings.Properties), []string{"payload.file.content"})}
+	w := mappingWriter(t, rt)
+	err := w.AssertLiveMappingCompatible(context.Background())
+	if err == nil {
+		t.Fatal("expected loud crash for _source.excludes containing payload.file.content, got nil")
+	}
+	if !strings.Contains(err.Error(), "_source.excludes contains") {
+		t.Errorf("error must mention _source.excludes pollution, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "payload.file.content") {
+		t.Errorf("error must name the offending path, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "Blocker #3 revive") {
+		t.Errorf("error must reference Blocker #3 revive for operator context, got %v", err)
+	}
+}
+
+// TestMappingCompat_SourceExcludesContentMetaFails 同上但针对 contentMeta（forbiddenSourceExcludes
+// 覆盖 preservedFilePaths 全集，防漂移）。
+func TestMappingCompat_SourceExcludesContentMetaFails(t *testing.T) {
+	var embedded struct {
+		Mappings struct {
+			Properties json.RawMessage `json:"properties"`
+		} `json:"mappings"`
+	}
+	if err := json.Unmarshal(IndexMappingJSON(), &embedded); err != nil {
+		t.Fatalf("parse embedded mapping: %v", err)
+	}
+	rt := &mappingTransport{body: liveMappingBodyWithExcludes(t, string(embedded.Mappings.Properties), []string{"payload.file.contentMeta"})}
+	w := mappingWriter(t, rt)
+	err := w.AssertLiveMappingCompatible(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "payload.file.contentMeta") {
+		t.Fatalf("expected loud crash for excludes containing contentMeta, got %v", err)
+	}
+}
+
+// TestMappingCompat_SourceExcludesUnrelatedPasses excludes 里含**其他**未在 forbiddenSourceExcludes
+// 里的字段（未来若加过滤字段）不阻止启动。
+func TestMappingCompat_SourceExcludesUnrelatedPasses(t *testing.T) {
+	var embedded struct {
+		Mappings struct {
+			Properties json.RawMessage `json:"properties"`
+		} `json:"mappings"`
+	}
+	if err := json.Unmarshal(IndexMappingJSON(), &embedded); err != nil {
+		t.Fatalf("parse embedded mapping: %v", err)
+	}
+	rt := &mappingTransport{body: liveMappingBodyWithExcludes(t, string(embedded.Mappings.Properties), []string{"someOtherField"})}
+	w := mappingWriter(t, rt)
+	if err := w.AssertLiveMappingCompatible(context.Background()); err != nil {
+		t.Fatalf("unrelated excludes must not block, got %v", err)
+	}
+}
+
+// TestMappingCompat_ForbiddenExcludesCoversPreservedPaths **契约锁死**：forbiddenSourceExcludes
+// 必须覆盖 preservedFilePaths 全集。future 加 preserve 字段时不更新 forbidden 列表 → CI 挂。
+func TestMappingCompat_ForbiddenExcludesCoversPreservedPaths(t *testing.T) {
+	forbidden := make(map[string]bool, len(forbiddenSourceExcludes))
+	for _, p := range forbiddenSourceExcludes {
+		forbidden[p] = true
+	}
+	for _, p := range preservedFilePaths {
+		if !forbidden[p] {
+			t.Errorf("preservedFilePaths %q must also be in forbiddenSourceExcludes (else scripted_upsert preserve silently fails)", p)
+		}
+	}
+}
+
+// TestEmbeddedMapping_NoSourceExcludes 内嵌 mapping 本身**不能**再声明 `_source.excludes`
+// （Blocker #3 复发 fix：已彻底移除该配置；防未来某人无意加回）。
+func TestEmbeddedMapping_NoSourceExcludes(t *testing.T) {
+	var top struct {
+		Mappings struct {
+			Source *struct {
+				Excludes []string `json:"excludes"`
+			} `json:"_source,omitempty"`
+		} `json:"mappings"`
+	}
+	if err := json.Unmarshal(IndexMappingJSON(), &top); err != nil {
+		t.Fatalf("parse embedded mapping: %v", err)
+	}
+	if top.Mappings.Source != nil && len(top.Mappings.Source.Excludes) > 0 {
+		t.Fatalf("embedded mapping must NOT declare _source.excludes (Blocker #3 revive gate); got %v", top.Mappings.Source.Excludes)
+	}
+}
