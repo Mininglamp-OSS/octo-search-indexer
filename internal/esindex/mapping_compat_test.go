@@ -115,3 +115,82 @@ func TestMappingCompat_PayloadRawMustBeDisabled(t *testing.T) {
 		t.Fatal("payloadRaw declared as an enabled object must FAIL (must be enabled:false BLOB)")
 	}
 }
+
+// TestMappingCompat_MissingFileContentFails v1.12：live mapping 缺 payload.file.content →
+// 断言失败（保证 file-extractor 写入前 live mapping 已升级）。
+func TestMappingCompat_MissingFileContentFails(t *testing.T) {
+	// 完整 v1.11 mapping（含 payloadRaw + mergeForward + richText + virtual/subSeq）+
+	// payload.file 只声明 v1.11 之前 5 字段，**缺** content + contentMeta。
+	props := `{
+		"messageId":{"type":"long"},
+		"parentMessageId":{"type":"long"},
+		"parentPayloadType":{"type":"integer"},
+		"virtual":{"type":"boolean"},
+		"subSeq":{"type":"integer"},
+		"payload":{"type":"object","properties":{
+			"type":{"type":"integer"},
+			"file":{"type":"object","properties":{
+				"url":{"type":"keyword"},"name":{"type":"text"},"caption":{"type":"text"},
+				"size":{"type":"long"},"extension":{"type":"keyword"}}},
+			"mergeForward":{"type":"object","properties":{"msgs":{"type":"object","properties":{
+				"from":{"type":"keyword"},"timestamp":{"type":"date","format":"epoch_second"}}}}},
+			"richText":{"type":"object","properties":{"searchText":{"type":"text"}}}
+		}},
+		"payloadRaw":{"type":"object","enabled":false}
+	}`
+	rt := &mappingTransport{body: liveMappingBody(props)}
+	w := mappingWriter(t, rt)
+	err := w.AssertLiveMappingCompatible(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "payload.file.content") {
+		t.Fatalf("missing payload.file.content must fail naming the path, got %v", err)
+	}
+}
+
+// TestMappingCompat_MissingFileContentMetaFails v1.12：live mapping 有 content 但缺 contentMeta.extractedAt
+// → 断言失败（保证 contentMeta object 已声明 properties，file-extractor 才能写 extractedAt/extractor/etc.）。
+func TestMappingCompat_MissingFileContentMetaFails(t *testing.T) {
+	props := `{
+		"messageId":{"type":"long"},
+		"parentMessageId":{"type":"long"},
+		"parentPayloadType":{"type":"integer"},
+		"virtual":{"type":"boolean"},
+		"subSeq":{"type":"integer"},
+		"payload":{"type":"object","properties":{
+			"type":{"type":"integer"},
+			"file":{"type":"object","properties":{
+				"url":{"type":"keyword"},"name":{"type":"text"},"caption":{"type":"text"},
+				"size":{"type":"long"},"extension":{"type":"keyword"},
+				"content":{"type":"text"}}},
+			"mergeForward":{"type":"object","properties":{"msgs":{"type":"object","properties":{
+				"from":{"type":"keyword"},"timestamp":{"type":"date","format":"epoch_second"}}}}},
+			"richText":{"type":"object","properties":{"searchText":{"type":"text"}}}
+		}},
+		"payloadRaw":{"type":"object","enabled":false}
+	}`
+	rt := &mappingTransport{body: liveMappingBody(props)}
+	w := mappingWriter(t, rt)
+	err := w.AssertLiveMappingCompatible(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "payload.file.contentMeta.extractedAt") {
+		t.Fatalf("missing payload.file.contentMeta.extractedAt must fail naming the path, got %v", err)
+	}
+}
+
+// TestRequiredMappingFieldPaths_IncludesV112Fields v1.12：明确覆盖 requiredMappingFieldPaths
+// 常量包含新加两条路径（配 IDX-2 加字段动作 + IDX-4 file-extractor 上线前置校验）。
+func TestRequiredMappingFieldPaths_IncludesV112Fields(t *testing.T) {
+	want := map[string]bool{
+		"payload.file.content":                true,
+		"payload.file.contentMeta.extractedAt": true,
+	}
+	found := map[string]bool{}
+	for _, p := range requiredMappingFieldPaths {
+		if want[p] {
+			found[p] = true
+		}
+	}
+	for p := range want {
+		if !found[p] {
+			t.Errorf("requiredMappingFieldPaths missing v1.12 path %q", p)
+		}
+	}
+}

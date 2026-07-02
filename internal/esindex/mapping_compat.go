@@ -36,6 +36,13 @@ var requiredMappingFieldPaths = []string{
 	"virtual",
 	// v1.11：subSeq 排序第三键 tiebreaker（search_after 不丢同 tuple 兄弟）。
 	"subSeq",
+	// v1.12：文件正文全文检索（file content indexing）。
+	// - payload.file.content 是 file-extractor 独立服务通过 OS _update partial 写入的字段。
+	// - payload.file.contentMeta.extractedAt 采样 contentMeta object 一个子字段代表整个对象
+	//   （flatten 只到 leaf field，逐 leaf 断言过重；断言存在 extractedAt 即证 contentMeta object
+	//   已声明 properties）。
+	"payload.file.content",
+	"payload.file.contentMeta.extractedAt",
 }
 
 // requiredDisabledObjectPaths 是必须以 enabled:false object 形态存在的留底字段（payloadRaw）。

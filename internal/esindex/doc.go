@@ -122,12 +122,34 @@ type VideoPayload struct {
 }
 
 // FilePayload 镜像 reader Doc.Payload.File（payload.file.{caption,name,extension} 可搜 + url/size）。
+//
+// v1.12：新增 Content + ContentMeta 两字段，配套 cmd/file-extractor 独立服务抽取的文件正文写入
+// （path: internal/fileextract → OS partial _update 只覆盖 payload.file.content + contentMeta，
+// 不动其他字段）。Content 走 mapping IK 分词器 + `_source.excludes` 排除 —— 搜命中走倒排，
+// _source 不膨胀（详见 internal/esindex/mapping/README.md v1.12）。
 type FilePayload struct {
-	URL       string `json:"url,omitempty"`
-	Name      string `json:"name,omitempty"`
-	Caption   string `json:"caption,omitempty"`
-	Size      int64  `json:"size,omitempty"`
-	Extension string `json:"extension,omitempty"`
+	URL         string           `json:"url,omitempty"`
+	Name        string           `json:"name,omitempty"`
+	Caption     string           `json:"caption,omitempty"`
+	Size        int64            `json:"size,omitempty"`
+	Extension   string           `json:"extension,omitempty"`
+	Content     string           `json:"content,omitempty"`     // v1.12
+	ContentMeta *FileContentMeta `json:"contentMeta,omitempty"` // v1.12
+}
+
+// FileContentMeta 是 file-extractor 抽取过程元信息（v1.12）。指针类型 + omitempty 保证未抽取
+// 的 file doc 该子对象缺席，与 mapping "contentMeta" object 默认无子字段兼容（IDX-2）。
+//
+// 字段语义：
+//   - ExtractedAt: 抽取时刻（epoch second），对应 mapping date+epoch_second
+//   - Extractor:   抽取器标识字符串（例 "tika/3.3.0"），mapping keyword
+//   - Truncated:   Content 是否被截到 file-extractor 配置的 MaxContentBytes（256KB 默认）
+//   - ExtractMs:   Tika 抽取耗时（毫秒），mapping long
+type FileContentMeta struct {
+	ExtractedAt int64  `json:"extractedAt,omitempty"`
+	Extractor   string `json:"extractor,omitempty"`
+	Truncated   bool   `json:"truncated,omitempty"`
+	ExtractMs   int64  `json:"extractMs,omitempty"`
 }
 
 // MergeForwardPayload 镜像 reader Doc.Payload.MergeForward（合并转发，type=11）。

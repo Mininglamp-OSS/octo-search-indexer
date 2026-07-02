@@ -1,10 +1,39 @@
-# octo-message index mapping (v1.11 — reader-aligned)
+# octo-message index mapping (v1.12 — file content indexing)
 
 `octo-message.json` is the **canonical index mapping + analyzer** the `es-indexer`
 writes against, embedded into the binary (`//go:embed`). The index must be
 **pre-created manually** with this mapping (plus ISM/lifecycle policy, shards/replicas
 and aliases) — `esindex.EnsureIndex` only **verifies the index exists** at startup and
 **refuses to start** if it is missing (auto-create intentionally disabled, see issue #29).
+
+## v1.12 文件正文全文检索（file content indexing）
+
+v1.12 在 `payload.file` 下新增两个字段，配套 `cmd/file-extractor` 独立服务抽取的文件正文写入：
+
+- `payload.file.content` (text, IK 分词) — Tika 抽出的文件正文纯文本。用 IK 双分析器
+  保持与 `payload.text.content` 同口径（index-time `ik_max_word` / query-time `ik_smart`）。
+  `mappings._source.excludes` 排除该字段，节省 _source 体积；搜索仍可命中并 highlight
+  （走倒排不走 _source）。
+- `payload.file.contentMeta.{extractedAt, extractor, truncated, extractMs}` (object) —
+  抽取元信息，便于运维观察抽取延迟 / 覆盖率 / 截断率。子字段类型：
+  - `extractedAt` — 抽取时刻 (epoch second, date)
+  - `extractor`   — 抽取器标识 (keyword, 如 "tika/3.3.0")
+  - `truncated`   — content 是否被截到 MaxContentBytes (boolean)
+  - `extractMs`   — Tika 抽取耗时 (long, 毫秒)
+
+写入契约：由独立 `cmd/file-extractor` 服务通过 OS `_update` partial update 只更新
+`payload.file.content` + `payload.file.contentMeta`，不动主 doc 其他字段（父 doc 由
+`cmd/es-indexer` 主流程写入）。file-extractor 消费同一 Kafka topic 但独立 consumer group
+`file-extractor`（不抢 es-indexer 位点）。
+
+> `payload.file.content` + `payload.file.contentMeta.extractedAt` 已纳入
+> `mapping_compat.go` 启动断言集（fail-closed），live mapping 不符直接拒启动。
+
+**⚠️ 不可逆警告**：`PUT _mapping` 添加 `payload.file.content` + `contentMeta` 后**不可逆**
+——OS 3.x mapping 字段只能通过 reindex + 切换 alias 才能移除。合并前 sig-off 意味着接受
+该单向决策。详见 `docs/file-content-indexing-feasibility.md` v2 §7 / §5 回滚方案。
+
+详见 `docs/file-content-indexing-feasibility.md`（v2 §7）+ `docs/file-content-indexing-implementation.md`（v2）+ `docs/file-extractor-tool-comparison.md`（Tika 选型论证）。
 
 ## v1.11 subSeq 排序 tiebreaker（配套 B2 虚拟子文档）
 

@@ -7,6 +7,9 @@
   },
   "mappings": {
     "dynamic": "strict",
+    "_source": {
+      "excludes": ["payload.file.content"]
+    },
     "properties": {
       "schemaVersion": { "type": "integer" },
       "messageId":     { "type": "long" },
@@ -79,7 +82,17 @@
               "name":      { "type": "text", "analyzer": "ik_max_word", "search_analyzer": "ik_smart" },
               "caption":   { "type": "text", "analyzer": "ik_max_word", "search_analyzer": "ik_smart" },
               "size":      { "type": "long" },
-              "extension": { "type": "keyword", "ignore_above": 32 }
+              "extension": { "type": "keyword", "ignore_above": 32 },
+              "content":   { "type": "text", "analyzer": "ik_max_word", "search_analyzer": "ik_smart" },
+              "contentMeta": {
+                "type": "object",
+                "properties": {
+                  "extractedAt": { "type": "date", "format": "epoch_second" },
+                  "extractor":   { "type": "keyword", "ignore_above": 32 },
+                  "truncated":   { "type": "boolean" },
+                  "extractMs":   { "type": "long" }
+                }
+              }
             }
           },
           "mergeForward": {
