@@ -148,11 +148,16 @@ type FilePayload struct {
 //
 // v1.13 P2-5：Truncated 从 bool 改成 *bool，避免 omitempty + zero-value 使 truncated=true→false
 // 的重抽取无法把字段从 stale true 清除（partial _update 语义下 field 缺失 = OS 保留旧值）。
+// Round-3 Blocker B (yujiawei P1 / Jerry-Xin #2)：Status + Reason tombstone 字段，permanent-fail
+// 时 file-extractor 写入 Status="unextractable" + Reason=<dlq_reason>，配合 backfill scroll
+// query `must_not term status=unextractable` 避免 rerun 重复 DLQ。成功抽取时不写这两个字段。
 type FileContentMeta struct {
-	ExtractedAt int64  `json:"extractedAt,omitempty"`
-	Extractor   string `json:"extractor,omitempty"`
-	Truncated   *bool  `json:"truncated,omitempty"`
-	ExtractMs   int64  `json:"extractMs,omitempty"`
+	ExtractedAt int64   `json:"extractedAt,omitempty"`
+	Extractor   string  `json:"extractor,omitempty"`
+	Truncated   *bool   `json:"truncated,omitempty"`
+	ExtractMs   int64   `json:"extractMs,omitempty"`
+	Status      *string `json:"status,omitempty"` // Round-3 Blocker B tombstone
+	Reason      *string `json:"reason,omitempty"` // Round-3 Blocker B tombstone reason
 }
 
 // MergeForwardPayload 镜像 reader Doc.Payload.MergeForward（合并转发，type=11）。

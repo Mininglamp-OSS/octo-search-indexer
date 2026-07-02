@@ -302,3 +302,68 @@ func TestEmbeddedMapping_NoSourceExcludes(t *testing.T) {
 		t.Fatalf("embedded mapping must NOT declare _source.excludes (Blocker #3 revive gate); got %v", top.Mappings.Source.Excludes)
 	}
 }
+
+// TestMappingCompat_MissingTombstoneStatusFails 🔴 Round-3 Blocker B (yujiawei P1 / Jerry-Xin #2)：
+// live mapping 缺 payload.file.contentMeta.status → tombstone 写入会因 dynamic:strict 4xx →
+// permanent-fail 文件无 tombstone → backfill rerun 重复 DLQ。启动期 loud crash 拦下部署顺序错。
+func TestMappingCompat_MissingTombstoneStatusFails(t *testing.T) {
+	// 含所有必需字段 **except** contentMeta.status
+	props := `{
+		"messageId":{"type":"long"},
+		"channelId":{"type":"keyword"},
+		"timestamp":{"type":"date","format":"epoch_second"},
+		"parentMessageId":{"type":"long"},
+		"parentPayloadType":{"type":"integer"},
+		"virtual":{"type":"boolean"},
+		"subSeq":{"type":"integer"},
+		"payload":{"properties":{
+			"mergeForward":{"properties":{"msgs":{"properties":{"from":{"type":"keyword"},"timestamp":{"type":"date"}}}}},
+			"richText":{"properties":{"searchText":{"type":"text"}}},
+			"file":{"properties":{
+				"content":{"type":"text"},
+				"contentMeta":{"properties":{
+					"extractedAt":{"type":"date"},
+					"reason":{"type":"keyword"}
+				}}
+			}}
+		}},
+		"payloadRaw":{"enabled":false,"type":"object"}
+	}`
+	rt := &mappingTransport{body: liveMappingBody(props)}
+	w := mappingWriter(t, rt)
+	err := w.AssertLiveMappingCompatible(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "payload.file.contentMeta.status") {
+		t.Fatalf("expected loud crash naming missing contentMeta.status field, got %v", err)
+	}
+}
+
+// TestMappingCompat_MissingTombstoneReasonFails 同上但缺 contentMeta.reason。
+func TestMappingCompat_MissingTombstoneReasonFails(t *testing.T) {
+	props := `{
+		"messageId":{"type":"long"},
+		"channelId":{"type":"keyword"},
+		"timestamp":{"type":"date","format":"epoch_second"},
+		"parentMessageId":{"type":"long"},
+		"parentPayloadType":{"type":"integer"},
+		"virtual":{"type":"boolean"},
+		"subSeq":{"type":"integer"},
+		"payload":{"properties":{
+			"mergeForward":{"properties":{"msgs":{"properties":{"from":{"type":"keyword"},"timestamp":{"type":"date"}}}}},
+			"richText":{"properties":{"searchText":{"type":"text"}}},
+			"file":{"properties":{
+				"content":{"type":"text"},
+				"contentMeta":{"properties":{
+					"extractedAt":{"type":"date"},
+					"status":{"type":"keyword"}
+				}}
+			}}
+		}},
+		"payloadRaw":{"enabled":false,"type":"object"}
+	}`
+	rt := &mappingTransport{body: liveMappingBody(props)}
+	w := mappingWriter(t, rt)
+	err := w.AssertLiveMappingCompatible(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "payload.file.contentMeta.reason") {
+		t.Fatalf("expected loud crash naming missing contentMeta.reason field, got %v", err)
+	}
+}

@@ -10,8 +10,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 )
@@ -67,9 +69,15 @@ func TestExtractor_WhitespaceOnlyIsEmptyExtract(t *testing.T) {
 				_, _ = w.Write([]byte(c.out)) //nolint:errcheck // test handler write; not the SUT
 			}))
 			defer tika.Close()
-			osHit := false
+			// Round-3 Blocker B: empty_extract 现在会写 tombstone (contentMeta.status=unextractable)。
+			// 断言收到的 OS 写入是 tombstone 而**非** content（真无 content 语义保持）。
+			var osBody string
 			os := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				osHit = true
+				b, rerr := io.ReadAll(r.Body)
+				if rerr != nil {
+					t.Errorf("read os body: %v", rerr)
+				}
+				osBody = string(b)
 				_, _ = w.Write([]byte(`{"result":"updated"}`)) //nolint:errcheck // test handler write; not the SUT
 			}))
 			defer os.Close()
@@ -99,8 +107,19 @@ func TestExtractor_WhitespaceOnlyIsEmptyExtract(t *testing.T) {
 			if reason != ReasonEmptyExtract {
 				t.Errorf("reason=%q want empty_extract (whitespace should DLQ, cause=%v)", reason, cause)
 			}
-			if osHit {
-				t.Errorf("OS must NOT be written when content is empty/whitespace")
+			// Round-3 Blocker B: OS 现在会被写 tombstone (contentMeta.status=unextractable) 而**非** content。
+			// 断言 (1) OS 确实收到了写请求 (2) 请求 body 不含 content 字段 (3) 含 empty_extract tombstone。
+			if osBody == "" {
+				t.Error("OS must receive tombstone write for empty_extract (Blocker B)")
+			}
+			if strings.Contains(osBody, `"content":`) {
+				t.Errorf("tombstone must NOT write content field (preserve true no-content semantics), got: %s", osBody)
+			}
+			if !strings.Contains(osBody, `"status":"unextractable"`) {
+				t.Errorf("empty_extract tombstone must carry status=unextractable, got: %s", osBody)
+			}
+			if !strings.Contains(osBody, `"reason":"empty_extract"`) {
+				t.Errorf("tombstone must carry dlqReason=empty_extract, got: %s", osBody)
 			}
 		})
 	}

@@ -37,6 +37,12 @@ type sourceDoc struct {
 	Size      int64
 }
 
+// tombstoneStatusValue 是 backfill scroll query 用来排除 permanent-fail tombstone doc 的
+// contentMeta.status 值。**必须**与 internal/fileextract/oswriter.go tombstoneStatus 严格
+// 一致（Round-3 Blocker B fix）。跨包不 import 避免 filebackfill → fileextract 依赖膨胀，
+// 靠 TestTombstoneStatusValue_MatchesFileextract 契约 test 锁死同步。
+const tombstoneStatusValue = "unextractable"
+
 // osScrollSource 用 OS scroll API 遍历待回填 doc。
 type osScrollSource struct {
 	client     *opensearchapi.Client
@@ -92,18 +98,7 @@ func (s *osScrollSource) Next(ctx context.Context) ([]sourceDoc, error) {
 }
 
 func (s *osScrollSource) firstBatch(ctx context.Context) ([]sourceDoc, error) {
-	// 用结构体 + json.Marshal 构造 body，避免字符串拼接（对齐 esindex 里 request body 构造 pattern）。
-	query := map[string]any{
-		"size": s.size,
-		"query": map[string]any{
-			"bool": map[string]any{
-				"filter":   []map[string]any{{"term": map[string]any{"payload.type": 8}}},
-				"must_not": []map[string]any{{"exists": map[string]any{"field": "payload.file.content"}}},
-			},
-		},
-		"_source": []string{"messageId", "payload.file"},
-	}
-	body, err := json.Marshal(query)
+	body, err := json.Marshal(buildFirstBatchQuery(s.size))
 	if err != nil {
 		return nil, fmt.Errorf("filebackfill: marshal scroll query: %w", err)
 	}
@@ -120,6 +115,30 @@ func (s *osScrollSource) firstBatch(ctx context.Context) ([]sourceDoc, error) {
 		s.scrollID = *resp.ScrollID
 	}
 	return s.parseHits(resp.Hits.Hits), nil
+}
+
+// buildFirstBatchQuery 构造 backfill scroll 首批查询 DSL（抽出便于单测）。
+//
+// Round-3 Blocker B (yujiawei P1 / Jerry-Xin #2)：must_not 加 term 过滤
+// `payload.file.contentMeta.status = tombstoneStatusValue`，排除已被 file-extractor
+// 标记为 permanent-fail 的 tombstone doc。防 backfill Job rerun 无限重复 DLQ 已知永久
+// 失败文件（之前 must_not 只查 content 缺失，permanent-fail 文件永远匹配 → 每次 rerun
+// 都重复 DLQ → DLQ 无界增长）。tombstone 常量与 fileextract/oswriter.go tombstoneStatus
+// 严格对齐（有 test 契约锁）。用结构体 + json.Marshal 构造，避免字符串拼接。
+func buildFirstBatchQuery(size int) map[string]any {
+	return map[string]any{
+		"size": size,
+		"query": map[string]any{
+			"bool": map[string]any{
+				"filter": []map[string]any{{"term": map[string]any{"payload.type": 8}}},
+				"must_not": []map[string]any{
+					{"exists": map[string]any{"field": "payload.file.content"}},
+					{"term": map[string]any{"payload.file.contentMeta.status": tombstoneStatusValue}},
+				},
+			},
+		},
+		"_source": []string{"messageId", "payload.file"},
+	}
 }
 
 // continueScroll 用 scroll_id 请求下一批。走裸 HTTP：

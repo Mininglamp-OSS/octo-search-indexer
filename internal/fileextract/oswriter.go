@@ -17,6 +17,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"time"
 
 	"github.com/Mininglamp-OSS/octo-search-indexer/internal/esindex"
 	"github.com/opensearch-project/opensearch-go/v3"
@@ -93,6 +94,58 @@ func (w *osWriter) UpdateContent(ctx context.Context, messageID string, content 
 	}
 	if resp == nil {
 		return errors.New("fileextract: nil update response")
+	}
+	return nil
+}
+
+// tombstoneStatus 是 permanent-fail 文件在 contentMeta.status 里写入的常量，与 backfill
+// source.go scroll query `must_not term contentMeta.status=<value>` 严格对齐。改此值必须
+// 同步改 source.go（有 test 契约锁）。
+const tombstoneStatus = "unextractable"
+
+// WriteTombstone 是 Round-3 Blocker B (yujiawei P1 / Jerry-Xin #2) fix：对 permanent-fail 文件
+// 写 tombstone marker 到 contentMeta，让 backfill scroll query 通过 must_not term 过滤，避免
+// rerun 无限重复 DLQ 已知永久失败文件。
+//
+// 语义：partial _update 只写 contentMeta.{status,reason,extractedAt}，**不写 content 字段**
+// —— 保留 "真无 content" 语义（reader 搜索时不会命中，与不写 tombstone 时的行为一致）。
+// doc_as_upsert=false → 主 doc 未落时返 errDocNotYet（不 upsert 造孤儿）；上层收到 errDocNotYet
+// 视为可容忍（tombstone 只是补丁不阻塞主 DLQ 路径，backfill 兜底重跑时若主 doc 已落再补写）。
+//
+// 错误分类同 UpdateContent（复用 classifyOSErr）。retry_on_conflict=3 缓解与 es-indexer 并发。
+func (w *osWriter) WriteTombstone(ctx context.Context, messageID string, reason string) error {
+	status := tombstoneStatus
+	body := map[string]any{
+		"doc": map[string]any{
+			"payload": map[string]any{
+				"file": map[string]any{
+					"contentMeta": esindex.FileContentMeta{
+						ExtractedAt: time.Now().Unix(),
+						Status:      &status,
+						Reason:      &reason,
+					},
+				},
+			},
+		},
+		"doc_as_upsert": false,
+	}
+	buf, err := json.Marshal(body)
+	if err != nil {
+		return fmt.Errorf("marshal tombstone body: %w", err)
+	}
+	retry := 3
+	req := opensearchapi.UpdateReq{
+		Index:      w.index,
+		DocumentID: messageID,
+		Body:       bytes.NewReader(buf),
+		Params:     opensearchapi.UpdateParams{RetryOnConflict: &retry},
+	}
+	resp, err := w.client.Update(ctx, req)
+	if err != nil {
+		return classifyOSErr(resp, err)
+	}
+	if resp == nil {
+		return errors.New("fileextract: nil tombstone response")
 	}
 	return nil
 }

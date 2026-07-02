@@ -10,6 +10,7 @@ package fileextract
 import (
 	"context"
 	"errors"
+	"log"
 	"path/filepath"
 	"strings"
 	"time"
@@ -54,7 +55,28 @@ func firstNonZero(a, b int64) int64 {
 //   - (dlqReason="oversize"/"blacklist_ext"/... , cause=err, err=nil) → 抽取 permanent 失败，caller 投 DLQ
 //   - (dlqReason="", cause=nil, err=errDocNotYet) → OS 主 doc 未落，caller 应触发本批重试
 //   - (dlqReason="", cause=nil, err=其他) → OS 或网络 transient 错，caller 决定重试策略
+//
+// Round-3 Blocker B (yujiawei P1 / Jerry-Xin #2)：permanent DLQ 返回前 defer 写 tombstone
+// (contentMeta.status="unextractable" + reason=<dlqReason>)，让 backfill scroll query 通过
+// `must_not term contentMeta.status=unextractable` 过滤，避免 rerun 无限重复 DLQ 同一文件。
+// tombstone 写失败不阻塞主 DLQ 路径（下次 backfill/consumer 兜底）。
 func (e *Extractor) ExtractAndWrite(ctx context.Context, messageID string, fp *filePayload) (dlqReason string, cause error, err error) {
+	// Round-3 Blocker B: 命名返回值 + defer 统一处理 tombstone 写入，避免每个 return 点重复代码。
+	// 只对 (dlqReason != "" && err == nil) 的 permanent DLQ 分支写 tombstone；OS transient / errDocNotYet
+	// / ctx 取消 场景 (err != nil) 不写（caller 会重试整批，无需 tombstone）。
+	defer func() {
+		if dlqReason == "" || err != nil {
+			return
+		}
+		if terr := e.os.WriteTombstone(ctx, messageID, dlqReason); terr != nil {
+			// tombstone 写失败不阻塞：主 DLQ 路径依然让 caller 投 DLQ，下次 backfill 兜底重跑
+			// （若主 doc 未落 → 404 = errDocNotYet 也算 tombstone 无法写；等 es-indexer 落主 doc 后
+			//  backfill 再次拉到同 doc 时会重新触发 tombstone 写入）。
+			log.Printf("file-extractor: WriteTombstone messageID=%s reason=%s failed (backfill will retry): %v",
+				messageID, dlqReason, terr)
+		}
+	}()
+
 	// 1. 扩展名白名单前置校验（黑名单 → skip 不 DLQ，白名单外 → DLQ blacklist_ext）
 	ext := normalizeExt(fp.Extension, fp.Name)
 	if isBlacklistedExt(ext) {

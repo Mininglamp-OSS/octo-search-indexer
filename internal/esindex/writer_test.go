@@ -145,6 +145,56 @@ func TestBulk_MixedStatuses(t *testing.T) {
 	}
 }
 
+// TestBulk_409IsTransient 🔴 Round-3 Blocker A regression：scripted_upsert + retry_on_conflict=3
+// 在两写者并发（es-indexer + file-extractor 都 update 同 _id）时可能耗尽 3 次内部重试仍报 409。
+// 老 isPermanentStatus 把 409 视作 permanent → 主 doc 甩进 DLQ + 前进 offset → 主 doc silently
+// 缺 search index。fix 后 409 归 transient，caller 应重试，与 sibling fileextract/oswriter.go 对齐。
+func TestBulk_409IsTransient(t *testing.T) {
+	rt := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		return jsonResp(200, `{"took":1,"errors":true,"items":[
+			{"update":{"_id":"409","status":409,"error":{"type":"version_conflict_engine_exception","reason":"concurrent update after 3 retry_on_conflict"}}}
+		]}`), nil
+	})
+	w := newTestWriter(t, rt)
+	res, err := w.Bulk(context.Background(), []searchmsg.Message{msg("409", "concurrent-write")})
+	if err != nil {
+		t.Fatalf("Bulk: %v", err)
+	}
+	if res[0].OK {
+		t.Fatalf("409 must NOT be OK, got %+v", res[0])
+	}
+	if res[0].Permanent() {
+		t.Fatalf("409 must be TRANSIENT (concurrent-write retriable), not permanent — else main doc silent-drops on redeliver conflict; got %+v", res[0])
+	}
+	if res[0].Status != 409 {
+		t.Fatalf("Status should carry 409, got %d", res[0].Status)
+	}
+}
+
+// TestIsPermanentStatus_409IsTransient Round-3 Blocker A：直接单测 isPermanentStatus 分类。
+func TestIsPermanentStatus_409IsTransient(t *testing.T) {
+	// transient (must not permanent)
+	transient := []int{0, 429, 500, 502, 503, 504, 409}
+	for _, s := range transient {
+		if isPermanentStatus(s) {
+			t.Errorf("status %d must be TRANSIENT (permanent=false), got permanent=true", s)
+		}
+	}
+	// permanent (real 4xx)
+	permanent := []int{400, 401, 403, 404, 410, 422}
+	for _, s := range permanent {
+		if !isPermanentStatus(s) {
+			t.Errorf("status %d must be PERMANENT (permanent=true), got permanent=false", s)
+		}
+	}
+	// 2xx: not permanent
+	for _, s := range []int{200, 201, 204} {
+		if isPermanentStatus(s) {
+			t.Errorf("2xx status %d must not be permanent, got permanent=true", s)
+		}
+	}
+}
+
 // TestBulk_BatchFailure 批级失败（网络错误）→ 返回 error，每条 transient(Status=0)。
 func TestBulk_BatchFailure(t *testing.T) {
 	rt := roundTripFunc(func(r *http.Request) (*http.Response, error) {

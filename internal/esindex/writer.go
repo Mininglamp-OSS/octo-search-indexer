@@ -77,10 +77,20 @@ func (r BulkItemResult) Permanent() bool {
 
 // isPermanentStatus 判定 HTTP 状态码是否为「永久错误」（毒丸，进 DLQ）。
 // 4xx 表示请求本身有问题（如 mapping 冲突、文档格式非法），重试无意义 → permanent。
-// 例外：429 Too Many Requests 是限流，属 transient（退避重试）。
+// 例外：
+//   - 429 Too Many Requests：OS 限流，属 transient（退避重试）。
+//   - 409 Conflict：optimistic-concurrency 冲突（v1.13 Blocker #3 修引入 scripted_upsert +
+//     retry_on_conflict=3 后新暴露）。3 次内部重试耗尽仍报 409 时属 transient，caller 应重试；
+//     误归 permanent 会把主 doc silent 甩进 DLQ + 前进 offset → 主 doc 不落 search（Round-3
+//     Blocker A / Jerry-Xin #1 / yujiawei P1）。与 sibling fileextract/oswriter.go:112-114
+//     的 409 处理对齐。
+//
 // 5xx / 0（网络/批级失败）属 transient。
 func isPermanentStatus(status int) bool {
 	if status == http.StatusTooManyRequests { // 429
+		return false
+	}
+	if status == http.StatusConflict { // 409 — Round-3 Blocker A fix
 		return false
 	}
 	return status >= 400 && status < 500

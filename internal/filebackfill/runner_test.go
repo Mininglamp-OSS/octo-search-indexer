@@ -2,8 +2,10 @@ package filebackfill
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -351,5 +353,41 @@ func TestParseHits_MalformedJSONSkipped(t *testing.T) {
 	}
 	if docs[0].MessageID != "42" {
 		t.Errorf("MessageID: got %q", docs[0].MessageID)
+	}
+}
+
+// TestBuildFirstBatchQuery_ExcludesTombstone Round-3 Blocker B (yujiawei P1 / Jerry-Xin #2)：
+// scroll 首批 query 必须同时用 must_not 过滤 (1) content 缺失 (2) contentMeta.status=unextractable，
+// 防 permanent-fail 文件每次 rerun 都被重新 DLQ。
+func TestBuildFirstBatchQuery_ExcludesTombstone(t *testing.T) {
+	q := buildFirstBatchQuery(500)
+	body, err := json.Marshal(q)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	s := string(body)
+	// filter: term payload.type=8
+	if !strings.Contains(s, `"payload.type":8`) {
+		t.Errorf("query must filter payload.type=8, got: %s", s)
+	}
+	// must_not: exists content
+	if !strings.Contains(s, `"exists":{"field":"payload.file.content"}`) {
+		t.Errorf("query must have must_not exists content, got: %s", s)
+	}
+	// Round-3 Blocker B: must_not term status=unextractable
+	if !strings.Contains(s, `"payload.file.contentMeta.status":"unextractable"`) {
+		t.Errorf("query must exclude tombstone via must_not term contentMeta.status=unextractable, got: %s", s)
+	}
+	if !strings.Contains(s, `"size":500`) {
+		t.Errorf("query must carry size=500, got: %s", s)
+	}
+}
+
+// TestTombstoneStatusValue_HardcodedContract 契约锁：filebackfill 侧 tombstoneStatusValue
+// 必须硬编码为 "unextractable"（与 fileextract/oswriter.go tombstoneStatus 同字符串）。
+// 两包独立断言同一字面值，改任一处不改另一处 → CI 挂。避免跨包 import 膨胀。
+func TestTombstoneStatusValue_HardcodedContract(t *testing.T) {
+	if tombstoneStatusValue != "unextractable" {
+		t.Fatalf("filebackfill.tombstoneStatusValue must == \"unextractable\" (fileextract-side tombstone status), got %q", tombstoneStatusValue)
 	}
 }

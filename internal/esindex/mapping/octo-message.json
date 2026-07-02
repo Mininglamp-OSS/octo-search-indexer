@@ -87,7 +87,9 @@
                   "extractedAt": { "type": "date", "format": "epoch_second" },
                   "extractor":   { "type": "keyword", "ignore_above": 32 },
                   "truncated":   { "type": "boolean" },
-                  "extractMs":   { "type": "long" }
+                  "extractMs":   { "type": "long" },
+                  "status":      { "type": "keyword", "ignore_above": 32 },
+                  "reason":      { "type": "keyword", "ignore_above": 64 }
                 }
               }
             }

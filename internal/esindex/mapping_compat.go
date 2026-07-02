@@ -43,6 +43,13 @@ var requiredMappingFieldPaths = []string{
 	//   已声明 properties）。
 	"payload.file.content",
 	"payload.file.contentMeta.extractedAt",
+	// Round-3 Blocker B (yujiawei P1 / Jerry-Xin #2)：contentMeta 新增 status + reason 字段供
+	// permanent-fail tombstone 写入（extractor 层，dlqReason 非空时写 status="unextractable"）。
+	// 与 backfill source.go scroll query `must_not term status=unextractable` 配合，防 rerun
+	// 重复 DLQ 已知永久失败文件。mapping 缺这两字段则 dynamic:strict 会 4xx 拒 tombstone 写入
+	// → 启动期 loud crash 让运维先 PUT mapping 再滚 pod。
+	"payload.file.contentMeta.status",
+	"payload.file.contentMeta.reason",
 }
 
 // requiredDisabledObjectPaths 是必须以 enabled:false object 形态存在的留底字段（payloadRaw）。

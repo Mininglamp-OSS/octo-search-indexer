@@ -345,11 +345,30 @@ func TestTika_EmptyBody(t *testing.T) {
 // ---- extractor tests (end-to-end w/ mock CDN + Tika + OS) ----
 
 // TestExtractor_BlacklistExtDLQ .mp4 扩展名 → DLQ blacklist_ext，不下载。
+// Round-3 Blocker B: 断言 permanent-fail 路径同步写 tombstone (contentMeta.status=unextractable)。
 func TestExtractor_BlacklistExtDLQ(t *testing.T) {
+	var tombstoneBody string
+	osSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, rerr := io.ReadAll(r.Body)
+		if rerr != nil { t.Errorf("read body: %v", rerr) }
+		tombstoneBody = string(b)
+		_, _ = w.Write([]byte(`{"_id":"42","result":"updated"}`)) //nolint:errcheck // test handler write
+	}))
+	defer osSrv.Close()
+
+	cfg := ServiceConfig{
+		ESAddresses: []string{osSrv.URL},
+		ESIndex:     "octo-message",
+		MaxFileSize: 1024,
+	}
+	os, err := newOSWriter(cfg)
+	if err != nil {
+		t.Fatalf("newOSWriter: %v", err)
+	}
 	e := &Extractor{
 		download:       &downloadClient{}, // 不会被调
 		tika:           &tikaClient{},
-		os:             &osWriter{},
+		os:             os,
 		maxFileSize:    1024,
 		extractorLabel: "tika/test",
 	}
@@ -361,11 +380,41 @@ func TestExtractor_BlacklistExtDLQ(t *testing.T) {
 	if cause == nil || err != nil {
 		t.Errorf("cause=%v err=%v", cause, err)
 	}
+	// Round-3 Blocker B: tombstone must be written on permanent-fail
+	if !strings.Contains(tombstoneBody, `"status":"unextractable"`) {
+		t.Errorf("tombstone must contain status=unextractable, got: %s", tombstoneBody)
+	}
+	if !strings.Contains(tombstoneBody, `"reason":"blacklist_ext"`) {
+		t.Errorf("tombstone must carry dlqReason=blacklist_ext, got: %s", tombstoneBody)
+	}
+	// tombstone 只写 contentMeta，不写 content 字段（保留真无 content 语义）
+	if strings.Contains(tombstoneBody, `"content":`) {
+		t.Errorf("tombstone must NOT write content field, got: %s", tombstoneBody)
+	}
 }
 
 // TestExtractor_OversizeDLQ size > cutoff → DLQ oversize，不下载。
+// Round-3 Blocker B: 断言 tombstone 同步写入。
 func TestExtractor_OversizeDLQ(t *testing.T) {
-	e := &Extractor{maxFileSize: 1024, extractorLabel: "tika/test"}
+	var tombstoneBody string
+	osSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, rerr := io.ReadAll(r.Body)
+		if rerr != nil { t.Errorf("read body: %v", rerr) }
+		tombstoneBody = string(b)
+		_, _ = w.Write([]byte(`{"_id":"42","result":"updated"}`)) //nolint:errcheck // test handler write
+	}))
+	defer osSrv.Close()
+
+	cfg := ServiceConfig{
+		ESAddresses: []string{osSrv.URL},
+		ESIndex:     "octo-message",
+		MaxFileSize: 1024,
+	}
+	os, err := newOSWriter(cfg)
+	if err != nil {
+		t.Fatalf("newOSWriter: %v", err)
+	}
+	e := &Extractor{os: os, maxFileSize: 1024, extractorLabel: "tika/test"}
 	fp := &filePayload{URL: "http://x/y.pdf", Name: "y.pdf", Extension: ".pdf", Size: 2048}
 	reason, cause, err := e.ExtractAndWrite(context.Background(), "42", fp)
 	if reason != ReasonOversize {
@@ -373,6 +422,12 @@ func TestExtractor_OversizeDLQ(t *testing.T) {
 	}
 	if err != nil {
 		t.Errorf("err: %v (cause=%v)", err, cause)
+	}
+	if !strings.Contains(tombstoneBody, `"status":"unextractable"`) {
+		t.Errorf("tombstone must contain status=unextractable, got: %s", tombstoneBody)
+	}
+	if !strings.Contains(tombstoneBody, `"reason":"oversize"`) {
+		t.Errorf("tombstone must carry dlqReason=oversize, got: %s", tombstoneBody)
 	}
 }
 

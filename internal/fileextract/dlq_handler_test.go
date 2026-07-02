@@ -230,3 +230,13 @@ func contains(haystack []byte, needle string) bool {
 	}
 	return false
 }
+
+// TestTombstoneStatus_HardcodedContract 契约锁：fileextract 侧 tombstoneStatus 必须硬编码
+// 为 "unextractable"（与 filebackfill/source.go tombstoneStatusValue 同字面值）。两包独立
+// 断言同一字符串，改任一处不改另一处 → CI 挂。避免跨包 import 膨胀（filebackfill 不 import
+// fileextract 是有意为之，见 filebackfill/source.go tombstoneStatusValue 注释）。
+func TestTombstoneStatus_HardcodedContract(t *testing.T) {
+	if tombstoneStatus != "unextractable" {
+		t.Fatalf("fileextract.tombstoneStatus must == \"unextractable\" (filebackfill-side scroll query value), got %q", tombstoneStatus)
+	}
+}
