@@ -15,10 +15,15 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
-	"strings"
 	"time"
 )
+
+// errCDNPermanent 是 tryFetch 遇到 CDN 4xx (非 429) 返回的 sentinel（v1.13 P2-6）。
+// 老代码用字符串 "cdn permanent status" 分类，重构 err.Error() 格式即静默把 4xx 归成 transient
+// 丢消息。改成 sentinel + errors.Is，无字符串耦合。
+var errCDNPermanent = errors.New("fileextract: cdn permanent status")
 
 // errOversize 是文件超过 MaxFileSize 阈值（不下载 body 直接返，节省带宽）。
 var errOversize = errors.New("fileextract: file size exceeds MaxFileSize cutoff")
@@ -28,14 +33,19 @@ var errDownloadFailed = errors.New("fileextract: download exhausted retries or 4
 
 // downloadClient 从 URL 拉文件 bytes。
 type downloadClient struct {
-	hc           *http.Client
-	maxSize      int64
-	retries      int
-	retryBackoff time.Duration
+	hc             *http.Client
+	maxSize        int64
+	retries        int
+	retryBackoff   time.Duration
+	allowedHosts   []string // v1.13 Blocker #1：SSRF host allowlist（pre-check）
+	allowedSchemes []string
 }
 
-// newDownloadClient 用 stdlib http.Client（Timeout 已含拨号+读体总耗时）。生产 sidecar
-// 走公网 CDN，不需要额外 DNS/连接池调优。
+// newDownloadClient 用 stdlib http.Client（Timeout 已含拨号+读体总耗时）。
+// v1.13 Blocker #1：Transport 挂 SSRF-restricted dialer + CheckRedirect 校验，防
+// (1) 消息 payload.file.url 指向 metadata IP (169.254.169.254) 或内网服务
+// (2) DNS rebinding 绕过 host allowlist
+// (3) redirect 到 blocked host / IP
 func newDownloadClient(cfg ServiceConfig) *downloadClient {
 	maxSize := cfg.MaxFileSize
 	if maxSize <= 0 {
@@ -46,11 +56,29 @@ func newDownloadClient(cfg ServiceConfig) *downloadClient {
 		retries = 3
 	}
 	backoff := cfg.RetryBackoffBase()
+	allowedHosts := cfg.AllowedDownloadHosts
+	allowedSchemes := cfg.AllowedDownloadSchemes
+	baseDialer := &net.Dialer{
+		Timeout:   30 * time.Second,
+		KeepAlive: 30 * time.Second,
+	}
+	transport := &http.Transport{
+		DialContext:         ssrfRestrictedDialer(baseDialer, cfg.SSRFAllowLoopback),
+		MaxIdleConns:        100,
+		IdleConnTimeout:     90 * time.Second,
+		TLSHandshakeTimeout: 10 * time.Second,
+	}
 	return &downloadClient{
-		hc:           &http.Client{Timeout: cfg.DownloadTimeout},
-		maxSize:      maxSize,
-		retries:      retries,
-		retryBackoff: backoff,
+		hc: &http.Client{
+			Timeout:       cfg.DownloadTimeout,
+			Transport:     transport,
+			CheckRedirect: ssrfCheckRedirect(allowedHosts, allowedSchemes),
+		},
+		maxSize:        maxSize,
+		retries:        retries,
+		retryBackoff:   backoff,
+		allowedHosts:   allowedHosts,
+		allowedSchemes: allowedSchemes,
 	}
 }
 
@@ -62,7 +90,13 @@ func (c ServiceConfig) RetryBackoffBase() time.Duration {
 }
 
 // Fetch 拉 URL 到 bytes 数组。重试策略：transient 错误按 base * 2^attempt 退避，共 retries+1 次尝试。
+// v1.13 Blocker #1：入口前置 SSRF 校验，scheme/host 不合法直接返 errDownloadFailed（不重试，
+// URL 不变重试无意义）。
 func (d *downloadClient) Fetch(ctx context.Context, url string) ([]byte, string, error) {
+	if err := validateURL(url, d.allowedHosts, d.allowedSchemes); err != nil {
+		// SSRF pre-check 拒绝 → download_failed（不重试；host/scheme 不变重试无意义）
+		return nil, "", fmt.Errorf("%w: %v", errDownloadFailed, err)
+	}
 	var lastErr error
 	for attempt := 0; attempt <= d.retries; attempt++ {
 		body, ct, err := d.tryFetch(ctx, url)
@@ -112,13 +146,14 @@ func (d *downloadClient) tryFetch(ctx context.Context, url string) ([]byte, stri
 		}
 		return nil, "", err // 网络/超时都进 transient 分支
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }() //nolint:errcheck // close-on-read: nothing to do with close err
 
 	if resp.StatusCode >= 500 || resp.StatusCode == http.StatusTooManyRequests {
 		return nil, "", fmt.Errorf("cdn transient status %d", resp.StatusCode)
 	}
 	if resp.StatusCode >= 400 {
-		return nil, "", fmt.Errorf("cdn permanent status %d", resp.StatusCode)
+		// v1.13 P2-6：用 sentinel errCDNPermanent（下方 isPermanentDownloadErr 走 errors.Is）
+		return nil, "", fmt.Errorf("%w: status %d", errCDNPermanent, resp.StatusCode)
 	}
 	if resp.ContentLength > d.maxSize {
 		return nil, "", errOversize
@@ -136,10 +171,10 @@ func (d *downloadClient) tryFetch(ctx context.Context, url string) ([]byte, stri
 }
 
 // isPermanentDownloadErr 判 err 是否 permanent（4xx 非 429，不重试）。
+// v1.13 P2-6：改 sentinel + errors.Is，不依赖 err.Error() 字符串（重构风险）。
 func isPermanentDownloadErr(err error) bool {
 	if err == nil {
 		return false
 	}
-	// 只有 tryFetch 返 "cdn permanent status <N>" 才 permanent
-	return strings.Contains(err.Error(), "cdn permanent status")
+	return errors.Is(err, errCDNPermanent)
 }

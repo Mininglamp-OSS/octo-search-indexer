@@ -79,8 +79,8 @@ func TestBulk_AllSuccess(t *testing.T) {
 	rt := roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		gotBody = readAll(r.Body)
 		return jsonResp(200, `{"took":1,"errors":false,"items":[
-			{"index":{"_id":"101","status":201}},
-			{"index":{"_id":"102","status":200}}
+			{"update":{"_id":"101","status":201}},
+			{"update":{"_id":"102","status":200}}
 		]}`), nil
 	})
 	w := newTestWriter(t, rt)
@@ -102,16 +102,26 @@ func TestBulk_AllSuccess(t *testing.T) {
 	if !strings.Contains(gotBody, `"messageId":101`) {
 		t.Fatalf("bulk body must carry numeric messageId (reader long): %s", gotBody)
 	}
+	// v1.13 Blocker #3 fix：动作行必须是 update，body 必须含 scripted_upsert=true + painless script。
+	if !strings.Contains(gotBody, `"update"`) {
+		t.Fatalf("bulk action must be 'update' (scripted_upsert), got: %s", gotBody)
+	}
+	if !strings.Contains(gotBody, `"scripted_upsert":true`) {
+		t.Fatalf("bulk body must carry scripted_upsert=true: %s", gotBody)
+	}
+	if !strings.Contains(gotBody, `"lang":"painless"`) {
+		t.Fatalf("bulk body must carry painless script: %s", gotBody)
+	}
 }
 
 // TestBulk_MixedStatuses 混合状态：成功/4xx(permanent)/429(transient)/5xx(transient)。
 func TestBulk_MixedStatuses(t *testing.T) {
 	rt := roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		return jsonResp(200, `{"took":1,"errors":true,"items":[
-			{"index":{"_id":"201","status":201}},
-			{"index":{"_id":"400","status":400,"error":{"type":"mapper_parsing_exception","reason":"bad field"}}},
-			{"index":{"_id":"429","status":429,"error":{"type":"es_rejected","reason":"queue full"}}},
-			{"index":{"_id":"503","status":503,"error":{"type":"unavailable","reason":"node down"}}}
+			{"update":{"_id":"201","status":201}},
+			{"update":{"_id":"400","status":400,"error":{"type":"mapper_parsing_exception","reason":"bad field"}}},
+			{"update":{"_id":"429","status":429,"error":{"type":"es_rejected","reason":"queue full"}}},
+			{"update":{"_id":"503","status":503,"error":{"type":"unavailable","reason":"node down"}}}
 		]}`), nil
 	})
 	w := newTestWriter(t, rt)
@@ -173,7 +183,7 @@ func TestBulk_Idempotent(t *testing.T) {
 	var bodies []string
 	rt := roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		bodies = append(bodies, readAll(r.Body))
-		return jsonResp(200, `{"took":1,"errors":false,"items":[{"index":{"_id":"555","status":201}}]}`), nil
+		return jsonResp(200, `{"took":1,"errors":false,"items":[{"update":{"_id":"555","status":201}}]}`), nil
 	})
 	w := newTestWriter(t, rt)
 	for i := 0; i < 2; i++ {
@@ -187,8 +197,11 @@ func TestBulk_Idempotent(t *testing.T) {
 		if err := json.Unmarshal([]byte(first), &action); err != nil {
 			t.Fatalf("parse action line: %v", err)
 		}
-		if action.Index.ID != "555" {
-			t.Fatalf("idempotent key must be normalized messageId '555', got %q", action.Index.ID)
+		if action.Update.ID != "555" {
+			t.Fatalf("idempotent key must be normalized messageId '555', got %q", action.Update.ID)
+		}
+		if action.Update.RetryOnConflict != 3 {
+			t.Fatalf("update action must carry retry_on_conflict=3, got %d", action.Update.RetryOnConflict)
 		}
 	}
 }
@@ -196,7 +209,7 @@ func TestBulk_Idempotent(t *testing.T) {
 // TestBulk_MissingResponseItem 响应条目数少于请求 → 缺失条标 transient，绝不静默当成功。
 func TestBulk_MissingResponseItem(t *testing.T) {
 	rt := roundTripFunc(func(r *http.Request) (*http.Response, error) {
-		return jsonResp(200, `{"took":1,"errors":false,"items":[{"index":{"_id":"701","status":201}}]}`), nil
+		return jsonResp(200, `{"took":1,"errors":false,"items":[{"update":{"_id":"701","status":201}}]}`), nil
 	})
 	w := newTestWriter(t, rt)
 	res, err := w.Bulk(context.Background(), []searchmsg.Message{msg("701", "a"), msg("702", "b")})
@@ -276,7 +289,7 @@ func TestBulk_NonNumericIDIsPermanentNoES(t *testing.T) {
 	rt := roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		sentBody = readAll(r.Body)
 		// ES 只应收到 1 条（合法的 808）。
-		return jsonResp(200, `{"took":1,"errors":false,"items":[{"index":{"_id":"808","status":201}}]}`), nil
+		return jsonResp(200, `{"took":1,"errors":false,"items":[{"update":{"_id":"808","status":201}}]}`), nil
 	})
 	w := newTestWriter(t, rt)
 	res, err := w.Bulk(context.Background(), []searchmsg.Message{msg("oops", "x"), msg("808", "y")})
@@ -327,8 +340,8 @@ func TestBulkDocs_SplitsByByteSize(t *testing.T) {
 	bulkCalls := 0
 	rt := roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		body := readAll(r.Body)
-		// 数请求里的动作行条数（每条一行 {"index":...}），按数生成等量成功 items。
-		n := strings.Count(body, `{"index":`)
+		// 数请求里的动作行条数（每条一行 {"update":...}），按数生成等量成功 items。
+		n := strings.Count(body, `{"update":`)
 		bulkCalls++
 		var sb strings.Builder
 		sb.WriteString(`{"took":1,"errors":false,"items":[`)
@@ -336,7 +349,7 @@ func TestBulkDocs_SplitsByByteSize(t *testing.T) {
 			if i > 0 {
 				sb.WriteByte(',')
 			}
-			sb.WriteString(`{"index":{"status":201}}`)
+			sb.WriteString(`{"update":{"status":201}}`)
 		}
 		sb.WriteString(`]}`)
 		return jsonResp(200, sb.String()), nil
@@ -381,7 +394,7 @@ func TestBulkDocs_SubBatchEncodeFailureKeepsAlignment(t *testing.T) {
 	bulkCalls := 0
 	rt := roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		body := readAll(r.Body)
-		n := strings.Count(body, `{"index":`)
+		n := strings.Count(body, `{"update":`)
 		bulkCalls++
 		var sb strings.Builder
 		sb.WriteString(`{"took":1,"errors":false,"items":[`)
@@ -389,15 +402,17 @@ func TestBulkDocs_SubBatchEncodeFailureKeepsAlignment(t *testing.T) {
 			if i > 0 {
 				sb.WriteByte(',')
 			}
-			sb.WriteString(`{"index":{"status":201}}`)
+			sb.WriteString(`{"update":{"status":201}}`)
 		}
 		sb.WriteString(`]}`)
 		return jsonResp(200, sb.String()), nil
 	})
 	w := osWriterFor(t, rt)
 
-	// doc0/doc1 各 ~30MB 合法 → 二者相加 >50MB 阈值 → doc0 独占第一子批。
-	big := make([]byte, 30<<20)
+	// doc0/doc1 各 ~20MB payloadRaw；v1.13 scripted_upsert body 含 params.doc + upsert 双 doc
+	// → encodedSingleDocSize ≈ 2×20MB + script overhead ≈ 40MB。两条相加 >50MB 阈值 →
+	// doc0 独占第一子批（且 40MB < 50MB 不触发 single-doc-permanent 413 分支）。
+	big := make([]byte, 20<<20)
 	for i := range big {
 		big[i] = 'x'
 	}
@@ -459,7 +474,7 @@ func TestBulkDocs_SingleOversizedDocIsPermanent(t *testing.T) {
 	bulkCalls := 0
 	rt := roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		bulkCalls++
-		return jsonResp(200, `{"took":1,"errors":false,"items":[{"index":{"status":201}}]}`), nil
+		return jsonResp(200, `{"took":1,"errors":false,"items":[{"update":{"status":201}}]}`), nil
 	})
 	w := osWriterFor(t, rt)
 	// 一条 doc 的 payloadRaw 超过 maxBulkBodyBytes 自身。

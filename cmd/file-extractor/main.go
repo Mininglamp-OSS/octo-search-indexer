@@ -31,6 +31,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/Mininglamp-OSS/octo-search-indexer/internal/esindex"
 	"github.com/Mininglamp-OSS/octo-search-indexer/internal/fileextract"
 )
 
@@ -54,6 +55,13 @@ func run(ctx context.Context) error {
 		<-ctx.Done()
 		return nil
 	}
+	// v1.13 P2-10：startup mapping-compat fail-closed 断言。es-indexer 已用 esindex.Writer
+	// 的 AssertLiveMappingCompatible 校验 mapping 齐备；file-extractor 也需同验证，避免部署
+	// 顺序错（mapping 未 PUT 就上 file-extractor）导致 permanent 400 与 Blocker #2 修复的
+	// in-place retry 循环叠加浪费时间才发现问题。缺字段 → loud crash 让 K8s 重启并告警。
+	if err := assertLiveMapping(ctx, cfg); err != nil {
+		return err
+	}
 	svc, err := fileextract.NewService(cfg)
 	if err != nil {
 		return err
@@ -66,6 +74,26 @@ func run(ctx context.Context) error {
 	log.Printf("file-extractor running: topic=%s group=%s dlq=%s es_index=%s tika=%s",
 		cfg.Topic, cfg.GroupID, cfg.DLQTopic, cfg.ESIndex, cfg.TikaURL)
 	return svc.Run(ctx)
+}
+
+// assertLiveMapping 用 esindex.Writer 复用 mapping-compat 校验（P2-10）。
+// 写完立即 Close 释放 client（本调用只做健康检查，主流程另建自己的 osWriter）。
+func assertLiveMapping(ctx context.Context, cfg fileextract.ServiceConfig) error {
+	w, err := esindex.NewWriter(esindex.Config{
+		Addresses: cfg.ESAddresses,
+		Index:     cfg.ESIndex,
+		Username:  cfg.ESUsername,
+		Password:  cfg.ESPassword,
+	})
+	if err != nil {
+		return err
+	}
+	defer func() { _ = w.Close() }() //nolint:errcheck // close-on-check: nothing to do with close err
+	if err := w.AssertLiveMappingCompatible(ctx); err != nil {
+		return err
+	}
+	log.Printf("file-extractor: live mapping compat OK for index=%s", cfg.ESIndex)
+	return nil
 }
 
 // loadConfig 从环境读配置。返回 enabled=false 时服务空转（未开通）。
@@ -88,8 +116,27 @@ func loadConfig() (fileextract.ServiceConfig, bool) {
 		MaxContentBytes:     envInt("EXTRACTOR_MAX_CONTENT_BYTES", 256*1024),
 		HTTPRetries:         envInt("EXTRACTOR_HTTP_RETRIES", 3),
 		ExtractStartupDelay: time.Duration(envInt("EXTRACT_STARTUP_DELAY_SECONDS", 5)) * time.Second,
+
+		// v1.13 Blocker #2 fix — in-place bounded retry 参数。生产运维按 OS SLA 与业务
+		// 延迟容忍度调整；未设 env 时走 fileextract 包内 default（10 / 1s / 60s）。
+		MaxRetriesPerMessage: envInt("EXTRACTOR_MAX_RETRIES_PER_MESSAGE", 0), // 0 → fileextract 用 defaultMaxRetriesPerMessage=10
+		TransientBackoffBase: time.Duration(envInt("EXTRACTOR_TRANSIENT_BACKOFF_BASE_MS", 0)) * time.Millisecond,
+		TransientBackoffMax:  time.Duration(envInt("EXTRACTOR_TRANSIENT_BACKOFF_MAX_MS", 0)) * time.Millisecond,
+
+		// v1.13 Blocker #1 fix — SSRF 防护参数。允许运维在不改代码前提下扩展 host 白名单
+		// （future 切内网 COS 时用），未设 env 时走 fileextract 包内 default
+		// (["cdn.deepminer.com.cn"] + ["https"])。
+		AllowedDownloadHosts:   splitCSV(os.Getenv("ALLOWED_DOWNLOAD_HOSTS")),
+		AllowedDownloadSchemes: splitCSV(os.Getenv("ALLOWED_DOWNLOAD_SCHEMES")),
+		// 🔴 SSRFAllowLoopback 显式不从 env 读取：生产必须 false（loopback 是 SSRF 目标之一）。
+		// 测试专用；httptest.NewServer 走 127.0.0.1 需 test cfg 直接设 true，无 env 通道防止
+		// 生产误开或运维在紧急情况下 hot-toggle 打开攻击面。
+		SSRFAllowLoopback: false,
 	}
-	enabledFlag, _ := strconv.ParseBool(os.Getenv("FILE_EXTRACTOR_ENABLED"))
+	enabledFlag, err := strconv.ParseBool(os.Getenv("FILE_EXTRACTOR_ENABLED"))
+	if err != nil {
+		enabledFlag = false // 无效值当未启用（保持"未开通即零运行"语义）
+	}
 	enabled := enabledFlag && len(cfg.Brokers) > 0 && len(cfg.ESAddresses) > 0
 	return cfg, enabled
 }

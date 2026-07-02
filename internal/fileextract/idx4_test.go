@@ -13,13 +13,19 @@ import (
 )
 
 // mkCfgForTest 造小超时的测试 config，避免测试跑太久。
+// v1.13 Blocker #1：test 用 httptest server 走 http://127.0.0.1:PORT，需要绕过 SSRF
+// scheme/host 白名单——加 http scheme + 127.0.0.1 host + SSRFAllowLoopback=true。
+// SSRF 的正式 test 覆盖在 ssrf_test.go（用默认 cfg 校验白名单拒绝逻辑）。
 func mkCfgForTest(maxSize int64) ServiceConfig {
 	return ServiceConfig{
-		DownloadTimeout: 500 * time.Millisecond,
-		ExtractTimeout:  500 * time.Millisecond,
-		MaxFileSize:     maxSize,
-		MaxContentBytes: 128, // 短便于测截断
-		HTTPRetries:     2,   // 3 次尝试
+		DownloadTimeout:        500 * time.Millisecond,
+		ExtractTimeout:         500 * time.Millisecond,
+		MaxFileSize:             maxSize,
+		MaxContentBytes:         128, // 短便于测截断
+		HTTPRetries:             2,   // 3 次尝试
+		AllowedDownloadHosts:    []string{"127.0.0.1"},
+		AllowedDownloadSchemes:  []string{"http", "https"},
+		SSRFAllowLoopback:       true, // httptest server 走 loopback，生产必须 false
 	}
 }
 
@@ -27,7 +33,9 @@ func mkCfgForTest(maxSize int64) ServiceConfig {
 func TestDownload_HappyPath(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/pdf")
-		w.Write([]byte("%PDF-1.7 hello"))
+		if _, werr := w.Write([]byte("%PDF-1.7 hello")); werr != nil {
+			t.Errorf("test server write: %v", werr)
+		}
 	}))
 	defer srv.Close()
 	dc := newDownloadClient(mkCfgForTest(1024))
@@ -49,7 +57,9 @@ func TestDownload_5xxTransientThenSuccess(t *testing.T) {
 			w.WriteHeader(500)
 			return
 		}
-		w.Write([]byte("ok"))
+		if _, werr := w.Write([]byte("ok")); werr != nil {
+			t.Errorf("test server write: %v", werr)
+		}
 	}))
 	defer srv.Close()
 	cfg := mkCfgForTest(1024)
@@ -59,6 +69,8 @@ func TestDownload_5xxTransientThenSuccess(t *testing.T) {
 		maxSize:      1024,
 		retries:      3,
 		retryBackoff: 10 * time.Millisecond,
+		allowedHosts:   []string{"127.0.0.1"},
+		allowedSchemes: []string{"http", "https"},
 	}
 	_ = cfg
 	body, _, err := dc.Fetch(context.Background(), srv.URL+"/x")
@@ -86,6 +98,8 @@ func TestDownload_5xxRetryExhausted(t *testing.T) {
 		maxSize:      1024,
 		retries:      2, // 共 3 次尝试
 		retryBackoff: 5 * time.Millisecond,
+		allowedHosts:   []string{"127.0.0.1"},
+		allowedSchemes: []string{"http", "https"},
 	}
 	_, _, err := dc.Fetch(context.Background(), srv.URL+"/x")
 	if !errors.Is(err, errDownloadFailed) {
@@ -109,6 +123,8 @@ func TestDownload_4xxPermanent(t *testing.T) {
 		maxSize:      1024,
 		retries:      3,
 		retryBackoff: 5 * time.Millisecond,
+		allowedHosts:   []string{"127.0.0.1"},
+		allowedSchemes: []string{"http", "https"},
 	}
 	_, _, err := dc.Fetch(context.Background(), srv.URL+"/x")
 	if !errors.Is(err, errDownloadFailed) {
@@ -124,7 +140,10 @@ func TestDownload_ContentLengthOversize(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Length", "999999")
 		w.WriteHeader(200)
-		w.Write(make([]byte, 999999))
+		if _, werr := w.Write(make([]byte, 999999)); werr != nil {
+			// Content-Length 触发 client 早退不读 body 是预期，Broken pipe 可忽略
+			_ = werr
+		}
 	}))
 	defer srv.Close()
 	dc := newDownloadClient(mkCfgForTest(1024))
@@ -138,7 +157,10 @@ func TestDownload_ContentLengthOversize(t *testing.T) {
 func TestDownload_LiedContentLength(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(200)
-		w.Write(make([]byte, 2048)) // 超过 maxSize=1024
+		if _, werr := w.Write(make([]byte, 2048)); werr != nil {
+			// Broken pipe when client cuts off at LimitReader boundary is expected
+			_ = werr //nolint:errcheck
+		}
 	}))
 	defer srv.Close()
 	dc := newDownloadClient(mkCfgForTest(1024))
@@ -159,6 +181,8 @@ func TestDownload_ContextCancelled(t *testing.T) {
 		maxSize:      1024,
 		retries:      3,
 		retryBackoff: time.Second,
+		allowedHosts:   []string{"127.0.0.1"},
+		allowedSchemes: []string{"http", "https"},
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() { time.Sleep(20 * time.Millisecond); cancel() }()
@@ -179,7 +203,9 @@ func TestTika_Success(t *testing.T) {
 		if got := r.Header.Get("Accept"); got != "text/plain" {
 			t.Errorf("Accept header: got %q", got)
 		}
-		w.Write([]byte("extracted text 抽出内容"))
+		if _, werr := w.Write([]byte("extracted text 抽出内容")); werr != nil {
+			t.Errorf("test server write: %v", werr)
+		}
 	}))
 	defer srv.Close()
 	tc := newTikaClient(ServiceConfig{TikaURL: srv.URL, ExtractTimeout: time.Second, MaxContentBytes: 128})
@@ -196,7 +222,9 @@ func TestTika_Success(t *testing.T) {
 func TestTika_ContentTruncated(t *testing.T) {
 	longText := strings.Repeat("abc", 200) // 600 bytes
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte(longText))
+		if _, werr := w.Write([]byte(longText)); werr != nil {
+			t.Errorf("test server write: %v", werr)
+		}
 	}))
 	defer srv.Close()
 	tc := newTikaClient(ServiceConfig{TikaURL: srv.URL, ExtractTimeout: time.Second, MaxContentBytes: 128})
@@ -216,7 +244,7 @@ func TestTika_ContentTruncated(t *testing.T) {
 func TestTika_Utf8SafeTruncate(t *testing.T) {
 	longChinese := strings.Repeat("中文字符", 100) // 每个 "中" = 3 bytes UTF-8
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte(longChinese))
+		_, _ = w.Write([]byte(longChinese)) //nolint:errcheck // test handler write; not the SUT
 	}))
 	defer srv.Close()
 	tc := newTikaClient(ServiceConfig{TikaURL: srv.URL, ExtractTimeout: time.Second, MaxContentBytes: 50})
@@ -242,7 +270,7 @@ func TestTika_EncryptedDocument500Body(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(500)
 		// 真实 Tika 3.3.0 加密 PDF 抛的 Java stack trace 采样：
-		w.Write([]byte("org.apache.tika.exception.EncryptedDocumentException: encrypted PDF"))
+		_, _ = w.Write([]byte("org.apache.tika.exception.EncryptedDocumentException: encrypted PDF")) //nolint:errcheck // test handler write; not the SUT
 	}))
 	defer srv.Close()
 	tc := newTikaClient(ServiceConfig{TikaURL: srv.URL, ExtractTimeout: time.Second, MaxContentBytes: 128})
@@ -256,7 +284,7 @@ func TestTika_EncryptedDocument500Body(t *testing.T) {
 func TestTika_500Generic(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(500)
-		w.Write([]byte("org.apache.tika.exception.TikaException: some other error"))
+		_, _ = w.Write([]byte("org.apache.tika.exception.TikaException: some other error")) //nolint:errcheck // test handler write; not the SUT
 	}))
 	defer srv.Close()
 	tc := newTikaClient(ServiceConfig{TikaURL: srv.URL, ExtractTimeout: time.Second, MaxContentBytes: 128})
@@ -283,7 +311,7 @@ func TestTika_422Unsupported(t *testing.T) {
 func TestTika_Timeout(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		time.Sleep(500 * time.Millisecond)
-		w.Write([]byte("ok"))
+		_, _ = w.Write([]byte("ok")) //nolint:errcheck // test handler write; not the SUT
 	}))
 	defer srv.Close()
 	tc := newTikaClient(ServiceConfig{TikaURL: srv.URL, ExtractTimeout: 100 * time.Millisecond, MaxContentBytes: 128})
@@ -339,50 +367,57 @@ func TestExtractor_BlacklistExtDLQ(t *testing.T) {
 func TestExtractor_OversizeDLQ(t *testing.T) {
 	e := &Extractor{maxFileSize: 1024, extractorLabel: "tika/test"}
 	fp := &filePayload{URL: "http://x/y.pdf", Name: "y.pdf", Extension: ".pdf", Size: 2048}
-	reason, _, err := e.ExtractAndWrite(context.Background(), "42", fp)
+	reason, cause, err := e.ExtractAndWrite(context.Background(), "42", fp)
 	if reason != ReasonOversize {
-		t.Errorf("reason: got %q want oversize", reason)
+		t.Errorf("reason: got %q want oversize (cause=%v)", reason, cause)
 	}
 	if err != nil {
-		t.Errorf("err: %v", err)
+		t.Errorf("err: %v (cause=%v)", err, cause)
 	}
 }
 
 // TestExtractor_HappyPath 下载 + Tika + OS 全流程走通（mock CDN + Tika + OS）。
 func TestExtractor_HappyPath(t *testing.T) {
 	cdn := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte("pdf bytes"))
+		_, _ = w.Write([]byte("pdf bytes")) //nolint:errcheck // test handler write; not the SUT
 	}))
 	defer cdn.Close()
 	tika := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte("extracted content 抽出内容"))
+		_, _ = w.Write([]byte("extracted content 抽出内容")) //nolint:errcheck // test handler write; not the SUT
 	}))
 	defer tika.Close()
 
 	var osCalls atomic.Int32
 	os := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		osCalls.Add(1)
-		body, _ := io.ReadAll(r.Body)
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read body: %v", err)
+			return
+		}
 		if !strings.Contains(string(body), `"content":"extracted content 抽出内容"`) {
 			t.Errorf("update body missing content: %s", string(body))
 		}
 		if !strings.Contains(string(body), `"doc_as_upsert":false`) {
 			t.Errorf("update body must have doc_as_upsert=false: %s", string(body))
 		}
-		w.Write([]byte(`{"_id":"42","_version":2,"result":"updated","_shards":{"total":2,"successful":2,"failed":0}}`))
+		_, _ = w.Write([]byte(`{"_id":"42","_version":2,"result":"updated","_shards":{"total":2,"successful":2,"failed":0}}`)) //nolint:errcheck // test handler write; not the SUT
 	}))
 	defer os.Close()
 
 	// 手工装配 Extractor 避开 newOSWriter（真实构造函数会因 http:// 前缀警告但可用）
 	cfg := ServiceConfig{
-		ESAddresses:     []string{os.URL},
-		ESIndex:         "octo-message",
-		TikaURL:         tika.URL,
-		DownloadTimeout: time.Second,
-		ExtractTimeout:  time.Second,
-		MaxFileSize:     1024 * 1024,
-		MaxContentBytes: 1024 * 1024,
-		HTTPRetries:     2,
+		ESAddresses:            []string{os.URL},
+		ESIndex:                "octo-message",
+		TikaURL:                tika.URL,
+		DownloadTimeout:        time.Second,
+		ExtractTimeout:         time.Second,
+		MaxFileSize:            1024 * 1024,
+		MaxContentBytes:        1024 * 1024,
+		HTTPRetries:            2,
+		AllowedDownloadHosts:   []string{"127.0.0.1"},
+		AllowedDownloadSchemes: []string{"http", "https"},
+		SSRFAllowLoopback:      true,
 	}
 	e, err := NewExtractor(cfg)
 	if err != nil {
@@ -443,7 +478,7 @@ func TestTika_FilenameCRLFInjection(t *testing.T) {
 	var gotHeader string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotHeader = r.Header.Get("Content-Disposition")
-		w.Write([]byte("ok"))
+		_, _ = w.Write([]byte("ok")) //nolint:errcheck // test handler write; not the SUT
 	}))
 	defer srv.Close()
 
@@ -565,7 +600,7 @@ func TestTika_ContentTypeHeaderSet(t *testing.T) {
 	var gotCT string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotCT = r.Header.Get("Content-Type")
-		w.Write([]byte("ok"))
+		_, _ = w.Write([]byte("ok")) //nolint:errcheck // test handler write; not the SUT
 	}))
 	defer srv.Close()
 

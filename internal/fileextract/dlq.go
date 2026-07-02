@@ -1,9 +1,9 @@
 package fileextract
 
-// DLQReason 是 file-extractor DLQ 投递原因枚举（v1.12）。全部触发点在 IDX-4 接上；
+// DLQReason 是 file-extractor DLQ 投递原因枚举（v1.13）。全部触发点在 IDX-4 接上；
 // IDX-3 骨架期只定义常量 + ReasonParseError（Kafka 反序列化失败）触发。
 //
-// 与 feasibility.md v2 §6.1 表格一一对应：
+// v1.13 Blocker #2 fix 新增 2 项 (retry_exhausted / os_permanent)：
 //
 //	| reason              | 触发条件                                      | 是否重试 |
 //	|---------------------|---------------------------------------------|----------|
@@ -15,6 +15,8 @@ package fileextract
 //	| encrypted           | Tika 抛 EncryptedDocumentException             | ❌      |
 //	| empty_extract       | Tika 返回空串或空白                           | ❌      |
 //	| extract_error       | 其他 Tika parse 异常                          | ✅ 1 次 |
+//	| retry_exhausted     | in-place bounded retry N 次未成功（Blocker #2） | ✅ N 次 |
+//	| os_permanent        | OS 返 4xx (非 404/409/429) permanent (P2-2)   | ❌      |
 const (
 	ReasonParseError     = "parse_error"
 	ReasonOversize       = "oversize"
@@ -24,6 +26,15 @@ const (
 	ReasonEncrypted      = "encrypted"
 	ReasonEmptyExtract   = "empty_extract"
 	ReasonExtractError   = "extract_error"
+
+	// ReasonRetryExhausted：单条消息 in-place bounded retry N 次仍未成功
+	// (errDocNotYet / errOSTransient 长期未收敛) → 强制 DLQ 并 commit offset，避免
+	// partition 无限阻塞。回灌工具按 messageId 从源 MySQL 重取重试。
+	ReasonRetryExhausted = "retry_exhausted"
+
+	// ReasonOSPermanent：OS 写返 4xx (非 404/409/429) permanent error，通常是请求
+	// body 编程 bug 或 mapping 冲突。立即 DLQ 不重试（重试无意义 + 会阻塞 partition）。
+	ReasonOSPermanent = "os_permanent"
 )
 
 // dlqRecord 是 file-extractor 落 DLQ topic 的记录载荷。

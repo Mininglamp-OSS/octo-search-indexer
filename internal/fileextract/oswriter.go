@@ -99,6 +99,10 @@ func (w *osWriter) UpdateContent(ctx context.Context, messageID string, content 
 
 // classifyOSErr 把 opensearch-go 的通用 error 转成本包 sentinel（errors.Is 可读）。
 // opensearch-go v3 的 Update 在 HTTP 非 2xx 时会返回带 status code 的 err（含 response body）。
+//
+// v1.13 P2-1 fix：新增 429 (Too Many Requests) → errOSTransient 分类
+// （老代码走 status >= 400 catch-all 误归 errOSPermanent，429 是 OS 限流是 transient 语义，
+// 与 download.go:117 的 CDN 429 处理一致）。
 func classifyOSErr(resp *opensearchapi.UpdateResp, err error) error {
 	if resp != nil && resp.Inspect().Response != nil {
 		status := resp.Inspect().Response.StatusCode
@@ -107,6 +111,9 @@ func classifyOSErr(resp *opensearchapi.UpdateResp, err error) error {
 			return errDocNotYet
 		case status == http.StatusConflict:
 			// retry_on_conflict=3 已经尝试过，仍报 409 视为 transient（下轮重试）
+			return errOSTransient
+		case status == http.StatusTooManyRequests:
+			// v1.13 P2-1：OS 限流是 transient 语义，需在 400 catch-all 之前拦下
 			return errOSTransient
 		case status >= 500:
 			return errOSTransient

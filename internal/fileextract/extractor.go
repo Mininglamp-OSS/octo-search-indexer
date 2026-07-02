@@ -93,14 +93,16 @@ func (e *Extractor) ExtractAndWrite(ctx context.Context, messageID string, fp *f
 			return ReasonExtractError, terr, nil
 		}
 	}
-	if content == "" {
-		return ReasonEmptyExtract, errors.New("tika returned empty content"), nil
+	if content == "" || strings.TrimSpace(content) == "" {
+		// v1.13 P2-7：whitespace-only 也视为 empty_extract（老代码只判 == ""，
+		// scanned/empty PDF 常返 "\n\n" / 空格串，会漏过 → 无意义 doc 被误 commit）
+		return ReasonEmptyExtract, errors.New("tika returned empty or whitespace-only content"), nil
 	}
 	// 5. OS partial update
 	meta := esindex.FileContentMeta{
 		ExtractedAt: time.Now().Unix(),
 		Extractor:   e.extractorLabel,
-		Truncated:   truncated,
+		Truncated:   &truncated, // v1.13 P2-5：指针便于清除 stale true
 		ExtractMs:   extractMs,
 	}
 	if uerr := e.os.UpdateContent(ctx, messageID, content, meta); uerr != nil {

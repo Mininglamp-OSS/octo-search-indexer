@@ -76,13 +76,19 @@ func mkNonFileMessage(t *testing.T, msgID string, contentType int) fetchedMessag
 		"type":    contentType,
 		"content": "hello",
 	}
-	rawBytes, _ := json.Marshal(rawPayload)
+	rawBytes, err := json.Marshal(rawPayload)
+	if err != nil {
+		t.Fatalf("marshal rawPayload: %v", err)
+	}
 	msg := searchmsg.Message{
 		SchemaVersion: searchmsg.SchemaVersion,
 		MessageID:     msgID,
 		RawPayload:    rawBytes,
 	}
-	value, _ := json.Marshal(msg)
+	value, err := json.Marshal(msg)
+	if err != nil {
+		t.Fatalf("marshal msg: %v", err)
+	}
 	return fetchedMessage{Topic: "test-topic", Partition: 0, Offset: 100, Key: []byte(msgID), Value: value}
 }
 

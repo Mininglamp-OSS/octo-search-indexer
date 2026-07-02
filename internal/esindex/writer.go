@@ -128,11 +128,77 @@ func NewWriter(cfg Config) (Writer, error) {
 }
 
 // bulkActionLine / bulkDocLine 构成 _bulk NDJSON 的每条两行：动作行 + 文档行。
-// 用 index 动作（非 create）实现 upsert：同 _id 重复投递覆盖同一 doc，幂等去重。
+//
+// 🔴 v1.13（Blocker #3 fix）：从 `index` 动作换成 `update` + `scripted_upsert`。
+// 原因：file-extractor 通过 partial _update 写 payload.file.content + contentMeta；es-indexer
+// 若走 `index` full-replace，redeliver（rebalance/restart/retry）时会**覆盖** file-extractor
+// 写的字段。改 scripted_upsert：doc 不存在 → upsert 全量写；doc 存在 → 走 preservePainless
+// 从 ctx._source 保留 preservedFilePaths 里的字段再全量替换。retry_on_conflict=3 与
+// file-extractor 一致，缓解两 writer 并发写冲突。
 type bulkActionLine struct {
-	Index struct {
-		ID string `json:"_id"`
-	} `json:"index"`
+	Update struct {
+		ID              string `json:"_id"`
+		RetryOnConflict int    `json:"retry_on_conflict"`
+	} `json:"update"`
+}
+
+// preservedFilePaths 是 es-indexer scripted_upsert 更新 doc 时**必须保留、不被覆盖**
+// 的字段路径清单——由 file-extractor 通过 partial _update 拥有写入权。若 es-indexer 走
+// full-replace 会抹掉这些字段（Blocker #3 原 bug）。preservePainless 常量按本清单实现
+// preserve 逻辑；未来 file-extractor 扩字段时**同步扩本清单 + 更新 script 常量 + test 断言**。
+var preservedFilePaths = []string{
+	"payload.file.content",
+	"payload.file.contentMeta",
+}
+
+// preservePainless 是 scripted_upsert 的 Painless script 常量。
+//   - ctx.op == 'create'（doc 不存在，走 upsert）：直接用 params.doc 全量赋值，无 preserve 需求
+//   - 否则（doc 已存在）：先从 ctx._source 保存 preservedFilePaths 字段 → 用 params.doc 全量
+//     替换 ctx._source → 恢复保留字段
+//
+// script 是**参数化常量**（本字符串每次一样，只有 params.doc 变），OS script cache 会 hit。
+// 语法针对 OS 3.x Painless，兼容 nested Map 访问 + null 判定。
+const preservePainless = `
+if (ctx.op == 'create') {
+  ctx._source = params.doc;
+} else {
+  def savedContent = null;
+  def savedMeta = null;
+  if (ctx._source.containsKey('payload') && ctx._source.payload instanceof Map) {
+    def f = ctx._source.payload.get('file');
+    if (f instanceof Map) {
+      savedContent = f.get('content');
+      savedMeta = f.get('contentMeta');
+    }
+  }
+  ctx._source = params.doc;
+  if (savedContent != null || savedMeta != null) {
+    if (!ctx._source.containsKey('payload') || !(ctx._source.payload instanceof Map)) {
+      ctx._source.payload = new HashMap();
+    }
+    if (!ctx._source.payload.containsKey('file') || !(ctx._source.payload.file instanceof Map)) {
+      ctx._source.payload.file = new HashMap();
+    }
+    if (savedContent != null) { ctx._source.payload.file.content = savedContent; }
+    if (savedMeta != null) { ctx._source.payload.file.contentMeta = savedMeta; }
+  }
+}
+`
+
+// bulkUpdateBody 是一条 doc 的 update + scripted_upsert body（第二行）。
+// script.params.doc 与 upsert 均携带同一 doc：前者供 script 执行 preserve+replace，
+// 后者供 OS 在 doc 不存在时初始化。scripted_upsert=true 让 upsert 分支也走 script（ctx.op=='create'）。
+type bulkUpdateBody struct {
+	Script         scriptBlock `json:"script"`
+	Upsert         Doc         `json:"upsert"`
+	ScriptedUpsert bool        `json:"scripted_upsert"`
+}
+
+// scriptBlock 是 Painless script + 参数。
+type scriptBlock struct {
+	Lang   string         `json:"lang"`
+	Source string         `json:"source"`
+	Params map[string]any `json:"params"`
 }
 
 // Bulk 把一批 Kafka 契约消息转成 reader 可读 Doc 后以 _bulk 幂等写入 ES。
@@ -265,13 +331,16 @@ func encodedDocSize(d Doc) int {
 }
 
 // encodedSingleDocSize 估算单条 doc（不含其 Derivatives）在 _bulk body 里的字节。
+// v1.13 scripted_upsert 后 body 膨胀 ~2x（script 常量 + params.doc + upsert），此估算按新
+// 结构算：动作行 (~80 字节 update+retry_on_conflict) + script 常量 + 2×doc JSON + 结构开销。
 func encodedSingleDocSize(d Doc) int {
 	docJSON, err := json.Marshal(d)
 	if err != nil {
 		return 0
 	}
-	// 动作行约 ~40 字节（{"index":{"_id":"<id>"}}）+ 文档行 + 2 换行；动作行用 id 长度近似。
-	return len(docJSON) + len(d.idString()) + 24 + 2
+	// 动作行 ~80 字节（{"update":{"_id":"<id>","retry_on_conflict":3}}）+ script 常量
+	// + params.doc + upsert.doc + JSON 结构 overhead (~120) + 2 换行。
+	return 80 + len(preservePainless) + 2*len(docJSON) + 120 + 2
 }
 
 // bulkOnce 执行单次 _bulk（原 BulkDocs 主体），用于 BulkDocs 的按字节子批切分。
@@ -319,22 +388,33 @@ func encodeBulkBody(docs []Doc) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
-// writeBulkDoc 向 buf 写一条 doc 的 index 动作行 + 文档行。
+// writeBulkDoc 向 buf 写一条 doc 的 update+scripted_upsert 动作行 + body 行（v1.13）。
+// 动作行携带 retry_on_conflict=3 与 file-extractor oswriter 一致，缓解并发冲突。
 func writeBulkDoc(buf *bytes.Buffer, d Doc) error {
 	id := d.idString()
 	var action bulkActionLine
-	action.Index.ID = id
+	action.Update.ID = id
+	action.Update.RetryOnConflict = 3
 	actionJSON, err := json.Marshal(action)
 	if err != nil {
 		return fmt.Errorf("esindex: marshal bulk action for %s: %w", id, err)
 	}
-	docJSON, err := json.Marshal(d)
+	body := bulkUpdateBody{
+		Script: scriptBlock{
+			Lang:   "painless",
+			Source: preservePainless,
+			Params: map[string]any{"doc": d},
+		},
+		Upsert:         d,
+		ScriptedUpsert: true,
+	}
+	bodyJSON, err := json.Marshal(body)
 	if err != nil {
-		return fmt.Errorf("esindex: marshal doc for %s: %w", id, err)
+		return fmt.Errorf("esindex: marshal update body for %s: %w", id, err)
 	}
 	buf.Write(actionJSON)
 	buf.WriteByte('\n')
-	buf.Write(docJSON)
+	buf.Write(bodyJSON)
 	buf.WriteByte('\n')
 	return nil
 }
@@ -380,7 +460,8 @@ func mapBulkResults(docs []Doc, resp *opensearchapi.BulkResp) []BulkItemResult {
 }
 
 // bulkItemResult 解析 _bulk 响应第 idx 项，返回单条 BulkItemResult（MessageID=id）。
-// 响应缺项/无 index 动作 → transient(Status=0) 让整批重试，绝不静默当成功。
+// 响应缺项/无 update 动作 → transient(Status=0) 让整批重试，绝不静默当成功。
+// v1.13：action key 从 "index" 改成 "update"（对齐 scripted_upsert 请求动作）。
 func bulkItemResult(id string, resp *opensearchapi.BulkResp, idx int) BulkItemResult {
 	res := BulkItemResult{MessageID: id}
 	if idx >= len(resp.Items) {
@@ -388,10 +469,10 @@ func bulkItemResult(id string, resp *opensearchapi.BulkResp, idx int) BulkItemRe
 		res.Err = fmt.Errorf("esindex: missing bulk response item for %s", id)
 		return res
 	}
-	item, ok := resp.Items[idx]["index"]
+	item, ok := resp.Items[idx]["update"]
 	if !ok {
 		res.Status = 0
-		res.Err = fmt.Errorf("esindex: bulk response item for %s has no index action", id)
+		res.Err = fmt.Errorf("esindex: bulk response item for %s has no update action", id)
 		return res
 	}
 	res.Status = item.Status

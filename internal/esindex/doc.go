@@ -145,10 +145,13 @@ type FilePayload struct {
 //   - Extractor:   抽取器标识字符串（例 "tika/3.3.0"），mapping keyword
 //   - Truncated:   Content 是否被截到 file-extractor 配置的 MaxContentBytes（256KB 默认）
 //   - ExtractMs:   Tika 抽取耗时（毫秒），mapping long
+//
+// v1.13 P2-5：Truncated 从 bool 改成 *bool，避免 omitempty + zero-value 使 truncated=true→false
+// 的重抽取无法把字段从 stale true 清除（partial _update 语义下 field 缺失 = OS 保留旧值）。
 type FileContentMeta struct {
 	ExtractedAt int64  `json:"extractedAt,omitempty"`
 	Extractor   string `json:"extractor,omitempty"`
-	Truncated   bool   `json:"truncated,omitempty"`
+	Truncated   *bool  `json:"truncated,omitempty"`
 	ExtractMs   int64  `json:"extractMs,omitempty"`
 }
 

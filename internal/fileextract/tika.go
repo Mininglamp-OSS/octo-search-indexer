@@ -41,7 +41,11 @@ type tikaClient struct {
 	maxContentBytes int
 }
 
-// newTikaClient 构造。HTTP client 复用同 stdlib idiom，Timeout 覆盖整个请求生命周期。
+// newTikaClient 构造。HTTP client 无 client-level Timeout（v1.13 P2-9）——
+// 老代码用 http.Client{Timeout} 与 ctx 独立，client timeout 触发时 ctx.Err() 是 nil，导致
+// 错误被误分类为 errExtractGeneric（DLQ extract_error, retry×1）而非 errExtractTimeout
+// (permanent, no retry)。改成 per-request context.WithTimeout 驱动，让 err 同时携带
+// context.DeadlineExceeded 语义。
 func newTikaClient(cfg ServiceConfig) *tikaClient {
 	max := cfg.MaxContentBytes
 	if max <= 0 {
@@ -52,7 +56,7 @@ func newTikaClient(cfg ServiceConfig) *tikaClient {
 		url = "http://localhost:9998"
 	}
 	return &tikaClient{
-		hc:              &http.Client{Timeout: cfg.ExtractTimeout},
+		hc:              &http.Client{}, // v1.13 P2-9：不用 client-level Timeout
 		baseURL:         url,
 		timeout:         cfg.ExtractTimeout,
 		maxContentBytes: max,
@@ -71,7 +75,12 @@ func newTikaClient(cfg ServiceConfig) *tikaClient {
 // octo-server 上传时用户可控字段，未 sanitize 会破坏 Content-Disposition 头或走 CRLF smuggling）。
 // extension 为空时 fallback filename 后缀；仍为空 → application/octet-stream 让 Tika auto-detect。
 func (t *tikaClient) Extract(ctx context.Context, fileBytes []byte, filename, extension string) (string, bool, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodPut, t.baseURL+"/tika", bytes.NewReader(fileBytes))
+	// v1.13 P2-9：per-request timeout by ctx，classifyOSErr → errExtractTimeout 精确。
+	// 用 parentCtx 判"是否 parent cancel"（区分调用方主动关停 vs 本次 Tika 超时）。
+	parentCtx := ctx
+	reqCtx, cancel := context.WithTimeout(ctx, t.timeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodPut, t.baseURL+"/tika", bytes.NewReader(fileBytes))
 	if err != nil {
 		return "", false, err
 	}
@@ -87,14 +96,20 @@ func (t *tikaClient) Extract(ctx context.Context, fileBytes []byte, filename, ex
 	}
 	resp, err := t.hc.Do(req)
 	if err != nil {
-		// ctx 取消/超时都视为 timeout，让 caller 走优雅退出（不进 extract_error DLQ）
-		if ctxErr := ctx.Err(); ctxErr != nil {
+		// P2-9：本次请求 ctx 超时 → errExtractTimeout（DLQ extract_timeout，permanent）
+		// parent ctx 取消（SIGTERM 等）→ 上抛 ctx.Err() 让 caller 优雅退出
+		if parentCtx.Err() != nil {
+			return "", false, parentCtx.Err()
+		}
+		if errors.Is(reqCtx.Err(), context.DeadlineExceeded) {
 			return "", false, errExtractTimeout
 		}
 		return "", false, fmt.Errorf("%w: %v", errExtractGeneric, err)
 	}
-	defer resp.Body.Close()
-	body, readErr := io.ReadAll(resp.Body)
+	defer func() { _ = resp.Body.Close() }() //nolint:errcheck // close-on-read: nothing to do with close err
+	// v1.13 P2-4：io.ReadAll 加 LimitReader 上限，避免 Tika 谎报 body 长度导致 OOM。
+	// 上限 = maxContentBytes+4（+4 冗余是 truncateContent 判断"是否超"用）
+	body, readErr := io.ReadAll(io.LimitReader(resp.Body, int64(t.maxContentBytes)+4))
 	if readErr != nil {
 		return "", false, fmt.Errorf("%w: read body: %v", errExtractGeneric, readErr)
 	}

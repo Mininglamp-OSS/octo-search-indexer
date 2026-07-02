@@ -4,6 +4,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 )
 
 // resetEnv 清空 EXTRACTOR/KAFKA/ES/FILE_EXTRACTOR/TIKA 前缀所有环境变量，保证 test 无污染。
@@ -88,6 +89,69 @@ func TestLoadConfig_HappyPath_Defaults(t *testing.T) {
 	}
 	if cfg.ExtractStartupDelay.Seconds() != 5 {
 		t.Errorf("ExtractStartupDelay default: got %v", cfg.ExtractStartupDelay)
+	}
+}
+
+// TestLoadConfig_V113ConfigDefaults v1.13 新增 6 字段未设 env 时留零值，由 fileextract 包内
+// default 在 NewProcessor / newDownloadClient 兜底（10 / 1s / 60s / cdn.deepminer.com.cn / https / false）。
+func TestLoadConfig_V113ConfigDefaults(t *testing.T) {
+	resetEnv(t)
+	t.Setenv("FILE_EXTRACTOR_ENABLED", "true")
+	t.Setenv("KAFKA_BROKERS", "kafka:9092")
+	t.Setenv("ES_ADDRESSES", "http://os:9200")
+	cfg, _ := loadConfig()
+	if cfg.MaxRetriesPerMessage != 0 {
+		t.Errorf("MaxRetriesPerMessage default: got %d want 0 (fileextract pkg default kicks in)", cfg.MaxRetriesPerMessage)
+	}
+	if cfg.TransientBackoffBase != 0 {
+		t.Errorf("TransientBackoffBase default: got %v want 0", cfg.TransientBackoffBase)
+	}
+	if cfg.TransientBackoffMax != 0 {
+		t.Errorf("TransientBackoffMax default: got %v want 0", cfg.TransientBackoffMax)
+	}
+	if len(cfg.AllowedDownloadHosts) != 0 {
+		t.Errorf("AllowedDownloadHosts default: got %v want empty (fileextract pkg default kicks in)", cfg.AllowedDownloadHosts)
+	}
+	if len(cfg.AllowedDownloadSchemes) != 0 {
+		t.Errorf("AllowedDownloadSchemes default: got %v want empty", cfg.AllowedDownloadSchemes)
+	}
+	if cfg.SSRFAllowLoopback {
+		t.Fatal("SSRFAllowLoopback must be false in prod (no env channel)")
+	}
+}
+
+// TestLoadConfig_V113ConfigOverride v1.13 新 env 被读取到 cfg。SSRFAllowLoopback 无论 env
+// 设什么都必须保持 false（生产安全 gate；测试专用只能通过 test cfg 注入）。
+func TestLoadConfig_V113ConfigOverride(t *testing.T) {
+	resetEnv(t)
+	t.Setenv("FILE_EXTRACTOR_ENABLED", "true")
+	t.Setenv("KAFKA_BROKERS", "kafka:9092")
+	t.Setenv("ES_ADDRESSES", "http://os:9200")
+	t.Setenv("EXTRACTOR_MAX_RETRIES_PER_MESSAGE", "5")
+	t.Setenv("EXTRACTOR_TRANSIENT_BACKOFF_BASE_MS", "500")
+	t.Setenv("EXTRACTOR_TRANSIENT_BACKOFF_MAX_MS", "30000")
+	t.Setenv("ALLOWED_DOWNLOAD_HOSTS", "cdn.deepminer.com.cn,internal-cos.example")
+	t.Setenv("ALLOWED_DOWNLOAD_SCHEMES", "https,http")
+	// SSRFAllowLoopback 无 env 通道；设任何 env 都无效
+	t.Setenv("SSRF_ALLOW_LOOPBACK", "true")
+	cfg, _ := loadConfig()
+	if cfg.MaxRetriesPerMessage != 5 {
+		t.Errorf("MaxRetriesPerMessage: got %d want 5", cfg.MaxRetriesPerMessage)
+	}
+	if cfg.TransientBackoffBase != 500*time.Millisecond {
+		t.Errorf("TransientBackoffBase: got %v want 500ms", cfg.TransientBackoffBase)
+	}
+	if cfg.TransientBackoffMax != 30*time.Second {
+		t.Errorf("TransientBackoffMax: got %v want 30s", cfg.TransientBackoffMax)
+	}
+	if len(cfg.AllowedDownloadHosts) != 2 || cfg.AllowedDownloadHosts[0] != "cdn.deepminer.com.cn" || cfg.AllowedDownloadHosts[1] != "internal-cos.example" {
+		t.Errorf("AllowedDownloadHosts: got %v", cfg.AllowedDownloadHosts)
+	}
+	if len(cfg.AllowedDownloadSchemes) != 2 || cfg.AllowedDownloadSchemes[0] != "https" || cfg.AllowedDownloadSchemes[1] != "http" {
+		t.Errorf("AllowedDownloadSchemes: got %v", cfg.AllowedDownloadSchemes)
+	}
+	if cfg.SSRFAllowLoopback {
+		t.Fatal("SSRFAllowLoopback must stay false even when SSRF_ALLOW_LOOPBACK=true env is set (no env channel by design)")
 	}
 }
 

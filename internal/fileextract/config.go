@@ -42,7 +42,28 @@ type ServiceConfig struct {
 	HTTPRetries     int           // CDN GET 重试次数（默认 3，指数退避 1s/2s/4s/8s）
 
 	// 时序竞态防护（v2 §7 #1）：启动时 sleep 缓解首启动瞬间 file-extractor 比
-	// es-indexer 抢先跑到 OS _update 返 404 的窄窗口。稳态竞态由 errDocNotYet + rebalance
-	// 自然重试兜底；Phase 2 备选独立 Kafka retry topic。
+	// es-indexer 抢先跑到 OS _update 返 404 的窄窗口。稳态竞态由 errDocNotYet + in-place
+	// bounded retry 兜底（v1.13 Blocker #2 fix）。
 	ExtractStartupDelay time.Duration
+
+	// v1.13 Blocker #2 fix — in-place bounded retry 参数。
+	// 单条消息 in-place retry 最大次数（默认 10）。达上限 → 强制 DLQ ReasonRetryExhausted
+	// + commit offset，避免 partition 永久阻塞。生产按 OS SLA 与业务延迟容忍度调。
+	MaxRetriesPerMessage int
+	// TransientBackoffBase 是 in-place retry 指数退避基（默认 1s）。第 N 次重试 sleep =
+	// min(Base × 2^(N-1), Max) + 满抖动。SIGTERM 立即返（ctx 感知）。
+	TransientBackoffBase time.Duration
+	// TransientBackoffMax 是单次退避上限（默认 60s），避免指数增长到不可接受延迟。
+	TransientBackoffMax time.Duration
+
+	// v1.13 Blocker #1 fix — SSRF 防护参数。
+	// AllowedDownloadHosts 是 CDN 下载 URL 的 host 白名单（默认 ["cdn.deepminer.com.cn"]）。
+	// URL host 不在此列则 pre-check 拒绝（不下载）。future 切内网 COS 通过 env 扩展。
+	AllowedDownloadHosts []string
+	// AllowedDownloadSchemes 是 URL scheme 白名单（默认 ["https"]）。
+	AllowedDownloadSchemes []string
+	// SSRFAllowLoopback：**仅测试用**，允许 dial 解析到 127.0.0.1 / ::1 loopback IP。
+	// 生产**必须 false**（默认）：loopback 是 SSRF 目标之一（内网服务）。test 场景
+	// httptest.NewServer 走 127.0.0.1 才需打开。
+	SSRFAllowLoopback bool
 }

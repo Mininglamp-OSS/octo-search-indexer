@@ -107,7 +107,9 @@ func TestRateLimiter_Unlimited(t *testing.T) {
 func TestRateLimiter_CtxCancel(t *testing.T) {
 	rl := newRateLimiter(0.1) // 极慢，每 10s 一个令牌
 	// 先消耗初始 burst 让下次 wait 会阻塞
-	_ = rl.Wait(context.Background())
+	if err := rl.Wait(context.Background()); err != nil {
+		t.Fatalf("initial Wait unexpected err: %v", err)
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() { time.Sleep(20 * time.Millisecond); cancel() }()
 	err := rl.Wait(ctx)
@@ -273,7 +275,9 @@ func TestRun_CtxCancelDuringLoop(t *testing.T) {
 	}
 }
 
-// TestRun_CtxDeadlineExceeded ctx timeout 期间 → 优雅退出。
+// TestRun_CtxDeadlineExceeded ctx timeout 期间 → 返 ErrTimeoutIncomplete（v1.13 P2-3）：
+// K8s Job 需要区分 timeout（提前退出，剩余未跑）vs signal-cancel（优雅退出），前者要 exit
+// non-zero 让 operator 知道重跑。
 func TestRun_CtxDeadlineExceeded(t *testing.T) {
 	src := &mockSource{
 		batches: [][]sourceDoc{{mkDoc("1")}},
@@ -281,11 +285,10 @@ func TestRun_CtxDeadlineExceeded(t *testing.T) {
 	}
 	ext := &mockExtractor{}
 	r := NewRunnerWith(src, ext, 0)
-	stats, err := r.Run(context.Background())
-	if err != nil {
-		t.Fatalf("ctx.DeadlineExceeded from source should be graceful, got err=%v", err)
+	_, err := r.Run(context.Background())
+	if !errors.Is(err, ErrTimeoutIncomplete) {
+		t.Fatalf("ctx.DeadlineExceeded must return ErrTimeoutIncomplete (P2-3), got %v", err)
 	}
-	_ = stats
 }
 
 // TestRun_SourceRealError source 返非 ctx 类错 → Run 上抛（K8s Job 退 1）。

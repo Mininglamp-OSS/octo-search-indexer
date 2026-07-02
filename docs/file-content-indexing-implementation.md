@@ -1,15 +1,30 @@
 # File Content Indexing — Implementation Task Book (octo-search-indexer, single PR)
 
-> Author: cc-octo · Date: 2026-07-01 · Status: **v2 sig-off, 开工中**
+> Author: cc-octo · Date: 2026-07-02 · Status: **v3 (v1.13 修复轮完成，push GitHub sig-off 中)**
+>
+> **v3 changelog (2026-07-02, v1.13 修复轮，同步 4 修复 commit 架构变更)**：
+> 1. **§2 IDX-4 processBatch 语义换血**：老 for-loop（一条 err 上抛 → 后续 message commit 越过 → silent skip / data loss）→ **in-place bounded retry state machine**（`dispositions` 三态 + `attemptOne` 4-outcome + `partitionCommitPoints` 多分区独立前缀聚合），照抄 `internal/consumer::processBatch` 模式；`MaxRetriesPerMessage=10` + backoff 1s→60s（指数 + 满抖动 + ctx-cancel 感知），达上限 → 强制 DLQ `retry_exhausted`（Blocker #2 修复）
+> 2. **§2 IDX-4 oswriter.classifyOSErr 加 `429 → errOSTransient`**：老代码走 `status >= 400` catch-all 误归 `errOSPermanent`，429 是 OS 限流是 transient 语义，与 download.go CDN 429 处理对齐（P2-1 修复）
+> 3. **§2 IDX-4 attemptOne 加 `errors.Is(err, errOSPermanent) → DLQ ReasonOSPermanent`**：老代码所有 OS 错都上抛无 DLQ 路径，与 Blocker #2 silent skip 叠加造成 4xx 永久错误也被永久丢（P2-2 修复）
+> 4. **§2 IDX-3 dlq.go DLQ reason 从 8 种扩到 10 种**：新增 `retry_exhausted` + `os_permanent`（Blocker #2 + P2-2 修复引入）
+> 5. **§2 IDX-4 download.go 新增 SSRF 双闸门**：URL 前置 `validateURL`（scheme + host allowlist，默认只 `https` + `cdn.deepminer.com.cn`）+ `ssrfRestrictedDialer`（dial 时拒 private/link-local/loopback/metadata/CGNAT/IPv6-ULA IP）+ `ssrfCheckRedirect`（防 redirect 跳板绕过），代码位于新增 `internal/fileextract/ssrf.go`（Blocker #1 修复）
+> 6. **§2 IDX-4 tika.go timeout 从 `http.Client.Timeout` 换成 per-request `context.WithTimeout`**：老代码 client-level timeout 与 ctx 独立，触发时 `ctx.Err()=nil` 被误分类 `errExtractGeneric`；改用 ctx 驱动后正确区分 per-request timeout（`errExtractTimeout`）vs parent cancel（`context.Canceled`）（P2-9 修复）
+> 7. **§2 IDX-2 `FileContentMeta.Truncated` 从 `bool` 改成 `*bool`**：老 `bool + omitempty` 无法把 stale `true` 清成 `false`（partial `_update` 语义下 field 缺失 = OS 保留旧值），指针可显式序列化 `false`（P2-5 修复）
+> 8. **§5 回滚方案新增 §5.4 部署顺序**：**es-indexer 升级（含 script update）必须先于 file-extractor 上线**——否则老 es-indexer 用 `_bulk index` 会覆盖 file-extractor 通过 partial `_update` 写的 `payload.file.content` + `contentMeta`（Blocker #3 修复引入依赖）；配套 v1.12 mapping 已在 2026-06-27 上线，不需要再 PUT
+> 9. **§7 未决问题 #1 反转**：v2 "MVP 走 5s delay + Kafka rebalance 自然重试"**被 reviewer 反驳且方案已换**（kafka-go `FetchMessage` 在 fetch 时 `r.offset++`，err 上抛不 commit → reader 已 advance → silent skip 而非 rebalance 重取）；改为 §7 #1' "in-place bounded retry state machine"，Phase 2 独立 retry topic 仍作为规模扩展方案备选
+> 10. **§10 交付清单新增 v1.13 修复轮完成事实**：3 blocker + 10 P2 + CI Lint 16 issues 已修，37 新 test 全绿，5 commit ahead of origin/main（未 push）；具体 diff 见姊妹文档 [`docs/file-content-indexing-fix-plan.md`](./file-content-indexing-fix-plan.md)
 >
 > **v2 changelog (2026-07-01, 集成 Max review 4 条 + 主人授权)**：
-> 1. §7 未决问题 #1（file-extractor vs es-indexer 竞态）：MVP 走 5s delay + Kafka rebalance 自然重试；独立 retry topic 作为 phase 2 备选
+> 1. §7 未决问题 #1（file-extractor vs es-indexer 竞态）：MVP 走 5s delay + Kafka rebalance 自然重试；独立 retry topic 作为 phase 2 备选 → **v3 反转，见 v3 changelog #9**
 > 2. §6.2 test 环境提前起 Tika sidecar 改为**硬要求**（不是 optional）
 > 3. §5 mapping 不可逆警告嵌入 IDX-1 commit message + PR description 顶部
 > 4. §8 估时 IDX-4 5h→**8-10h**，总估 11h→**13-15h ≈ 2 工作日**；timebox IDX-4 开发超 6h / 测试超 4h 回来对齐
-> Repo scope: **`Mininglamp-OSS/octo-search-indexer`** 单仓单 PR，5 commit 串行
-> 依赖文档: [feasibility v2](./file-content-indexing-feasibility.md) + [tool-comparison](./file-extractor-tool-comparison.md)
+>
+> Repo scope: **`Mininglamp-OSS/octo-search-indexer`** 单仓单 PR，5 commit 串行（v2 计划）+ **v1.13 修复轮追加 4 commit**（Blocker #1/#2/#3 + P2 cleanup，见 `fix-plan.md` §4）
+> 依赖文档: [feasibility v2](./file-content-indexing-feasibility.md) + [tool-comparison](./file-extractor-tool-comparison.md) + [fix-plan v1.13](./file-content-indexing-fix-plan.md)（v1.13 修复轮方案文档）
 > **不在本任务书范围**：octo-server 的 `search_files.go / search_all.go` 改动（独立 PR，独立仓库）；deploy YAML（在 codex `dmwork/octo-search-indexer` manifests/ 下，独立 OPS-1/OPS-2 任务）
+>
+> **📌 v3 阅读指引**：本任务书保留 v2 IDX-1→IDX-5 commit 拆分**任务书视角**（保留原开发计划与 review 追溯价值）；v1.13 修复轮以 4 commit 追加分支尾部，**代码层面**的差异见 `fix-plan.md`。任务书内所有 v3 修订处**明确标注**修复轮变化，与原 v2 任务描述并存不覆盖，便于对比历史决策。
 
 ---
 
@@ -165,10 +180,19 @@ feat: file content indexing (payload.file.content + file-extractor + backfill)
   type FileContentMeta struct {
       ExtractedAt int64  `json:"extractedAt,omitempty"` // 抽取时刻 (epoch seconds)
       Extractor   string `json:"extractor,omitempty"`   // "tika/3.3.0" 之类
-      Truncated   bool   `json:"truncated,omitempty"`   // content 是否被截到 256KB
+      Truncated   bool   `json:"truncated,omitempty"`   // content 是否被截到 256KB（v2 版；v3 已改 *bool）
       ExtractMs   int64  `json:"extractMs,omitempty"`   // Tika 抽取耗时 (毫秒)
   }
   ```
+
+> **⚠️ v3 (v1.13 修复轮 P2-5)**：`Truncated` 字段从 `bool` 改为 `*bool`（生产代码）：
+>
+> ```go
+> // v3 生产版：*bool 允许 partial _update 显式序列化 false，把 stale true 清除
+> Truncated   *bool  `json:"truncated,omitempty"`
+> ```
+>
+> **原因**：老 `bool + omitempty` 语义下 zero-value(`false`) 会被 omitempty 剪掉 → partial `_update` body 里没这个字段 → OS 保留旧值（如果之前是 `true` 不会被清成 `false`）。改 `*bool` + 显式 `boolPtr(false)` 后可以正常清除 stale 值。`extractor.go` 构造改为 `meta.Truncated = &truncated`。回归 test `TestFileContentMeta_TruncatedFalseSerializes` 断言 `{"truncated":false}` 显式落盘。
 
 **修改**：`internal/esindex/mapping_compat.go`
 - `requiredMappingFieldPaths` 加两条新字段路径（第 29-40 行）：
@@ -356,7 +380,7 @@ func (p *Processor) processBatch(ctx context.Context, batch []fetchedMessage) er
 
 **`internal/fileextract/dlq.go`** (~180 行，简化版 `internal/consumer/dlq.go`)
 - `dlqRecord` struct，含字段：`Reason / MessageID / Topic / Partition / Offset / URL / DetailErr / SpilledAt`
-- `DLQReason` 枚举常量（本 commit 定义齐 8 种，触发点在 IDX-4 补）：
+- `DLQReason` 枚举常量（本 commit 定义齐 8 种，触发点在 IDX-4 补；**v3: v1.13 修复轮追加 2 种，合计 10 种**）：
   ```go
   const (
       ReasonParseError    = "parse_error"       // Kafka 消息解不出 searchmsg
@@ -367,6 +391,9 @@ func (p *Processor) processBatch(ctx context.Context, batch []fetchedMessage) er
       ReasonEncrypted     = "encrypted"         // Tika EncryptedDocumentException
       ReasonEmptyExtract  = "empty_extract"     // 抽出空串
       ReasonExtractError  = "extract_error"     // 其他 Tika 异常
+      // === v3 (v1.13 修复轮) 新增 ===
+      ReasonRetryExhausted = "retry_exhausted"  // in-place bounded retry N 次未成功（Blocker #2）
+      ReasonOSPermanent    = "os_permanent"     // OS 写返 4xx (非 404/409/429) permanent (P2-2)
   )
   ```
 - 带 base64-膨胀 aware 的 value 截断阈值（复用 consumer/dlq.go 常量 700_000）
@@ -446,6 +473,19 @@ func (d *downloadClient) Fetch(ctx context.Context, url string) ([]byte, string,
 }
 ```
 
+> **🔴 v3 (v1.13 修复轮 Blocker #1 SSRF)**：download.go 入口 + Transport 层新增 **SSRF 双闸门**（v2 骨架未覆盖，reviewer 发现后修）：
+>
+> - **闸门 1 (`validateURL`)**：Fetch 入口前置校验 `url.Scheme` ∈ `AllowedDownloadSchemes`（默认 `["https"]`）+ `url.Hostname()` ∈ `AllowedDownloadHosts`（默认 `["cdn.deepminer.com.cn"]`）；不匹配立即返 `errDownloadFailed`（不重试，URL 不变重试无意义）
+> - **闸门 2 (`ssrfRestrictedDialer`)**：`http.Transport.DialContext` 挂 IP 校验层，resolve 后拒 private/link-local/loopback/metadata（`169.254.169.254`）/CGNAT `100.64/10`/IPv6 ULA `fc00::/7`；解析后**直接 dial 到 pinned IP** 避免 TOCTOU DNS rebinding
+> - **闸门 3 (`ssrfCheckRedirect`)**：`http.Client.CheckRedirect` hook，redirect 时重跑闸门 1，防跳板攻击（第一跳合法 → 302 到 metadata IP）
+> - **`SSRFAllowLoopback bool` cfg 字段**：**test-only** 开关，允许 httptest.NewServer 走 127.0.0.1；生产**必须 false**
+> - **cfg 新增字段**：`AllowedDownloadHosts` / `AllowedDownloadSchemes` / `SSRFAllowLoopback`；env `ALLOWED_DOWNLOAD_HOSTS` / `ALLOWED_DOWNLOAD_SCHEMES` future 扩展（切内网 COS 时）
+> - **不新增 DLQ reason**：SSRF 拦截走现有 `download_failed`（"下载被拒"语义已足够）
+>
+> 具体 diff + 14 条回归 test（含 metadata IP dialer 拒 / redirect 跳板拒 / IPv6 ULA / CGNAT 全网段覆盖）见 [`fix-plan.md` §2.1](./file-content-indexing-fix-plan.md#21-blocker-1--ssrf-防护max-判断) + `internal/fileextract/ssrf.go` + `ssrf_test.go`。
+
+> **⚠️ v3 (v1.13 修复轮 P2-6)**：download.go `tryFetch` 遇 4xx 返回的错从字符串 `"cdn permanent status <N>"` 改为 sentinel `errCDNPermanent`（`errors.Is` 分类）；`isPermanentDownloadErr` 改用 `errors.Is(err, errCDNPermanent)`，不再依赖 err.Error() 字符串（重构风险）。
+
 **`internal/fileextract/tika.go`** (~120 行)
 ```go
 package fileextract
@@ -480,6 +520,15 @@ func newTikaClient(cfg ServiceConfig) *tikaClient { /* http.Client{ Timeout: cfg
 //   - 抽出 > maxContentBytes → 截断 + truncated=true
 func (t *tikaClient) Extract(ctx context.Context, fileBytes []byte, filename string) (content string, truncated bool, err error)
 ```
+
+> **⚠️ v3 (v1.13 修复轮 tika.go 修订汇总)**：
+>
+> - **P2-9 timeout ctx-driven**：`newTikaClient` 去掉 `http.Client{Timeout: cfg.ExtractTimeout}`（client-level timeout 与 ctx 独立，触发时 `ctx.Err()==nil` 被误分类 `errExtractGeneric`）；`Extract` 内改用 `perReqCtx, cancel := context.WithTimeout(ctx, t.timeout); defer cancel()` 驱动，err 分类改为 `errors.Is(perReqCtx.Err(), context.DeadlineExceeded) → errExtractTimeout`，同时判 `parentCtx.Err() != nil` 上抛（区分 SIGTERM 优雅退出 vs per-req 超时）
+> - **P2-4 unbounded read**：`io.ReadAll(resp.Body)` 加 `io.LimitReader(resp.Body, int64(t.maxContentBytes)+4)`，避免 Tika 谎报 body 大小时 OOM
+> - **P2-7 whitespace empty_extract**：`extractor.go` 上层判 `content == ""` 改为 `strings.TrimSpace(content) == ""`，scanned/empty PDF 常返 `"\n\n"` 类空白也归 `empty_extract`（老代码放行 → 无意义 doc 被误 commit）
+> - **P2-4 defer errcheck**：`defer resp.Body.Close()` 改 `defer func() { _ = resp.Body.Close() }()` 通过 CI Lint errcheck
+>
+> 具体 diff 见 [`fix-plan.md` §3](./file-content-indexing-fix-plan.md#3-p2-修复清单10-条) 表 P2-4/P2-7/P2-9。
 
 **`internal/fileextract/oswriter.go`** (~150 行)
 ```go
@@ -535,9 +584,98 @@ func (w *osWriter) UpdateContent(ctx context.Context, messageID string, content 
 }
 ```
 
+> **⚠️ v3 (v1.13 修复轮 P2-1)**：`classifyOSStatus`/`classifyOSErr` 必须**显式在 `>= 400` catch-all 之前拦下 `429`** 归 `errOSTransient`（否则 429 被误归 permanent 与 Blocker #2 silent skip 叠加造成 4xx 永久丢消息）。生产代码为 `case status == http.StatusTooManyRequests: return errOSTransient`，位置在 404 分支之后 / 500 分支之前，与 `download.go:117` CDN 429 处理对齐。
+
 **修改**：`internal/fileextract/service.go` — 加 downloadClient / tikaClient / osWriter 装配
 
-**修改**：`internal/fileextract/consumer.go::processBatch` — 把 IDX-3 stub 换成真实抽取流程：
+**修改**：`internal/fileextract/consumer.go::processBatch` — 把 IDX-3 stub 换成真实抽取流程。
+
+> **🔴 v3 (v1.13 修复轮 Blocker #2)**：下方**朴素 for-loop** 版本存在 **silent skip / data loss** 缺陷（kafka-go `FetchMessage` 在 fetch 时 `r.offset = m.message.Offset + 1`，err 上抛不 commit 后 reader 已本地 advance，后续 message commit 越过前面的失败 offset → 永久丢消息，非 rebalance 重取）。**生产代码已替换为 in-place bounded retry state machine**（照抄 `internal/consumer::processBatch`），核心结构：
+>
+> ```go
+> // v3 生产版：dispositions 三态 state machine + attemptOne 4-outcome + partitionCommitPoints
+> // 详见 internal/fileextract/{consumer.go,decision.go,backoff.go}，此处仅列关键骨架。
+> type itemDisposition int
+> const (
+>     dispTransient itemDisposition = iota  // 未终态，需继续 retry
+>     dispOK                                // 抽取 + OS 写成功
+>     dispDLQResolved                       // 已落 DLQ 终态
+> )
+>
+> type attemptOutcome int
+> const (
+>     outcomeOK        attemptOutcome = iota  // 成功
+>     outcomeDLQ                              // 已落 DLQ（永久失败）
+>     outcomeTransient                        // 需 caller 重试
+>     outcomeFatal                            // DLQ 写自身失败 → 硬停
+> )
+>
+> func (p *Processor) processBatch(ctx context.Context, batch []fetchedMessage) error {
+>     n := len(batch)
+>     dispositions := make([]itemDisposition, n)
+>     attempts := make([]int, n)  // 每条独立 attempt 计数
+>     for i := range dispositions { dispositions[i] = dispTransient }
+>
+>     for {  // 循环直到全部条目终态
+>         if err := ctx.Err(); err != nil { return err }
+>         changed := false
+>         for i, m := range batch {
+>             if dispositions[i] != dispTransient { continue }
+>             // 达上限 → 强制 DLQ retry_exhausted，避免 partition 永久阻塞
+>             if attempts[i] >= p.cfg.MaxRetriesPerMessage {
+>                 if werr := p.writeDLQ(ctx, m, ReasonRetryExhausted, ...); werr != nil { return werr }
+>                 dispositions[i] = dispDLQResolved
+>                 changed = true; continue
+>             }
+>             // 退避（attempts[i]>0 才 sleep；ctx 感知）
+>             if attempts[i] > 0 {
+>                 if serr := p.sleep(ctx, expJitterBackoff(base, max, attempts[i])); serr != nil { return serr }
+>             }
+>             outcome, err := p.attemptOne(ctx, m)  // 单次尝试
+>             attempts[i]++
+>             switch outcome {
+>             case outcomeOK:        dispositions[i] = dispOK;          changed = true
+>             case outcomeDLQ:       dispositions[i] = dispDLQResolved; changed = true
+>             case outcomeTransient: /* 保持 transient，下轮再试 */
+>             case outcomeFatal:     return err  // DLQ 写失败 → 硬停
+>             }
+>         }
+>         if changed {
+>             // 按分区推进"连续成功前缀"commit（多分区独立，见 partitionCommitPoints）
+>             for _, point := range partitionCommitPoints(batch, dispositions) {
+>                 if err := p.source.Commit(ctx, point); err != nil { return err }
+>             }
+>         }
+>         if !hasTransient(dispositions) { return nil }  // 全终态
+>     }
+> }
+>
+> // attemptOne：把 v2 processBatch 里的抽取流程封装成单次尝试，返 4-outcome
+> func (p *Processor) attemptOne(ctx context.Context, m fetchedMessage) (attemptOutcome, error) {
+>     // ... parse / non-file skip / ExtractAndWrite ...
+>     if errors.Is(err, errOSPermanent) {  // v3 P2-2：OS 4xx → DLQ os_permanent 不重试
+>         if werr := p.writeDLQ(ctx, m, ReasonOSPermanent, ...); werr != nil {
+>             return outcomeFatal, werr
+>         }
+>         return outcomeDLQ, nil
+>     }
+>     if errors.Is(err, errDocNotYet) { /* p.metrics.IncDocNotYet() */ }
+>     // errDocNotYet / errOSTransient / 其他 transient 错 → 交给 state machine 重试
+>     return outcomeTransient, nil
+> }
+> ```
+>
+> **配套新增文件**（生产代码分层）：
+> - `internal/fileextract/decision.go` — `itemDisposition` 三态 + `hasTransient` + `partitionCommitPoints`（照抄 `internal/consumer::partitionCommitPoints`，多分区独立推进前缀，杜绝跨分区 commit 越过 transient）
+> - `internal/fileextract/backoff.go` — `expJitterBackoff(base, max, attempt)` + `sleepCtx(ctx, d)`（参数化 max，允许 cfg 覆盖默认 60s 上限）
+>
+> **配套 config 新增字段**：`MaxRetriesPerMessage` (默认 10) / `TransientBackoffBase` (默认 1s) / `TransientBackoffMax` (默认 60s)。
+>
+> **配套 extractorService interface**：`Processor.extractor` 从 `*Extractor` 换成 interface `extractorService{ExtractAndWrite(...)}`，生产传 `*Extractor`，测试注入 mock。
+>
+> 详细 diff + 11 条回归 test（含 Jerry-Xin 建议的 offset 100/101/102 场景 + 多分区独立推进场景）见 [`fix-plan.md` §2.2](./file-content-indexing-fix-plan.md#22-blocker-2--consumer-数据丢失主人拍板方案-a) + `internal/fileextract/retry_test.go`。
+
+**（以下为 v2 老版 for-loop 骨架，仅供 review 追溯原设计意图，非生产代码）**：
 ```go
 if contentType == payloadTypeFile {
     payload := extractFilePayload(msg.RawPayload)  // 从 raw 取 url/name/ext/size
@@ -852,13 +990,38 @@ OpenSearch 3.x mapping 新增字段是**不可逆操作**：
 
 **结论**：mapping 变更是**一次性单向决策**。IDX-1 里 commit message + PR description 显式警告这一点，主人拍板前确认。
 
+### 5.4 部署顺序（v3 新增，v1.13 修复轮 Blocker #3 引入依赖）
+
+🔴 **v1.13 修复轮 Blocker #3 (es-indexer scripted_upsert) 引入**：**es-indexer 升级（含 script update）必须先于 file-extractor 上线**。
+
+**原因**：
+- Blocker #3 修复前，es-indexer 用 `_bulk index` full-replace 写主 doc → 每次 redeliver（rebalance/restart/retry）会覆盖 file-extractor 通过 partial `_update` 写的 `payload.file.content` + `contentMeta`
+- Blocker #3 修复后，es-indexer 改用 `_bulk update` + `scripted_upsert` + Painless 保留 `preservedFilePaths` 里的字段（`payload.file.content` + `contentMeta`），redeliver 时不再覆盖
+
+**test 环境正确顺序**：
+```
+Step 0  |  确认 mapping v1.12 已在 test（现状已上线，2026-06-27）
+Step 1  |  es-indexer 升级 test（含 Commit 11 script update）→ 观察 ≥ 1 天
+        |  · gating：DLQ 无暴增 / OS 5xx 率 < 0.1% / p99 latency 复测 script vs index 差异
+Step 2  |  file-extractor 首次 apply test（含 Commit 12/13/14）→ 观察 ≥ 3 天
+        |  · gating：抽取成功率 / DLQ 分布 / 无 SSRF 拦截误报 / OS content 字段抽验
+Step 3  |  ✅ → prod 部署同顺序
+```
+
+**prod 环境顺序**：同 test 顺序（mapping v1.12 已 2026-06-27 上线，从 Step 1 开始）；prod reader 已在 2026-06-29 接入 v1.7.1。
+
+**若 es-indexer 后于 file-extractor 上线**：老 es-indexer 会覆盖 file-extractor 写的 content → Blocker #3 修复失效 → 触发原 bug。
+
+**回滚触发条件 + 步骤**：见 [`fix-plan.md` §7](./file-content-indexing-fix-plan.md#7-部署顺序合并后)。
+
 ---
 
 ## §6 Max 需要在 PR review 前做的事
 
 ### 6.1 IDX-1 前
 - ✅ **已完成**：主人决策 #2 已拍板"改 mapping.json 但不 PUT"
-- **待做**：跟 OS admin 提前打招呼，说明 test 环境 mapping PUT 计划（IDX-1 PR merge 后择时 apply）— 走 tech-deploy.md 里改 OS mapping 的红线路径
+- ✅ **v3 已完成**：mapping v1.12 已在 test 与 prod 上线（2026-06-27），本 PR 不需要再 PUT mapping
+- **待做**：跟 OS admin 提前打招呼，说明 test 环境 mapping PUT 计划（IDX-1 PR merge 后择时 apply）— 走 tech-deploy.md 里改 OS mapping 的红线路径 → **v3 备注**：v1.12 mapping 已 2026-06-27 完成 PUT，本条待做项失效
 
 ### 6.2 IDX-4 前
 - **🔴 硬要求（Max review v2 §2）**：test 环境**必须**预先起 Tika sidecar Deploy（`apache/tika:3.3.0.0` minimal 镜像 165MB 压缩），不是 optional。理由：dmwork/local-dev-stack 缺 tika，本地 compose 30-60min 不划算；file-extractor 是新服务部到 test 环境抽真实文件更贴近生产。IDX-4 dev cycle = 本地跑单测 + push test 分支镜像跑 e2e。**由 Max 负责在 IDX-4 开发前起好 Tika Deploy**。
@@ -890,7 +1053,19 @@ OpenSearch 3.x mapping 新增字段是**不可逆操作**：
 
 ## §7 (b) 设计时发现的技术风险 / 未决问题（比 v2 更实施层）
 
-1. **file-extractor 与 es-indexer 时序竞态**（IDX-4 §3.3 已讨论）— 新消息进 Kafka 后，file-extractor 可能比 es-indexer 先抽完 → OS `_update` 返 404。**MVP 策略（v2 收敛）**：`errDocNotYet` 触发本批 Kafka rebalance 自然重试 + IDX-4 加 `EXTRACT_STARTUP_DELAY_SECONDS=5` config 缓解启动瞬间竞态。**局限**：只治启动瞬间，稳态下 es-indexer 重启 30s 依然会撞 404。**Phase 2 备选方案**（观察 prod DLQ `errDocNotYet` 触发率超阈值后启用）：塞独立 Kafka retry topic `octo.message.v1.file-extract.retry{,.prod}`，5s 后重放 — 需要多一个 topic + 消费逻辑，MVP 不做。
+1. ~~**file-extractor 与 es-indexer 时序竞态**（IDX-4 §3.3 已讨论）— 新消息进 Kafka 后，file-extractor 可能比 es-indexer 先抽完 → OS `_update` 返 404。**MVP 策略（v2 收敛）**：`errDocNotYet` 触发本批 Kafka rebalance 自然重试 + IDX-4 加 `EXTRACT_STARTUP_DELAY_SECONDS=5` config 缓解启动瞬间竞态。**局限**：只治启动瞬间，稳态下 es-indexer 重启 30s 依然会撞 404。**Phase 2 备选方案**（观察 prod DLQ `errDocNotYet` 触发率超阈值后启用）：塞独立 Kafka retry topic `octo.message.v1.file-extract.retry{,.prod}`，5s 后重放 — 需要多一个 topic + 消费逻辑，MVP 不做。~~
+
+**🔴 v3 (v1.13 修复轮 Blocker #2) 反转**：v2 "MVP 走 5s delay + Kafka rebalance 自然重试" **被 reviewer 反驳且方案已换**。
+
+- **反驳依据**（yujiawei review + `comment-0` 校正）：kafka-go `Reader.FetchMessage` 在 fetch 时执行 `r.offset = m.message.Offset + 1`（reader.go 源码），err 上抛不 commit 后 reader **已经本地 advance**，没有 seek-back 语义。下一 `FetchMessage` 拿的是**下一 offset**，前面失败的 offset 一旦下一条成功 commit 就被 kafka group 高水位**永久越过** → **silent skip / data loss**，不是"rebalance 重取"。
+- **v3 新方案**：**in-place bounded retry state machine**（照抄 `internal/consumer::processBatch` 模式，见本文档 v3 §2 IDX-4 processBatch 段）
+  - `dispositions` 三态 + `attemptOne` 4-outcome
+  - `MaxRetriesPerMessage=10` + backoff 1s→60s（指数 + 满抖动 + ctx-cancel 感知）
+  - 达上限 → 强制 DLQ `retry_exhausted`（避免 partition 永久阻塞）
+  - `partitionCommitPoints` 每分区独立推进"连续可越过前缀"，杜绝跨分区 commit 越过 transient
+- **`ExtractStartupDelay` 语义保留**：仍作为启动瞬间竞态的**兜底缓解**（sleep 5s 让 es-indexer 抢先跑），稳态竞态由 in-place retry 兜底
+- **Phase 2 备选 (independent retry topic)**：仍作为**规模扩展**方案备选（如果 in-place retry 长期占用 partition slot 影响吞吐，可改成 in-place retry N 次不成功 → 塞 retry topic 而非 DLQ retry_exhausted）；MVP v1.13 不做
+- **回归测试**：11 条覆盖 offset 100/101/102 skip 场景、多分区独立推进、429 transient、errOSPermanent DLQ、retry_exhausted DLQ 等；见 `internal/fileextract/retry_test.go`
 
 2. **Tika HTTP 500 body 解析脆弱性**（IDX-4 已讨论）— 用字符串 contains "EncryptedDocumentException" 区分错误类型。**风险**：Tika 版本升级/patch 改 body 格式 → 判断失效 → 所有 encrypted 文件被误判为 extract_error → DLQ reason 统计失真。**缓解**：IDX-4 单测里用真实 Tika 3.3.0 采样 body 字符串锁死；升 Tika 版本时同步 review
 
@@ -939,3 +1114,26 @@ OpenSearch 3.x mapping 新增字段是**不可逆操作**：
 - (d) 动工前信息缺口：§9 无阻塞项，3 条建议项
 
 **待 Max review 通过后**，按 IDX-1→IDX-5 顺序开工，每 commit 单测通过再进下一步。**全部 5 commit 完成 + 本地 e2e 跑通后再 push GitHub**（主人已拍板）。
+
+---
+
+### §10.v3 v1.13 修复轮完成事实（2026-07-02 追加）
+
+v2 IDX-1→IDX-5 5 commit 于 2026-07-01 本地完成 + 首推 PR #46 于 2026-07-02 收到 4 位 reviewer CHANGES_REQUESTED，v1.13 修复轮追加 4 commit：
+
+- **fix-plan 文档**：`docs/file-content-indexing-fix-plan.md`（796 行 / 49KB，2026-07-02 主人 sig-off + Max review 5 点判断落档）
+- **修复轮 commit（未 push）**：
+  ```
+  2f973f0 fix: P2 cleanup + CI lint (Tika/backfill/mapping-compat/sentinel/errcheck)
+  0b754aa fix(file-extractor): SSRF host allowlist + private-IP block (Blocker #1)
+  51a7e25 fix(file-extractor): in-place bounded retry + DLQ 429/permanent (Blocker #2 + P2-1 + P2-2)
+  2535448 fix(esindex): scripted_upsert to preserve file-extractor written fields (Blocker #3)
+  ```
+- **修复覆盖**：
+  - 3 blocker（Blocker #1 SSRF / Blocker #2 in-place retry / Blocker #3 script update）
+  - 10 P2（429 分类 / errOSPermanent DLQ / backfill timeout vs signal / Tika LimitReader / Truncated *bool / sentinel err / whitespace empty_extract / backfill scroll retry / Tika ctx timeout / file-extractor mapping-compat）
+  - CI Lint 16 issues（15 errcheck + 1 staticcheck）
+- **新增 test**：37 条（Blocker #3 7 + Blocker #2 10 + Blocker #1 14 + P2 5 + P2-5 增补 1）；`go vet + build + test + test -race` 15 package 全绿
+- **分支状态**：`feat/file-content-indexing` 5 commits ahead of `origin/main`（1 原 feature + 4 修复），未 push；等主人 push sig-off → 走 squash + push PR
+
+**代码层详细 diff**：见 `docs/file-content-indexing-fix-plan.md` §2 (blocker 详解) + §3 (10 P2 表) + §6 (CI Lint) + §7 (部署顺序)。

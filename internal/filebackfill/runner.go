@@ -12,6 +12,17 @@ import (
 	"github.com/Mininglamp-OSS/octo-search-indexer/internal/fileextract"
 )
 
+// ErrTimeoutIncomplete 是 Run 因 top-level context.DeadlineExceeded 提前退出的 sentinel
+// （v1.13 P2-3）。K8s Job 用它区分"正常 EOF"（return nil）与"timeout 剩余未跑"（return err，
+// exit non-zero → operator 得知需要重跑）。SIGTERM 触发的 context.Canceled 仍返 nil（优雅退出）。
+var ErrTimeoutIncomplete = errors.New("filebackfill: run timed out before scroll EOF (incomplete)")
+
+// scrollRetryConfig 是 P2-8：scroll source.Next 出 transient 错时的 in-place backoff retry 参数。
+const (
+	scrollMaxRetries = 3
+	scrollBackoffMin = 500 * time.Millisecond
+)
+
 // batchSource 是 Runner 依赖的 scroll source 抽象（便于测试注入 mock）。
 type batchSource interface {
 	Next(ctx context.Context) ([]sourceDoc, error)
@@ -79,8 +90,10 @@ func NewRunnerWith(src batchSource, ext docExtractor, rate float64) *Runner {
 // Run 主循环：拉一批 → 逐条限速抽取 → 累计 stats → 直到 EOF / ctx 取消 / timeout。
 // 返回汇总 stats（K8s Job 用 stats.OSTransient/DLQ 判退出码）。
 //
-// ctx.Canceled / DeadlineExceeded 视为优雅退出（返 nil err），不当运行错误 —— K8s SIGTERM
-// 场景不应触发退出码 1 + 错误日志误报。真正的 source 错误（如 OS 5xx）仍然上抛。
+// v1.13 P2-3：区分 ctx.Canceled（signal 优雅退出，nil）与 ctx.DeadlineExceeded（timeout
+// 提前退出，ErrTimeoutIncomplete）。老代码把两者都当 graceful → K8s Job exit 0 但实际未跑完，
+// 掩盖需要重跑的信号。
+// v1.13 P2-8：source.Next 出 transient 错时 bounded backoff retry，避免长跑 job 因单次 blip 中断。
 func (r *Runner) Run(ctx context.Context) (Stats, error) {
 	var stats Stats
 	lastLog := time.Now()
@@ -92,15 +105,22 @@ func (r *Runner) Run(ctx context.Context) (Stats, error) {
 			stats.Scanned, stats.Extracted, stats.DLQ, stats.Skipped, stats.OSTransient)
 	}()
 	for {
+		// P2-3：判 ctx 类型，把 DeadlineExceeded 与 Canceled 分开返
 		if err := ctx.Err(); err != nil {
-			return stats, nil
+			if errors.Is(err, context.DeadlineExceeded) {
+				return stats, ErrTimeoutIncomplete
+			}
+			return stats, nil // Canceled = SIGTERM 优雅退出
 		}
-		batch, err := r.source.Next(ctx)
+		batch, err := r.nextWithRetry(ctx)
 		if errors.Is(err, io.EOF) {
+			return stats, nil // 正常 EOF
+		}
+		if errors.Is(err, context.Canceled) {
 			return stats, nil
 		}
-		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-			return stats, nil
+		if errors.Is(err, context.DeadlineExceeded) {
+			return stats, ErrTimeoutIncomplete
 		}
 		if err != nil {
 			return stats, err
@@ -109,7 +129,11 @@ func (r *Runner) Run(ctx context.Context) (Stats, error) {
 			stats.Scanned++
 			if err := r.limiter.Wait(ctx); err != nil {
 				stats.Skipped++
-				return stats, nil // ctx 取消，优雅退出
+				// P2-3 一致：limiter Wait 因 ctx 取消退出，判类型
+				if errors.Is(err, context.DeadlineExceeded) {
+					return stats, ErrTimeoutIncomplete
+				}
+				return stats, nil
 			}
 			r.processOne(ctx, doc, &stats)
 			if time.Since(lastLog) > r.progress {
@@ -119,6 +143,36 @@ func (r *Runner) Run(ctx context.Context) (Stats, error) {
 			}
 		}
 	}
+}
+
+// nextWithRetry 包装 source.Next 加 bounded backoff retry（P2-8）。
+//   - EOF / ctx err → 直接返（上层处理）
+//   - transient err（非 EOF / 非 ctx）→ retry with backoff，共 scrollMaxRetries 次
+//   - 重试耗尽 → 返最后一次 err（上层视为 fatal）
+//
+// scroll 查询本身是幂等的（same query 每次返 same page），故 retry 安全。
+func (r *Runner) nextWithRetry(ctx context.Context) ([]sourceDoc, error) {
+	var lastErr error
+	for attempt := 0; attempt <= scrollMaxRetries; attempt++ {
+		if attempt > 0 {
+			wait := scrollBackoffMin * time.Duration(1<<(attempt-1)) // 500ms/1s/2s/4s
+			select {
+			case <-time.After(wait):
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}
+		batch, err := r.source.Next(ctx)
+		if err == nil {
+			return batch, nil
+		}
+		if errors.Is(err, io.EOF) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return nil, err
+		}
+		lastErr = err
+		log.Printf("filebackfill: source.Next transient err (attempt %d/%d): %v", attempt+1, scrollMaxRetries+1, err)
+	}
+	return nil, lastErr
 }
 
 // processOne 抽取一条 → 更新 stats（不 return err，让 Job 继续跑）。

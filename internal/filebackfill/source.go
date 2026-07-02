@@ -141,8 +141,11 @@ func (s *osScrollSource) continueScroll(ctx context.Context) ([]sourceDoc, error
 	if err != nil {
 		return nil, fmt.Errorf("filebackfill: continue scroll: %w", err)
 	}
-	defer resp.Body.Close()
-	raw, _ := io.ReadAll(resp.Body)
+	defer func() { _ = resp.Body.Close() }() //nolint:errcheck // close-on-read: nothing to do with close err
+	raw, readErr := io.ReadAll(resp.Body)
+	if readErr != nil {
+		return nil, fmt.Errorf("filebackfill: continue scroll read body: %w", readErr)
+	}
 	if resp.StatusCode >= 400 {
 		return nil, fmt.Errorf("filebackfill: continue scroll status %d: %s", resp.StatusCode, string(raw))
 	}
@@ -225,7 +228,11 @@ func (s *osScrollSource) Close(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	_, _ = s.client.Client.Perform(req.WithContext(ctx))
+	// Close scroll 是尽力操作（scroll ctx 会自动过期），错误只 log 不阻断。
+	if _, perr := s.client.Client.Perform(req.WithContext(ctx)); perr != nil {
+		// intentional: 忽略 close 失败（scroll 后 5 min 自动 GC）；不返 err 以免 Runner defer 报误。
+		_ = perr
+	}
 	return nil
 }
 
