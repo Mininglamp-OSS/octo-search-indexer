@@ -49,6 +49,35 @@ func firstNonZero(a, b int64) int64 {
 	return b
 }
 
+// tombstoneReasons 是"文件本身永久不可抽取"类 DLQ 原因集合；只有这些 reason 会写 tombstone
+// (contentMeta.status="unextractable")。
+//
+// Round-4 Should-Fix (lml2468 review)：老实现对**所有** dlqReason 都写 tombstone (包括
+// download_failed / extract_timeout 等 transient 类)，永久移除 backfill recovery safety net —
+// download_failed 是 CDN 5xx / 网络抖动，extract_timeout 是 Tika 临时资源紧张，下次 rerun 可能
+// 成功。写 tombstone 后 backfill scroll `must_not term contentMeta.status=unextractable` 直接
+// 跳过 → **永远不再重试**。commit message 声称的"permanent DLQ"列表也漏了 extract_timeout →
+// intent vs impl 不一致，本轮修 impl 匹配 intent（不改 intent）。
+//
+// 白名单只覆盖 extractor.ExtractAndWrite 内部返回的 permanent 类（不含 ParseError /
+// RetryExhausted / OSPermanent — 这些 reason 由 consumer.processBatch 直接 writeDLQ，不经
+// extractor.defer；ParseError 场景 doc 不存在于 OS 也不需要 tombstone）。
+var tombstoneReasons = map[string]bool{
+	ReasonBlacklistExt: true, // 扩展名黑名单：永远不该抽
+	ReasonOversize:     true, // 文件超大：不会自己变小
+	ReasonEncrypted:    true, // 加密 PDF：无密码无解
+	ReasonEmptyExtract: true, // Tika 抽出空/纯空白：文件真无文本
+	ReasonExtractError: true, // Tika 报 exception：内容/格式问题，重试无益
+	// 明确排除：ReasonDownloadFailed（CDN 5xx / 网络抖动，rerun 可能成功）
+	// 明确排除：ReasonExtractTimeout（Tika 临时资源紧张 / 大文件超时，rerun 可能成功）
+}
+
+// isTombstoneReason 报告某 DLQ reason 是否属于"文件永久不可抽取"类，值得写 tombstone。
+// 供 extractor.defer 过滤 transient 类不写 tombstone（保留 backfill recovery safety net）。
+func isTombstoneReason(reason string) bool {
+	return tombstoneReasons[reason]
+}
+
 // ExtractAndWrite 拉文件 → Tika 抽取 → OS partial update。
 // 返回：
 //   - (dlqReason="", cause=nil, err=nil) → 成功
@@ -60,12 +89,22 @@ func firstNonZero(a, b int64) int64 {
 // (contentMeta.status="unextractable" + reason=<dlqReason>)，让 backfill scroll query 通过
 // `must_not term contentMeta.status=unextractable` 过滤，避免 rerun 无限重复 DLQ 同一文件。
 // tombstone 写失败不阻塞主 DLQ 路径（下次 backfill/consumer 兜底）。
+//
+// Round-4 Should-Fix (lml2468)：defer 加 isTombstoneReason 白名单过滤，只对**文件本身永久
+// 不可抽取**类 reason 写 tombstone；transient 类 (download_failed / extract_timeout) 不写，
+// 保留 backfill recovery safety net。
 func (e *Extractor) ExtractAndWrite(ctx context.Context, messageID string, fp *filePayload) (dlqReason string, cause error, err error) {
 	// Round-3 Blocker B: 命名返回值 + defer 统一处理 tombstone 写入，避免每个 return 点重复代码。
-	// 只对 (dlqReason != "" && err == nil) 的 permanent DLQ 分支写 tombstone；OS transient / errDocNotYet
-	// / ctx 取消 场景 (err != nil) 不写（caller 会重试整批，无需 tombstone）。
+	// Round-4 Should-Fix: 加白名单过滤，只对 permanent 类写 tombstone；transient 类
+	// (download_failed / extract_timeout) 保留 backfill recovery 语义。
+	// err != nil 分支 (errDocNotYet / OS transient / ctx 取消) 依然不写（caller 会重试整批）。
 	defer func() {
 		if dlqReason == "" || err != nil {
+			return
+		}
+		if !isTombstoneReason(dlqReason) {
+			// transient 类 DLQ reason (download_failed / extract_timeout) 不写 tombstone，
+			// 保留 backfill 下次 rerun 兜底重试的能力。
 			return
 		}
 		if terr := e.os.WriteTombstone(ctx, messageID, dlqReason); terr != nil {
