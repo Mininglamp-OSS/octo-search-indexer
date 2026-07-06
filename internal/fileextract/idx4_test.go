@@ -20,12 +20,12 @@ func mkCfgForTest(maxSize int64) ServiceConfig {
 	return ServiceConfig{
 		DownloadTimeout:        500 * time.Millisecond,
 		ExtractTimeout:         500 * time.Millisecond,
-		MaxFileSize:             maxSize,
-		MaxContentBytes:         128, // 短便于测截断
-		HTTPRetries:             2,   // 3 次尝试
-		AllowedDownloadHosts:    []string{"127.0.0.1"},
-		AllowedDownloadSchemes:  []string{"http", "https"},
-		SSRFAllowLoopback:       true, // httptest server 走 loopback，生产必须 false
+		MaxFileSize:            maxSize,
+		MaxContentBytes:        128, // 短便于测截断
+		HTTPRetries:            2,   // 3 次尝试
+		AllowedDownloadHosts:   []string{"127.0.0.1"},
+		AllowedDownloadSchemes: []string{"http", "https"},
+		SSRFAllowLoopback:      true, // httptest server 走 loopback，生产必须 false
 	}
 }
 
@@ -65,10 +65,10 @@ func TestDownload_5xxTransientThenSuccess(t *testing.T) {
 	cfg := mkCfgForTest(1024)
 	// 缩短 backoff 使测试更快
 	dc := &downloadClient{
-		hc:           &http.Client{Timeout: 500 * time.Millisecond},
-		maxSize:      1024,
-		retries:      3,
-		retryBackoff: 10 * time.Millisecond,
+		hc:             &http.Client{Timeout: 500 * time.Millisecond},
+		maxSize:        1024,
+		retries:        3,
+		retryBackoff:   10 * time.Millisecond,
 		allowedHosts:   []string{"127.0.0.1"},
 		allowedSchemes: []string{"http", "https"},
 	}
@@ -94,10 +94,10 @@ func TestDownload_5xxRetryExhausted(t *testing.T) {
 	}))
 	defer srv.Close()
 	dc := &downloadClient{
-		hc:           &http.Client{Timeout: 500 * time.Millisecond},
-		maxSize:      1024,
-		retries:      2, // 共 3 次尝试
-		retryBackoff: 5 * time.Millisecond,
+		hc:             &http.Client{Timeout: 500 * time.Millisecond},
+		maxSize:        1024,
+		retries:        2, // 共 3 次尝试
+		retryBackoff:   5 * time.Millisecond,
 		allowedHosts:   []string{"127.0.0.1"},
 		allowedSchemes: []string{"http", "https"},
 	}
@@ -119,10 +119,10 @@ func TestDownload_4xxPermanent(t *testing.T) {
 	}))
 	defer srv.Close()
 	dc := &downloadClient{
-		hc:           &http.Client{Timeout: 500 * time.Millisecond},
-		maxSize:      1024,
-		retries:      3,
-		retryBackoff: 5 * time.Millisecond,
+		hc:             &http.Client{Timeout: 500 * time.Millisecond},
+		maxSize:        1024,
+		retries:        3,
+		retryBackoff:   5 * time.Millisecond,
 		allowedHosts:   []string{"127.0.0.1"},
 		allowedSchemes: []string{"http", "https"},
 	}
@@ -177,10 +177,10 @@ func TestDownload_ContextCancelled(t *testing.T) {
 	}))
 	defer srv.Close()
 	dc := &downloadClient{
-		hc:           &http.Client{Timeout: time.Second},
-		maxSize:      1024,
-		retries:      3,
-		retryBackoff: time.Second,
+		hc:             &http.Client{Timeout: time.Second},
+		maxSize:        1024,
+		retries:        3,
+		retryBackoff:   time.Second,
 		allowedHosts:   []string{"127.0.0.1"},
 		allowedSchemes: []string{"http", "https"},
 	}
@@ -350,7 +350,9 @@ func TestExtractor_BlacklistExtDLQ(t *testing.T) {
 	var tombstoneBody string
 	osSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		b, rerr := io.ReadAll(r.Body)
-		if rerr != nil { t.Errorf("read body: %v", rerr) }
+		if rerr != nil {
+			t.Errorf("read body: %v", rerr)
+		}
 		tombstoneBody = string(b)
 		_, _ = w.Write([]byte(`{"_id":"42","result":"updated"}`)) //nolint:errcheck // test handler write
 	}))
@@ -399,7 +401,9 @@ func TestExtractor_OversizeDLQ(t *testing.T) {
 	var tombstoneBody string
 	osSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		b, rerr := io.ReadAll(r.Body)
-		if rerr != nil { t.Errorf("read body: %v", rerr) }
+		if rerr != nil {
+			t.Errorf("read body: %v", rerr)
+		}
 		tombstoneBody = string(b)
 		_, _ = w.Write([]byte(`{"_id":"42","result":"updated"}`)) //nolint:errcheck // test handler write
 	}))
@@ -496,12 +500,12 @@ func TestNormalizeExt(t *testing.T) {
 	cases := []struct {
 		ext, name, want string
 	}{
-		{".pdf", "x.pdf", ".pdf"},          // 传入的 ext 优先
-		{"pdf", "x.pdf", ".pdf"},           // 无前导 dot 加上
-		{"PDF", "x.pdf", ".pdf"},           // 大写归一化
-		{"", "x.docx", ".docx"},            // fallback filename
-		{"", "no_extension_file", ""},      // 均无
-		{"  .txt  ", "x.txt", ".txt"},      // trim
+		{".pdf", "x.pdf", ".pdf"},     // 传入的 ext 优先
+		{"pdf", "x.pdf", ".pdf"},      // 无前导 dot 加上
+		{"PDF", "x.pdf", ".pdf"},      // 大写归一化
+		{"", "x.docx", ".docx"},       // fallback filename
+		{"", "no_extension_file", ""}, // 均无
+		{"  .txt  ", "x.txt", ".txt"}, // trim
 	}
 	for _, c := range cases {
 		if got := normalizeExt(c.ext, c.name); got != c.want {

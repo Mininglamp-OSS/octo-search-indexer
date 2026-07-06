@@ -65,9 +65,9 @@ func (c Config) ToExtractorConfig() fileextract.ServiceConfig {
 
 // Stats 是 Runner.Run 的汇总统计。K8s Job 用于退出码判定。
 type Stats struct {
-	Scanned    int64 // OS scroll 拉出的总 doc 数
-	Extracted  int64 // 成功抽取 + OS update 的 doc 数
-	DLQ        int64 // 抽取失败进 DLQ 计数（backfill 只 log 不真写 kafka，spill 到日志）
-	Skipped    int64 // ctx 取消 / 其他原因跳过
+	Scanned     int64 // OS scroll 拉出的总 doc 数
+	Extracted   int64 // 成功抽取 + OS update 的 doc 数
+	DLQ         int64 // 抽取失败进 DLQ 计数（backfill 只 log 不真写 kafka，spill 到日志）
+	Skipped     int64 // ctx 取消 / 其他原因跳过
 	OSTransient int64 // OS errDocNotYet / transient 触发次数（backfill 场景理论上不该出现 errDocNotYet）
 }

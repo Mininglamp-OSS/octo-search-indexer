@@ -45,12 +45,12 @@ const tombstoneStatusValue = "unextractable"
 
 // osScrollSource 用 OS scroll API 遍历待回填 doc。
 type osScrollSource struct {
-	client     *opensearchapi.Client
-	index      string
-	size       int
-	scrollTTL  time.Duration
-	scrollID   string // 首批后由 OS 返回
-	exhausted  bool
+	client    *opensearchapi.Client
+	index     string
+	size      int
+	scrollTTL time.Duration
+	scrollID  string // 首批后由 OS 返回
+	exhausted bool
 }
 
 func newOSScrollSource(cfg Config) (*osScrollSource, error) {

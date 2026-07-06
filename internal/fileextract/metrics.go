@@ -11,12 +11,12 @@ import (
 
 // counters 是一组进程内简单计数（uint64 atomic），无并发风险且零依赖。
 type counters struct {
-	processed       atomic.Uint64
-	skippedNonFile  atomic.Uint64
-	dlqTotal        atomic.Uint64
-	docNotYet       atomic.Uint64 // v2 §7 #1 时序竞态触发计数，观察 Phase 2 独立 retry topic 是否要上
-	retryExhausted  atomic.Uint64 // v1.13 Blocker #2：in-place retry N 次未成功 → DLQ 触发计数
-	osPermanent     atomic.Uint64 // v1.13 P2-2：OS 4xx permanent → DLQ 触发计数
+	processed      atomic.Uint64
+	skippedNonFile atomic.Uint64
+	dlqTotal       atomic.Uint64
+	docNotYet      atomic.Uint64 // v2 §7 #1 时序竞态触发计数，观察 Phase 2 独立 retry topic 是否要上
+	retryExhausted atomic.Uint64 // v1.13 Blocker #2：in-place retry N 次未成功 → DLQ 触发计数
+	osPermanent    atomic.Uint64 // v1.13 P2-2：OS 4xx permanent → DLQ 触发计数
 }
 
 func (c *counters) IncProcessed()      { c.processed.Add(1) }

@@ -48,8 +48,8 @@ func (m *mockSource) Close() error {
 
 // mockDLQSink 抓 DLQ 写入。
 type mockDLQSink struct {
-	mu      sync.Mutex
-	records []dlqRecord
+	mu       sync.Mutex
+	records  []dlqRecord
 	writeErr error // 注入写失败
 }
 

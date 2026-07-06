@@ -82,20 +82,20 @@ func TestValidateURL_CustomAllowlist(t *testing.T) {
 // TestIsBlockedIP_CoversAllTargets 逐个校验 isBlockedIP 覆盖所有 SSRF 目标网段。
 func TestIsBlockedIP_CoversAllTargets(t *testing.T) {
 	blocked := []string{
-		"10.0.0.1",             // RFC 1918
-		"172.16.0.1",           // RFC 1918
-		"192.168.1.1",          // RFC 1918
-		"127.0.0.1",            // loopback
-		"169.254.169.254",      // cloud metadata (link-local)
-		"169.254.1.1",          // link-local
-		"0.0.0.0",              // unspecified
-		"100.64.0.1",           // CGNAT
-		"100.127.255.255",      // CGNAT 上界
-		"::1",                  // IPv6 loopback
-		"fe80::1",              // IPv6 link-local
-		"fc00::1",              // IPv6 ULA
-		"fd12:3456:789a::1",    // IPv6 ULA
-		"::",                   // IPv6 unspecified
+		"10.0.0.1",          // RFC 1918
+		"172.16.0.1",        // RFC 1918
+		"192.168.1.1",       // RFC 1918
+		"127.0.0.1",         // loopback
+		"169.254.169.254",   // cloud metadata (link-local)
+		"169.254.1.1",       // link-local
+		"0.0.0.0",           // unspecified
+		"100.64.0.1",        // CGNAT
+		"100.127.255.255",   // CGNAT 上界
+		"::1",               // IPv6 loopback
+		"fe80::1",           // IPv6 link-local
+		"fc00::1",           // IPv6 ULA
+		"fd12:3456:789a::1", // IPv6 ULA
+		"::",                // IPv6 unspecified
 	}
 	for _, s := range blocked {
 		ip := net.ParseIP(s)

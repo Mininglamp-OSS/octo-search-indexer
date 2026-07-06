@@ -26,9 +26,9 @@ import (
 type mockExtractor struct {
 	mu sync.Mutex
 	// outcomes[msgID] = 一序列每次返回值（(reason, cause, err)）
-	outcomes    map[string][]extractResult
-	calls       map[string]int // 每 msgID 被调多少次
-	defaultRes  extractResult
+	outcomes   map[string][]extractResult
+	calls      map[string]int // 每 msgID 被调多少次
+	defaultRes extractResult
 }
 
 type extractResult struct {
@@ -119,7 +119,7 @@ func TestProcessBatch_TransientRetryThenSuccess(t *testing.T) {
 	dlq := &mockDLQSink{}
 	ext := newMockExtractor()
 	ext.queue("42",
-		extractResult{err: errDocNotYet}, // attempt 1
+		extractResult{err: errDocNotYet},   // attempt 1
 		extractResult{err: errOSTransient}, // attempt 2
 		extractResult{},                    // attempt 3 → OK
 	)

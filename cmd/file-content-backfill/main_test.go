@@ -29,7 +29,7 @@ func TestSplitCSV(t *testing.T) {
 		{"a", []string{"a"}},
 		{"a,b,c", []string{"a", "b", "c"}},
 		{"a, b , c", []string{"a", "b", "c"}}, // trim
-		{",a,,b,", []string{"a", "b"}},         // 忽略空
+		{",a,,b,", []string{"a", "b"}},        // 忽略空
 	}
 	for _, c := range cases {
 		got := splitCSV(c.in)

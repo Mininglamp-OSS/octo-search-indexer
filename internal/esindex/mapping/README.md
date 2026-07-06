@@ -12,26 +12,67 @@ v1.12 在 `payload.file` 下新增两个字段，配套 `cmd/file-extractor` 独
 
 - `payload.file.content` (text, IK 分词) — Tika 抽出的文件正文纯文本。用 IK 双分析器
   保持与 `payload.text.content` 同口径（index-time `ik_max_word` / query-time `ik_smart`）。
-  `mappings._source.excludes` 排除该字段，节省 _source 体积；搜索仍可命中并 highlight
-  （走倒排不走 _source）。
-- `payload.file.contentMeta.{extractedAt, extractor, truncated, extractMs}` (object) —
-  抽取元信息，便于运维观察抽取延迟 / 覆盖率 / 截断率。子字段类型：
+  搜索时走倒排索引直接命中并支持 highlight。
+  > **v1.13 变更**：早期版本曾用 `mappings._source.excludes: ["payload.file.content"]`
+  > 剔除该字段以节省 _source 体积，但与 v1.13 Blocker #3 scripted_upsert preserve 语义
+  > 冲突（script 从 `ctx._source` 读取 content 保留字段时永远读到 null → preserve 分支不生效
+  > → es-indexer redeliver 覆盖 file-extractor 写入的 content）。**已删除** `_source.excludes`
+  > 声明；`mapping_compat.go` 的 `forbiddenSourceExcludes` 启动断言额外拦截 live index 若
+  > 残留旧 excludes 的部署顺序错误（loud crash）。详见 `docs/file-content-indexing-*.md` v3。
+- `payload.file.contentMeta.{extractedAt, extractor, truncated, extractMs, status, reason}` (object) —
+  抽取元信息，便于运维观察抽取延迟 / 覆盖率 / 截断率 / **永久不可抽取 tombstone**。子字段类型：
   - `extractedAt` — 抽取时刻 (epoch second, date)
   - `extractor`   — 抽取器标识 (keyword, 如 "tika/3.3.0")
   - `truncated`   — content 是否被截到 MaxContentBytes (boolean)
   - `extractMs`   — Tika 抽取耗时 (long, 毫秒)
+  - `status`      — **v1.13 Round-3 Blocker B**：permanent-fail tombstone 标记 (keyword，
+     当前唯一取值 `"unextractable"`)。写入者为 `internal/fileextract/oswriter.go`
+     `WriteTombstone`；由 `internal/filebackfill/source.go` scroll query `must_not term
+     contentMeta.status=unextractable` 消费，防 backfill Job rerun 无限重复 DLQ 同一永久
+     失败文件。**只有 permanent 类 DLQ reason 才写**（见 `extractor.go` `tombstoneReasons`
+     白名单，Round-4 Should-Fix）；transient 类（`download_failed` / `extract_timeout`）
+     保留 backfill 兜底能力，不写 tombstone。
+  - `reason`      — **v1.13 Round-3 Blocker B**：status=`unextractable` 时携带的具体 DLQ
+     reason (keyword，如 `blacklist_ext` / `oversize` / `encrypted` / `empty_extract` /
+     `extract_error`)，便于运维分类查询与排障。
 
 写入契约：由独立 `cmd/file-extractor` 服务通过 OS `_update` partial update 只更新
 `payload.file.content` + `payload.file.contentMeta`，不动主 doc 其他字段（父 doc 由
 `cmd/es-indexer` 主流程写入）。file-extractor 消费同一 Kafka topic 但独立 consumer group
 `file-extractor`（不抢 es-indexer 位点）。
 
-> `payload.file.content` + `payload.file.contentMeta.extractedAt` 已纳入
-> `mapping_compat.go` 启动断言集（fail-closed），live mapping 不符直接拒启动。
+> **v1.13 Round-3 Blocker A**：`cmd/es-indexer` 主写入路径从 `_bulk index` 改为
+> `_bulk update + scripted_upsert`（`retry_on_conflict=3`）以保留 file-extractor 的写入
+> 字段；`isPermanentStatus` 已把 409 `version_conflict` 归为 transient（并发写者耗尽内部
+> retry 后仍返 409 时由 caller 重试，不再 silent 甩 DLQ）。
 
-**⚠️ 不可逆警告**：`PUT _mapping` 添加 `payload.file.content` + `contentMeta` 后**不可逆**
+> `payload.file.content` + `payload.file.contentMeta.{extractedAt, status, reason}`
+> 都已纳入 `mapping_compat.go` 启动断言集（fail-closed），live mapping 缺字段 or
+> `_source.excludes` 残留旧配置直接拒启动 loud crash。
+
+**⚠️ 不可逆警告**：`PUT _mapping` 添加 `payload.file.content` + `contentMeta.*` 字段后**不可逆**
 ——OS 3.x mapping 字段只能通过 reindex + 切换 alias 才能移除。合并前 sig-off 意味着接受
 该单向决策。详见 `docs/file-content-indexing-feasibility.md` v2 §7 / §5 回滚方案。
+
+**部署 runbook**：live index 若已有旧 `_source.excludes: ["payload.file.content"]`（v1.12 版
+mapping），必须在滚 v1.13+ pod **之前** admin `PUT _mapping` 清 excludes + 加
+`contentMeta.status/reason` 字段，否则 `AssertLiveMappingCompatible` loud crash 拒启动
+（feature 非 bug）。两处 mapping 变动 idempotent + reversible，合并成一次 PUT 更清爽：
+
+```json
+PUT /octo-message/_mapping
+{
+  "_source": { "excludes": [] },
+  "properties": {
+    "payload": { "properties": { "file": { "properties": { "contentMeta": {
+      "properties": {
+        "status": { "type": "keyword", "ignore_above": 32 },
+        "reason": { "type": "keyword", "ignore_above": 64 }
+      }
+    }}}}}
+  }
+}
+```
 
 详见 `docs/file-content-indexing-feasibility.md`（v2 §7）+ `docs/file-content-indexing-implementation.md`（v2）+ `docs/file-extractor-tool-comparison.md`（Tika 选型论证）。
 

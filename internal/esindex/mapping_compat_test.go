@@ -179,7 +179,7 @@ func TestMappingCompat_MissingFileContentMetaFails(t *testing.T) {
 // 常量包含新加两条路径（配 IDX-2 加字段动作 + IDX-4 file-extractor 上线前置校验）。
 func TestRequiredMappingFieldPaths_IncludesV112Fields(t *testing.T) {
 	want := map[string]bool{
-		"payload.file.content":                true,
+		"payload.file.content":                 true,
 		"payload.file.contentMeta.extractedAt": true,
 	}
 	found := map[string]bool{}

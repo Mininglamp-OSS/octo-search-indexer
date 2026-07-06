@@ -156,11 +156,11 @@ func TestStats_TypeShape(t *testing.T) {
 // TestConfig_ToExtractorConfig 字段转发正确。
 func TestConfig_ToExtractorConfig(t *testing.T) {
 	c := Config{
-		ESAddresses: []string{"http://os:9200"},
-		ESIndex:     "octo-message",
-		ESUsername:  "u",
-		ESPassword:  "p",
-		TikaURL:     "http://tika:9998",
+		ESAddresses:     []string{"http://os:9200"},
+		ESIndex:         "octo-message",
+		ESUsername:      "u",
+		ESPassword:      "p",
+		TikaURL:         "http://tika:9998",
 		DownloadTimeout: 10 * time.Second,
 		ExtractTimeout:  20 * time.Second,
 		MaxFileSize:     1024,
@@ -230,11 +230,11 @@ func TestRun_MixedOutcomes(t *testing.T) {
 		mkDoc("1"), mkDoc("2"), mkDoc("3"), mkDoc("4"), mkDoc("5"),
 	}}}
 	ext := &mockExtractor{results: []extractorResult{
-		{},                                                                 // 1 → success
-		{reason: "oversize", cause: errors.New("too big")},                 // 2 → DLQ
-		{},                                                                 // 3 → success
-		{err: errors.New("os 500 boom")},                                   // 4 → OSTransient
-		{},                                                                 // 5 → success
+		{}, // 1 → success
+		{reason: "oversize", cause: errors.New("too big")}, // 2 → DLQ
+		{},                               // 3 → success
+		{err: errors.New("os 500 boom")}, // 4 → OSTransient
+		{},                               // 5 → success
 	}}
 	r := NewRunnerWith(src, ext, 0)
 	stats, err := r.Run(context.Background())

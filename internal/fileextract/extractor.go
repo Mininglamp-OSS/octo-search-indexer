@@ -20,11 +20,11 @@ import (
 
 // Extractor 抽取核心。跨 consumer + backfill 复用。
 type Extractor struct {
-	download        *downloadClient
-	tika            *tikaClient
-	os              *osWriter
-	maxFileSize     int64
-	extractorLabel  string // 写进 contentMeta.extractor (e.g. "tika/3.3.0")
+	download       *downloadClient
+	tika           *tikaClient
+	os             *osWriter
+	maxFileSize    int64
+	extractorLabel string // 写进 contentMeta.extractor (e.g. "tika/3.3.0")
 }
 
 // NewExtractor 构造。所有下游 client 均在这里装配，consumer.Service / backfill Runner 各自 New 一份。
@@ -164,7 +164,7 @@ func (e *Extractor) ExtractAndWrite(ctx context.Context, messageID string, fp *f
 		ExtractedAt: time.Now().Unix(),
 		Extractor:   e.extractorLabel,
 		Truncated:   &truncated, // v1.13 P2-5：指针便于清除 stale true
-		ExtractMs:   extractMs,
+		ExtractMs:   &extractMs, // Round-4 TKT-5：同 P2-5 pattern，显式落盘允许 0ms 覆盖 stale
 	}
 	if uerr := e.os.UpdateContent(ctx, messageID, content, meta); uerr != nil {
 		// 主 doc 未落 → 上抛让 caller 重试整批（consumer 走 kafka rebalance 重取）
