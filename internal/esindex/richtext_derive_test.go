@@ -304,12 +304,13 @@ func TestRichTextDerivatives_ClampOversizeWidthHeight(t *testing.T) {
 	}
 }
 
-// mkBulkResp 构造一个 _bulk 响应（每个 status 一项 index action）。
+// mkBulkResp 构造一个 _bulk 响应（每个 status 一项 update action）。
+// v1.13：动作行从 index 换 update（Blocker #3 scripted_upsert fix）。
 func mkBulkResp(statuses ...int) *opensearchapi.BulkResp {
 	resp := &opensearchapi.BulkResp{}
 	for _, st := range statuses {
 		item := opensearchapi.BulkRespItem{Status: st}
-		resp.Items = append(resp.Items, map[string]opensearchapi.BulkRespItem{"index": item})
+		resp.Items = append(resp.Items, map[string]opensearchapi.BulkRespItem{"update": item})
 	}
 	return resp
 }
