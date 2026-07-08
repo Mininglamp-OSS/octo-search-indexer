@@ -31,6 +31,12 @@ var errOversize = errors.New("fileextract: file size exceeds MaxFileSize cutoff"
 // errDownloadFailed 是重试耗尽或 4xx 非 429 permanent 失败（触发 DLQ reason=download_failed）。
 var errDownloadFailed = errors.New("fileextract: download exhausted retries or 4xx permanent")
 
+// errInvalidURL 是 SSRF pre-check（validateURL）拒绝 URL 的 sentinel（触发 DLQ reason=invalid_url）。
+// 与 errDownloadFailed 分开：pre-check 拒是 policy 硬约束（scheme/host allowlist 不变，同 URL
+// 无论重试或 backfill rerun 结果不变），归 permanent tombstone；errDownloadFailed 保留给
+// CDN 5xx / 4xx expired 等 transient/URL-specific 故障（rerun 可能成功，不写 tombstone）。
+var errInvalidURL = errors.New("fileextract: url rejected by SSRF pre-check")
+
 // downloadClient 从 URL 拉文件 bytes。
 type downloadClient struct {
 	hc             *http.Client
@@ -94,8 +100,10 @@ func (c ServiceConfig) RetryBackoffBase() time.Duration {
 // URL 不变重试无意义）。
 func (d *downloadClient) Fetch(ctx context.Context, url string) ([]byte, string, error) {
 	if err := validateURL(url, d.allowedHosts, d.allowedSchemes); err != nil {
-		// SSRF pre-check 拒绝 → download_failed（不重试；host/scheme 不变重试无意义）
-		return nil, "", fmt.Errorf("%w: %v", errDownloadFailed, err)
+		// SSRF pre-check 拒绝 → invalid_url（不重试；host/scheme allowlist 是硬约束，同 URL rerun 无益）。
+		// 归 permanent tombstone reason（extractor.go tombstoneReasons），backfill scroll 会过滤，
+		// 避免老 URL（如已下线的历史 COS 直连）被 rerun 无限重试。
+		return nil, "", fmt.Errorf("%w: %v", errInvalidURL, err)
 	}
 	var lastErr error
 	for attempt := 0; attempt <= d.retries; attempt++ {

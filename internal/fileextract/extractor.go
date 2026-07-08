@@ -59,6 +59,11 @@ func firstNonZero(a, b int64) int64 {
 // 跳过 → **永远不再重试**。commit message 声称的"permanent DLQ"列表也漏了 extract_timeout →
 // intent vs impl 不一致，本轮修 impl 匹配 intent（不改 intent）。
 //
+// v1.14：invalid_url 是从 download_failed 拆出的**永久** SSRF policy 类（validateURL pre-check
+// 拒），归 tombstone —— 与 download_failed 语义相反：URL host/scheme allowlist 是硬约束，
+// 同 URL rerun 结果不变（typical: 老历史消息带已淘汰的 CDN/COS 直连域名），需 tombstone
+// 让 backfill 跳过避免无限重复失败。
+//
 // 白名单只覆盖 extractor.ExtractAndWrite 内部返回的 permanent 类（不含 ParseError /
 // RetryExhausted / OSPermanent — 这些 reason 由 consumer.processBatch 直接 writeDLQ，不经
 // extractor.defer；ParseError 场景 doc 不存在于 OS 也不需要 tombstone）。
@@ -68,6 +73,7 @@ var tombstoneReasons = map[string]bool{
 	ReasonEncrypted:    true, // 加密 PDF：无密码无解
 	ReasonEmptyExtract: true, // Tika 抽出空/纯空白：文件真无文本
 	ReasonExtractError: true, // Tika 报 exception：内容/格式问题，重试无益
+	ReasonInvalidURL:   true, // SSRF pre-check 拒 URL：allowlist 硬约束，同 URL rerun 无益
 	// 明确排除：ReasonDownloadFailed（CDN 5xx / 网络抖动，rerun 可能成功）
 	// 明确排除：ReasonExtractTimeout（Tika 临时资源紧张 / 大文件超时，rerun 可能成功）
 }
@@ -130,6 +136,11 @@ func (e *Extractor) ExtractAndWrite(ctx context.Context, messageID string, fp *f
 	if derr != nil {
 		if errors.Is(derr, errOversize) {
 			return ReasonOversize, derr, nil
+		}
+		if errors.Is(derr, errInvalidURL) {
+			// SSRF pre-check 拒 → permanent (走 tombstone)。放在 errDownloadFailed 前判断，
+			// 否则 wrap 顺序变化时可能被更宽松的分支吃掉。
+			return ReasonInvalidURL, derr, nil
 		}
 		if errors.Is(derr, errDownloadFailed) {
 			return ReasonDownloadFailed, derr, nil

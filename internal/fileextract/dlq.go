@@ -11,6 +11,7 @@ package fileextract
 //	| oversize            | 文件 > MaxFileSize                            | ❌      |
 //	| blacklist_ext       | 扩展名在黑名单（不该走这里，是设计正常跳过） | ❌      |
 //	| download_failed     | HTTP GET CDN 5xx 或连接超时（重试耗尽）        | ✅ 3 次 |
+//	| invalid_url         | SSRF pre-check 拒 URL（scheme/host allowlist）| ❌      |
 //	| extract_timeout     | Tika 抽取 > ExtractTimeout                    | ❌      |
 //	| encrypted           | Tika 抛 EncryptedDocumentException             | ❌      |
 //	| empty_extract       | Tika 返回空串或空白                           | ❌      |
@@ -26,6 +27,11 @@ const (
 	ReasonEncrypted      = "encrypted"
 	ReasonEmptyExtract   = "empty_extract"
 	ReasonExtractError   = "extract_error"
+
+	// ReasonInvalidURL：SSRF pre-check 拒绝 URL（scheme/host 不在 allowlist）。
+	// 归 permanent DLQ + tombstone：allowlist 是硬 policy 边界，同 URL rerun 结果不变。
+	// 典型触发：老历史 file 消息 URL 是已淘汰的 CDN/COS 直连域名，不在现役 allowlist 内。
+	ReasonInvalidURL = "invalid_url"
 
 	// ReasonRetryExhausted：单条消息 in-place bounded retry N 次仍未成功
 	// (errDocNotYet / errOSTransient 长期未收敛) → 强制 DLQ 并 commit offset，避免

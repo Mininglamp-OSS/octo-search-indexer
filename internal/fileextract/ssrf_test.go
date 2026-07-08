@@ -163,7 +163,8 @@ func TestSSRFRestrictedDialer_LoopbackBypassWhenAllowed(t *testing.T) {
 }
 
 // TestFetch_SSRFPrecheckBlocksMalformedURL Fetch 入口 pre-check 拦 malformed URL，
-// 不重试（scheme/host 不变重试无意义）。
+// 不重试（scheme/host 不变重试无意义）。v1.14 起 pre-check 失败归 errInvalidURL
+// （从 errDownloadFailed 拆分，SSRF policy permanent 类，走 tombstone）。
 func TestFetch_SSRFPrecheckBlocksMalformedURL(t *testing.T) {
 	dc := newDownloadClient(ServiceConfig{
 		DownloadTimeout: 100 * time.Millisecond,
@@ -171,8 +172,8 @@ func TestFetch_SSRFPrecheckBlocksMalformedURL(t *testing.T) {
 		MaxFileSize:     1024,
 	})
 	_, _, err := dc.Fetch(context.Background(), "http://cdn.deepminer.com.cn/x") // http 被默认 scheme 拒
-	if !errors.Is(err, errDownloadFailed) {
-		t.Fatalf("expected errDownloadFailed wrapping SSRF, got %v", err)
+	if !errors.Is(err, errInvalidURL) {
+		t.Fatalf("expected errInvalidURL wrapping SSRF pre-check, got %v", err)
 	}
 }
 

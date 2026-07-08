@@ -26,6 +26,7 @@ func TestTombstoneReasons_Whitelist(t *testing.T) {
 		ReasonEncrypted,
 		ReasonEmptyExtract,
 		ReasonExtractError,
+		ReasonInvalidURL, // v1.14：SSRF pre-check 拒 URL（scheme/host allowlist policy 硬约束）
 	}
 	for _, r := range permanent {
 		if !isTombstoneReason(r) {
@@ -234,5 +235,108 @@ func TestExtractor_PermanentDLQ_WritesTombstone_Encrypted(t *testing.T) {
 	}
 	if !strings.Contains(tombstoneBody, `"reason":"encrypted"`) {
 		t.Errorf("tombstone must carry reason=encrypted, got: %s", tombstoneBody)
+	}
+}
+
+// TestExtractor_PermanentDLQ_WritesTombstone_InvalidURLHost v1.14 新分支：URL host 不在
+// SSRF allowlist → validateURL 拒 → errInvalidURL → ReasonInvalidURL → tombstone 写入。
+// 覆盖典型生产场景：老历史 file 消息 URL 是已淘汰的 CDN/COS 直连域名，不在现役 allowlist 内，
+// 归 permanent 让 backfill 跳过避免无限重复失败（不是 transient download_failed）。
+func TestExtractor_PermanentDLQ_WritesTombstone_InvalidURLHost(t *testing.T) {
+	var tombstoneBody string
+	osSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, rerr := io.ReadAll(r.Body)
+		if rerr != nil {
+			t.Errorf("read body: %v", rerr)
+		}
+		tombstoneBody = string(b)
+		_, _ = w.Write([]byte(`{"result":"updated"}`)) //nolint:errcheck // test handler write
+	}))
+	defer osSrv.Close()
+
+	cfg := ServiceConfig{
+		ESAddresses:            []string{osSrv.URL},
+		ESIndex:                "octo-message",
+		DownloadTimeout:        200 * time.Millisecond,
+		ExtractTimeout:         200 * time.Millisecond,
+		MaxFileSize:            1024,
+		MaxContentBytes:        1024,
+		HTTPRetries:            1,
+		AllowedDownloadHosts:   []string{"cdn.example.com"}, // 明确 host allowlist
+		AllowedDownloadSchemes: []string{"https"},
+		SSRFAllowLoopback:      true,
+	}
+	e, err := NewExtractor(cfg)
+	if err != nil {
+		t.Fatalf("NewExtractor: %v", err)
+	}
+	// URL host 不在 allowlist → pre-check 拒（不会真去 dial）
+	fp := &filePayload{URL: "https://not-in-allowlist.example.org/x.pdf", Name: "x.pdf", Extension: ".pdf"}
+	reason, cause, rerr := e.ExtractAndWrite(context.Background(), "42", fp)
+	if rerr != nil {
+		t.Fatalf("ExtractAndWrite: err=%v cause=%v", rerr, cause)
+	}
+	if reason != ReasonInvalidURL {
+		t.Fatalf("expected invalid_url reason, got %q (cause=%v)", reason, cause)
+	}
+	if !errors.Is(cause, errInvalidURL) {
+		t.Errorf("cause must wrap errInvalidURL, got %v", cause)
+	}
+	if !strings.Contains(tombstoneBody, `"status":"unextractable"`) {
+		t.Errorf("invalid_url (permanent) must write tombstone, got body: %s", tombstoneBody)
+	}
+	if !strings.Contains(tombstoneBody, `"reason":"invalid_url"`) {
+		t.Errorf("tombstone must carry reason=invalid_url, got: %s", tombstoneBody)
+	}
+}
+
+// TestExtractor_PermanentDLQ_WritesTombstone_InvalidURLScheme v1.14：URL scheme 非白名单
+// （空 scheme / http / ftp 等）→ validateURL 拒 → errInvalidURL → ReasonInvalidURL → tombstone。
+// 覆盖脏数据场景：payload.file.url 为空或 scheme 异常。
+func TestExtractor_PermanentDLQ_WritesTombstone_InvalidURLScheme(t *testing.T) {
+	var tombstoneBody string
+	osSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, rerr := io.ReadAll(r.Body)
+		if rerr != nil {
+			t.Errorf("read body: %v", rerr)
+		}
+		tombstoneBody = string(b)
+		_, _ = w.Write([]byte(`{"result":"updated"}`)) //nolint:errcheck // test handler write
+	}))
+	defer osSrv.Close()
+
+	cfg := ServiceConfig{
+		ESAddresses:            []string{osSrv.URL},
+		ESIndex:                "octo-message",
+		DownloadTimeout:        200 * time.Millisecond,
+		ExtractTimeout:         200 * time.Millisecond,
+		MaxFileSize:            1024,
+		MaxContentBytes:        1024,
+		HTTPRetries:            1,
+		AllowedDownloadHosts:   []string{"cdn.example.com"},
+		AllowedDownloadSchemes: []string{"https"}, // 只放 https，http/ftp/空全拒
+		SSRFAllowLoopback:      true,
+	}
+	e, err := NewExtractor(cfg)
+	if err != nil {
+		t.Fatalf("NewExtractor: %v", err)
+	}
+	// scheme=ftp 不在 allowlist → pre-check 拒（走 errSSRFScheme → wrap errInvalidURL）
+	fp := &filePayload{URL: "ftp://cdn.example.com/x.pdf", Name: "x.pdf", Extension: ".pdf"}
+	reason, cause, rerr := e.ExtractAndWrite(context.Background(), "42", fp)
+	if rerr != nil {
+		t.Fatalf("ExtractAndWrite: err=%v cause=%v", rerr, cause)
+	}
+	if reason != ReasonInvalidURL {
+		t.Fatalf("expected invalid_url reason, got %q (cause=%v)", reason, cause)
+	}
+	if !errors.Is(cause, errInvalidURL) {
+		t.Errorf("cause must wrap errInvalidURL, got %v", cause)
+	}
+	if !strings.Contains(tombstoneBody, `"status":"unextractable"`) {
+		t.Errorf("invalid_url (permanent) must write tombstone, got body: %s", tombstoneBody)
+	}
+	if !strings.Contains(tombstoneBody, `"reason":"invalid_url"`) {
+		t.Errorf("tombstone must carry reason=invalid_url, got: %s", tombstoneBody)
 	}
 }
