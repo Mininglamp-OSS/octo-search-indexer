@@ -24,6 +24,7 @@ package main
 import (
 	"context"
 	"log"
+	"net/http"
 	"os"
 	"os/signal"
 	"strconv"
@@ -78,12 +79,19 @@ func run(ctx context.Context) error {
 
 // assertLiveMapping 用 esindex.Writer 复用 mapping-compat 校验（P2-10）。
 // 写完立即 Close 释放 client（本调用只做健康检查，主流程另建自己的 osWriter）。
+// 与主 osWriter 同规则：cfg.ESTLSInsecureSkipVerify=true 时注入 InsecureSkipVerifyTransport，
+// 否则健康检查在自签证书 OS 上会先于主流程失败。
 func assertLiveMapping(ctx context.Context, cfg fileextract.ServiceConfig) error {
+	var transport http.RoundTripper
+	if cfg.ESTLSInsecureSkipVerify {
+		transport = esindex.InsecureSkipVerifyTransport()
+	}
 	w, err := esindex.NewWriter(esindex.Config{
 		Addresses: cfg.ESAddresses,
 		Index:     cfg.ESIndex,
 		Username:  cfg.ESUsername,
 		Password:  cfg.ESPassword,
+		Transport: transport,
 	})
 	if err != nil {
 		return err
@@ -100,22 +108,23 @@ func assertLiveMapping(ctx context.Context, cfg fileextract.ServiceConfig) error
 // 开通条件：FILE_EXTRACTOR_ENABLED (可解析为 true) 且 brokers / ES 地址均已配置。
 func loadConfig() (fileextract.ServiceConfig, bool) {
 	cfg := fileextract.ServiceConfig{
-		Brokers:             splitCSV(os.Getenv("KAFKA_BROKERS")),
-		Topic:               envOr("KAFKA_TOPIC", "octo.message.v1"),
-		DLQTopic:            envOr("KAFKA_DLQ_TOPIC", "octo.message.v1.file-extract.dlq"),
-		GroupID:             envOr("KAFKA_GROUP_ID", "file-extractor"),
-		BatchSize:           envInt("EXTRACTOR_BATCH_SIZE", 50),
-		ESAddresses:         splitCSV(os.Getenv("ES_ADDRESSES")),
-		ESIndex:             envOr("ES_INDEX", "octo-message"),
-		ESUsername:          os.Getenv("ES_USERNAME"),
-		ESPassword:          os.Getenv("ES_PASSWORD"),
-		TikaURL:             envOr("TIKA_URL", "http://localhost:9998"),
-		DownloadTimeout:     time.Duration(envInt("EXTRACTOR_DOWNLOAD_TIMEOUT_MS", 30000)) * time.Millisecond,
-		ExtractTimeout:      time.Duration(envInt("EXTRACTOR_EXTRACT_TIMEOUT_MS", 30000)) * time.Millisecond,
-		MaxFileSize:         int64(envInt("EXTRACTOR_MAX_FILE_SIZE_BYTES", 20*1024*1024)),
-		MaxContentBytes:     envInt("EXTRACTOR_MAX_CONTENT_BYTES", 256*1024),
-		HTTPRetries:         envInt("EXTRACTOR_HTTP_RETRIES", 3),
-		ExtractStartupDelay: time.Duration(envInt("EXTRACT_STARTUP_DELAY_SECONDS", 5)) * time.Second,
+		Brokers:                 splitCSV(os.Getenv("KAFKA_BROKERS")),
+		Topic:                   envOr("KAFKA_TOPIC", "octo.message.v1"),
+		DLQTopic:                envOr("KAFKA_DLQ_TOPIC", "octo.message.v1.file-extract.dlq"),
+		GroupID:                 envOr("KAFKA_GROUP_ID", "file-extractor"),
+		BatchSize:               envInt("EXTRACTOR_BATCH_SIZE", 50),
+		ESAddresses:             splitCSV(os.Getenv("ES_ADDRESSES")),
+		ESIndex:                 envOr("ES_INDEX", "octo-message"),
+		ESUsername:              os.Getenv("ES_USERNAME"),
+		ESPassword:              os.Getenv("ES_PASSWORD"),
+		ESTLSInsecureSkipVerify: strings.EqualFold(os.Getenv("ES_TLS_INSECURE_SKIP_VERIFY"), "true"),
+		TikaURL:                 envOr("TIKA_URL", "http://localhost:9998"),
+		DownloadTimeout:         time.Duration(envInt("EXTRACTOR_DOWNLOAD_TIMEOUT_MS", 30000)) * time.Millisecond,
+		ExtractTimeout:          time.Duration(envInt("EXTRACTOR_EXTRACT_TIMEOUT_MS", 30000)) * time.Millisecond,
+		MaxFileSize:             int64(envInt("EXTRACTOR_MAX_FILE_SIZE_BYTES", 20*1024*1024)),
+		MaxContentBytes:         envInt("EXTRACTOR_MAX_CONTENT_BYTES", 256*1024),
+		HTTPRetries:             envInt("EXTRACTOR_HTTP_RETRIES", 3),
+		ExtractStartupDelay:     time.Duration(envInt("EXTRACT_STARTUP_DELAY_SECONDS", 5)) * time.Second,
 
 		// v1.13 Blocker #2 fix — in-place bounded retry 参数。生产运维按 OS SLA 与业务
 		// 延迟容忍度调整；未设 env 时走 fileextract 包内 default（10 / 1s / 60s）。

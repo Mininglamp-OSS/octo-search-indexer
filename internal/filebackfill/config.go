@@ -27,6 +27,10 @@ type Config struct {
 	ESIndex     string // e.g. "octo-message" (alias 或 backing index)
 	ESUsername  string
 	ESPassword  string
+	// ESTLSInsecureSkipVerify 为 true 时跳过 OpenSearch HTTPS 证书校验（自签证书场景）。
+	// 默认 false。与 es-indexer / file-extractor / reconcile 同开关语义（共用
+	// esindex.InsecureSkipVerifyTransport helper）。
+	ESTLSInsecureSkipVerify bool
 
 	// TikaURL / DownloadTimeout / ExtractTimeout / MaxFileSize / MaxContentBytes / HTTPRetries
 	// 转发给 fileextract.NewExtractor 复用同一套抽取核心。
@@ -50,16 +54,17 @@ type Config struct {
 // ToExtractorConfig 转换成 fileextract.ServiceConfig（extractor 只用其中一部分字段）。
 func (c Config) ToExtractorConfig() fileextract.ServiceConfig {
 	return fileextract.ServiceConfig{
-		ESAddresses:     c.ESAddresses,
-		ESIndex:         c.ESIndex,
-		ESUsername:      c.ESUsername,
-		ESPassword:      c.ESPassword,
-		TikaURL:         c.TikaURL,
-		DownloadTimeout: c.DownloadTimeout,
-		ExtractTimeout:  c.ExtractTimeout,
-		MaxFileSize:     c.MaxFileSize,
-		MaxContentBytes: c.MaxContentBytes,
-		HTTPRetries:     c.HTTPRetries,
+		ESAddresses:             c.ESAddresses,
+		ESIndex:                 c.ESIndex,
+		ESUsername:              c.ESUsername,
+		ESPassword:              c.ESPassword,
+		ESTLSInsecureSkipVerify: c.ESTLSInsecureSkipVerify,
+		TikaURL:                 c.TikaURL,
+		DownloadTimeout:         c.DownloadTimeout,
+		ExtractTimeout:          c.ExtractTimeout,
+		MaxFileSize:             c.MaxFileSize,
+		MaxContentBytes:         c.MaxContentBytes,
+		HTTPRetries:             c.HTTPRetries,
 	}
 }
 

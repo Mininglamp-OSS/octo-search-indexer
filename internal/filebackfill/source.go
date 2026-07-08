@@ -22,8 +22,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/http"
 	"time"
 
+	"github.com/Mininglamp-OSS/octo-search-indexer/internal/esindex"
 	"github.com/opensearch-project/opensearch-go/v3"
 	"github.com/opensearch-project/opensearch-go/v3/opensearchapi"
 )
@@ -54,11 +56,16 @@ type osScrollSource struct {
 }
 
 func newOSScrollSource(cfg Config) (*osScrollSource, error) {
+	var transport http.RoundTripper
+	if cfg.ESTLSInsecureSkipVerify {
+		transport = esindex.InsecureSkipVerifyTransport()
+	}
 	client, err := opensearchapi.NewClient(opensearchapi.Config{
 		Client: opensearch.Config{
 			Addresses: cfg.ESAddresses,
 			Username:  cfg.ESUsername,
 			Password:  cfg.ESPassword,
+			Transport: transport,
 		},
 	})
 	if err != nil {

@@ -32,6 +32,10 @@ type ServiceConfig struct {
 	ESIndex     string
 	ESUsername  string
 	ESPassword  string
+	// ESTLSInsecureSkipVerify 为 true 时跳过 OpenSearch HTTPS 证书校验（自签证书场景）。
+	// 默认 false：使用默认 transport，强制校验，行为不变。与 es-indexer / reconcile / backfill
+	// 同一开关语义（共用 esindex.InsecureSkipVerifyTransport helper）。
+	ESTLSInsecureSkipVerify bool
 
 	// Tika / Download / Extract
 	TikaURL         string        // http://localhost:9998（sidecar 部署方案 α）

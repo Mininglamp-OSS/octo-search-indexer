@@ -52,6 +52,7 @@ func run() error {
 		esIndex     = flag.String("es-index", envOr("BACKFILL_ES_INDEX", "octo-message"), "OpenSearch index / alias")
 		esUser      = flag.String("es-user", os.Getenv("BACKFILL_ES_USER"), "OS username (optional)")
 		esPass      = flag.String("es-pass", os.Getenv("BACKFILL_ES_PASS"), "OS password (optional)")
+		esTLSSkip   = flag.Bool("es-tls-insecure", envBool("BACKFILL_ES_TLS_INSECURE_SKIP_VERIFY"), "skip TLS cert verification for HTTPS OpenSearch (self-signed); default off")
 		tikaURL     = flag.String("tika-url", envOr("BACKFILL_TIKA_URL", "http://tika-service:9998"), "Tika Server URL")
 		rate        = flag.Float64("rate", envFloat("BACKFILL_RATE", 50), "extraction rate limit (docs/s; <=0 = unlimited)")
 		scrollSize  = flag.Int("scroll-size", envInt("BACKFILL_SCROLL_SIZE", 500), "OS scroll batch size")
@@ -71,20 +72,21 @@ func run() error {
 	}
 
 	cfg := fbf.Config{
-		ESAddresses:     splitCSV(*esAddrs),
-		ESIndex:         *esIndex,
-		ESUsername:      *esUser,
-		ESPassword:      *esPass,
-		TikaURL:         *tikaURL,
-		DownloadTimeout: time.Duration(*downloadMS) * time.Millisecond,
-		ExtractTimeout:  time.Duration(*extractMS) * time.Millisecond,
-		MaxFileSize:     *maxSize,
-		MaxContentBytes: *maxContent,
-		HTTPRetries:     *httpRetries,
-		Rate:            *rate,
-		ScrollSize:      *scrollSize,
-		ScrollTTL:       *scrollTTL,
-		Timeout:         *timeout,
+		ESAddresses:             splitCSV(*esAddrs),
+		ESIndex:                 *esIndex,
+		ESUsername:              *esUser,
+		ESPassword:              *esPass,
+		ESTLSInsecureSkipVerify: *esTLSSkip,
+		TikaURL:                 *tikaURL,
+		DownloadTimeout:         time.Duration(*downloadMS) * time.Millisecond,
+		ExtractTimeout:          time.Duration(*extractMS) * time.Millisecond,
+		MaxFileSize:             *maxSize,
+		MaxContentBytes:         *maxContent,
+		HTTPRetries:             *httpRetries,
+		Rate:                    *rate,
+		ScrollSize:              *scrollSize,
+		ScrollTTL:               *scrollTTL,
+		Timeout:                 *timeout,
 	}
 
 	runner, err := fbf.NewRunner(cfg)
@@ -123,6 +125,12 @@ func envOr(key, def string) string {
 		return v
 	}
 	return def
+}
+
+// envBool 解析布尔型 env（fail-closed：仅 "true"/"TRUE" 等 → true，其余一律 false）。
+// 与 cmd/backfill / cmd/reconcile 同实现，方便运维在 K8s Job env 里开 self-signed TLS 跳过。
+func envBool(k string) bool {
+	return strings.EqualFold(os.Getenv(k), "true")
 }
 
 func envInt(key string, def int) int {

@@ -41,6 +41,8 @@ type osWriter struct {
 }
 
 // newOSWriter 构造 OpenSearch 客户端（复用 esindex.NewWriter 相同 dial 参数形态便于运维一致）。
+// cfg.ESTLSInsecureSkipVerify=true 时注入 esindex.InsecureSkipVerifyTransport() 跳过自签
+// 证书校验（与 es-indexer / reconcile / backfill 同一 helper，避免各自实现漂移）。
 func newOSWriter(cfg ServiceConfig) (*osWriter, error) {
 	if len(cfg.ESAddresses) == 0 {
 		return nil, errors.New("fileextract: at least one OS address required")
@@ -48,11 +50,16 @@ func newOSWriter(cfg ServiceConfig) (*osWriter, error) {
 	if cfg.ESIndex == "" {
 		return nil, errors.New("fileextract: OS index required")
 	}
+	var transport http.RoundTripper
+	if cfg.ESTLSInsecureSkipVerify {
+		transport = esindex.InsecureSkipVerifyTransport()
+	}
 	client, err := opensearchapi.NewClient(opensearchapi.Config{
 		Client: opensearch.Config{
 			Addresses: cfg.ESAddresses,
 			Username:  cfg.ESUsername,
 			Password:  cfg.ESPassword,
+			Transport: transport,
 		},
 	})
 	if err != nil {
