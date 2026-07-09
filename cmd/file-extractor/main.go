@@ -50,8 +50,12 @@ func main() {
 
 func run(ctx context.Context) error {
 	cfg, enabled := loadConfig()
+	obsAddr := envOr("FILE_EXTRACTOR_OBS_ADDR", ":9090")
 	if !enabled {
 		log.Printf("file-extractor: FILE_EXTRACTOR_ENABLED not true (or brokers/ES unset); idling (no backend connection)")
+		// 对齐 es-indexer：空转态也起 obs server（/healthz + /readyz 200，/metrics 空），
+		// 让被刻意停用的 pod 不在编排器 HTTP 探针下 crashloop。不连任何后端（metrics=nil）。
+		serveIdleObs(ctx, obsAddr)
 		<-ctx.Done()
 		return nil
 	}
@@ -71,9 +75,44 @@ func run(ctx context.Context) error {
 			log.Printf("file-extractor: close error: %v", cerr)
 		}
 	}()
-	log.Printf("file-extractor running: topic=%s group=%s dlq=%s es_index=%s tika=%s",
-		cfg.Topic, cfg.GroupID, cfg.DLQTopic, cfg.ESIndex, cfg.TikaURL)
+
+	// Observability server（healthz/readyz/metrics）。运行循环起后置 ready。
+	if obsAddr != "" {
+		obs := fileextract.NewObsServer(obsAddr, svc.Metrics(), nil)
+		obs.Start(log.Printf)
+		obs.SetReady(true)
+		defer func() {
+			sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if serr := obs.Shutdown(sctx); serr != nil {
+				log.Printf("file-extractor: obs shutdown: %v", serr)
+			}
+		}()
+	}
+	log.Printf("file-extractor running: topic=%s group=%s dlq=%s es_index=%s tika=%s obs=%s",
+		cfg.Topic, cfg.GroupID, cfg.DLQTopic, cfg.ESIndex, cfg.TikaURL, obsAddr)
 	return svc.Run(ctx)
+}
+
+// serveIdleObs 在空转（停用）态起 obs HTTP server：/healthz 与 /readyz 均返回 200，
+// /metrics 空。对齐 es-indexer 的 idle obs，保证被停用的 pod 在探针下不 crashloop。
+// 不连任何后端（metrics=nil），ctx 取消时优雅停机。
+func serveIdleObs(ctx context.Context, addr string) {
+	if addr == "" {
+		return
+	}
+	obs := fileextract.NewObsServer(addr, nil, nil)
+	obs.SetReady(true) // 空转正常即 ready（未拨任何后端）
+	obs.Start(log.Printf)
+	go func() {
+		<-ctx.Done()
+		sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if serr := obs.Shutdown(sctx); serr != nil {
+			log.Printf("file-extractor: idle obs shutdown: %v", serr)
+		}
+	}()
+	log.Printf("file-extractor: idle observability server on %s (/healthz + /readyz 200, idle)", addr)
 }
 
 // assertLiveMapping 用 esindex.Writer 复用 mapping-compat 校验（P2-10）。

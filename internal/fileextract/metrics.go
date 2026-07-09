@@ -1,35 +1,103 @@
 package fileextract
 
-// metrics.go — file-extractor 计数器骨架（IDX-3 只做 log 打印，IDX-4+ 接 Prometheus 阶段 7 独立任务）。
-// 名字对齐 feasibility.md v2 §11 里提到的观察指标：processed / skipped_non_file / dlq_total[reason] /
-// extract_duration_ms / doc_not_yet（时序竞态触发次数）。
+// metrics.go — file-extractor Prometheus 指标（阶段 7：从 atomic stub 升级为 client_golang 私有 registry）。
+//
+// 设计对齐 sibling internal/consumer/metrics.go：
+//   - 私有 registry（不用 global default registry，避免多 binary 交叉注册）。
+//   - namespace = "fileextract"（与 indexer_* / searchetl_producer_* 对称）。
+//   - 由 obs.go 的 ObsServer 通过 Registry() 暴露 /metrics。
+//
+// 指标（全部 fileextract_ 前缀）：
+//   - processed_total          counter          抽取+回写成功数（核心吞吐）
+//   - skipped_non_file_total   counter          非 type=8 跳过数
+//   - dlq_total{reason}        counter          dead-letter 数 by reason
+//   - doc_not_yet_total        counter          主 doc 未落时序竞态触发数
+//   - retry_exhausted_total    counter          原地重试耗尽转 DLQ 数
+//   - os_permanent_total       counter          OS 4xx permanent 转 DLQ 数
+//
+// 兼容说明：本次（P0）只把已有 6 个计数点接到 client_golang 私有 registry，方法签名尽量不动 consumer 调用点，
+// 唯一变更是 IncDLQ 增加 reason 参数（调用点旁边本就有 reason 变量）。
+// 更细粒度指标（io_op_duration{op} / tika / download / content_bytes / tombstone /
+// dlq_write_errors）需新增埋点、涉及 download/tika/oswriter/dlq_handler 多文件，
+// 留待 P1 增量补齐（见 .omc/monitoring/file-extractor-monitoring-plan.md §3）。
 
 import (
-	"log"
-	"sync/atomic"
+	"github.com/prometheus/client_golang/prometheus"
 )
 
-// counters 是一组进程内简单计数（uint64 atomic），无并发风险且零依赖。
+// metricsNamespace 给所有 series 加 fileextract_ 前缀。
+const metricsNamespace = "fileextract"
+
+// counters 是 file-extractor 的可观测集，backed by prometheus client_golang，
+// 绑定在一个私有 registry 上（同 consumer.Metrics 惯例）。
 type counters struct {
-	processed      atomic.Uint64
-	skippedNonFile atomic.Uint64
-	dlqTotal       atomic.Uint64
-	docNotYet      atomic.Uint64 // v2 §7 #1 时序竞态触发计数，观察 Phase 2 独立 retry topic 是否要上
-	retryExhausted atomic.Uint64 // v1.13 Blocker #2：in-place retry N 次未成功 → DLQ 触发计数
-	osPermanent    atomic.Uint64 // v1.13 P2-2：OS 4xx permanent → DLQ 触发计数
+	reg *prometheus.Registry
+
+	processed      prometheus.Counter
+	skippedNonFile prometheus.Counter
+	dlqTotal       *prometheus.CounterVec
+	docNotYet      prometheus.Counter
+	retryExhausted prometheus.Counter
+	osPermanent    prometheus.Counter
 }
 
-func (c *counters) IncProcessed()      { c.processed.Add(1) }
-func (c *counters) IncSkippedNonFile() { c.skippedNonFile.Add(1) }
-func (c *counters) IncDLQ()            { c.dlqTotal.Add(1) }
-func (c *counters) IncDocNotYet()      { c.docNotYet.Add(1) }
-func (c *counters) IncRetryExhausted() { c.retryExhausted.Add(1) }
-func (c *counters) IncOSPermanent()    { c.osPermanent.Add(1) }
-
-// LogSnapshot 打印当前累计计数（周期性调用，比如每 N 秒或 debug 时）。
-// IDX-3 stub 版：只 log；阶段 7 接 Prometheus counter 替换。
-func (c *counters) LogSnapshot() {
-	log.Printf("file-extractor metrics: processed=%d skipped_non_file=%d dlq_total=%d doc_not_yet=%d retry_exhausted=%d os_permanent=%d",
-		c.processed.Load(), c.skippedNonFile.Load(), c.dlqTotal.Load(), c.docNotYet.Load(),
-		c.retryExhausted.Load(), c.osPermanent.Load())
+// newCounters 构造并注册所有指标到私有 registry。
+func newCounters() *counters {
+	reg := prometheus.NewRegistry()
+	c := &counters{
+		reg: reg,
+		processed: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Name:      "processed_total",
+			Help:      "Files extracted and written back to OpenSearch successfully.",
+		}),
+		skippedNonFile: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Name:      "skipped_non_file_total",
+			Help:      "Non type=8 messages skipped.",
+		}),
+		dlqTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Name:      "dlq_total",
+			Help:      "Messages dead-lettered by reason.",
+		}, []string{"reason"}),
+		docNotYet: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Name:      "doc_not_yet_total",
+			Help:      "Timing-race hits where the main doc was not yet indexed by es-indexer (404).",
+		}),
+		retryExhausted: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Name:      "retry_exhausted_total",
+			Help:      "In-place retries exhausted, forced to DLQ.",
+		}),
+		osPermanent: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Name:      "os_permanent_total",
+			Help:      "OpenSearch 4xx permanent errors routed to DLQ.",
+		}),
+	}
+	reg.MustRegister(
+		c.processed, c.skippedNonFile, c.dlqTotal,
+		c.docNotYet, c.retryExhausted, c.osPermanent,
+	)
+	return c
 }
+
+// Registry 暴露私有 registry 供 obs /metrics handler 使用。
+func (c *counters) Registry() *prometheus.Registry { return c.reg }
+
+func (c *counters) IncProcessed()      { c.processed.Inc() }
+func (c *counters) IncSkippedNonFile() { c.skippedNonFile.Inc() }
+
+// IncDLQ 记一次 dead-letter，reason 为空时归到 "unknown" 避免空 label。
+func (c *counters) IncDLQ(reason string) {
+	if reason == "" {
+		reason = "unknown"
+	}
+	c.dlqTotal.WithLabelValues(reason).Inc()
+}
+
+func (c *counters) IncDocNotYet()      { c.docNotYet.Inc() }
+func (c *counters) IncRetryExhausted() { c.retryExhausted.Inc() }
+func (c *counters) IncOSPermanent()    { c.osPermanent.Inc() }

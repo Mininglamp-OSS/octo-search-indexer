@@ -14,6 +14,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -160,8 +161,9 @@ func TestProcessBatch_RetryExhaustedToDLQ(t *testing.T) {
 	if len(dlq.records) != 1 || dlq.records[0].Reason != ReasonRetryExhausted {
 		t.Fatalf("expected 1 DLQ retry_exhausted, got %+v", dlq.records)
 	}
-	if p.metrics.retryExhausted.Load() != 1 {
-		t.Fatalf("retryExhausted counter should be 1, got %d", p.metrics.retryExhausted.Load())
+	if got := dumpMetrics(t, p.metrics); !strings.Contains(got, `fileextract_dlq_total{reason="retry_exhausted"} 1`) ||
+		!strings.Contains(got, "fileextract_retry_exhausted_total 1") {
+		t.Fatalf("dlq_total{reason=retry_exhausted} and retry_exhausted_total should both be 1 in:\n%s", got)
 	}
 	if len(src.commits) != 1 || src.commits[0].Offset != 200 {
 		t.Fatalf("offset must be committed after DLQ retry_exhausted, got %+v", src.commits)
@@ -217,8 +219,32 @@ func TestProcessBatch_OSPermanentToDLQ(t *testing.T) {
 	if len(dlq.records) != 1 || dlq.records[0].Reason != ReasonOSPermanent {
 		t.Fatalf("expected 1 DLQ os_permanent, got %+v", dlq.records)
 	}
-	if p.metrics.osPermanent.Load() != 1 {
-		t.Fatalf("osPermanent counter should be 1, got %d", p.metrics.osPermanent.Load())
+	if got := dumpMetrics(t, p.metrics); !strings.Contains(got, `fileextract_dlq_total{reason="os_permanent"} 1`) ||
+		!strings.Contains(got, "fileextract_os_permanent_total 1") {
+		t.Fatalf("dlq_total{reason=os_permanent} and os_permanent_total should both be 1 in:\n%s", got)
+	}
+}
+
+// TestProcessBatch_DynamicReasonLabel extractor 动态返回的 dlqReason（此处 empty_extract）
+// 必须原样透传到 fileextract_dlq_total 的 reason label。区别于 retry_exhausted/os_permanent/
+// parse_error 那三个静态常量分支，这条覆盖 attemptOne 里 `p.metrics.IncDLQ(dlqReason)` 路径。
+func TestProcessBatch_DynamicReasonLabel(t *testing.T) {
+	src := &mockSource{}
+	dlq := &mockDLQSink{}
+	ext := newMockExtractor()
+	// extractor 判定文件抽取为空 → 返回非空 dlqReason（不 retry，直接 DLQ）
+	ext.queue("empty", extractResult{reason: ReasonEmptyExtract})
+	p := newRetryTestProcessor(t, src, dlq, ext, 10)
+
+	batch := []fetchedMessage{mkFileMessage(t, "empty", 0, 500)}
+	if err := p.processBatch(context.Background(), batch); err != nil {
+		t.Fatalf("processBatch: %v", err)
+	}
+	if len(dlq.records) != 1 || dlq.records[0].Reason != ReasonEmptyExtract {
+		t.Fatalf("expected 1 DLQ empty_extract, got %+v", dlq.records)
+	}
+	if got := dumpMetrics(t, p.metrics); !strings.Contains(got, `fileextract_dlq_total{reason="empty_extract"} 1`) {
+		t.Fatalf("dynamic reason must pass through to dlq_total label, want reason=empty_extract in:\n%s", got)
 	}
 }
 

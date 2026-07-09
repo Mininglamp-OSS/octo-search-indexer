@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 
@@ -105,8 +106,8 @@ func TestProcessOne_SkipNonFileMessages(t *testing.T) {
 		if len(dlq.records) != 0 {
 			t.Errorf("ct=%d: expected 0 DLQ records, got %d: %+v", ct, len(dlq.records), dlq.records)
 		}
-		if p.metrics.skippedNonFile.Load() != 1 {
-			t.Errorf("ct=%d: skippedNonFile expected 1, got %d", ct, p.metrics.skippedNonFile.Load())
+		if got := dumpMetrics(t, p.metrics); !strings.Contains(got, `fileextract_skipped_non_file_total 1`) {
+			t.Errorf("ct=%d: skippedNonFile expected 1 in:\n%s", ct, got)
 		}
 	}
 }
@@ -132,8 +133,8 @@ func TestProcessOne_ParseErrorToDLQ(t *testing.T) {
 	if dlq.records[0].Reason != ReasonParseError {
 		t.Errorf("reason: got %q want %q", dlq.records[0].Reason, ReasonParseError)
 	}
-	if p.metrics.dlqTotal.Load() != 1 {
-		t.Errorf("dlqTotal expected 1, got %d", p.metrics.dlqTotal.Load())
+	if got := dumpMetrics(t, p.metrics); !strings.Contains(got, `fileextract_dlq_total{reason="parse_error"} 1`) {
+		t.Errorf("dlqTotal parse_error expected 1 in:\n%s", got)
 	}
 }
 

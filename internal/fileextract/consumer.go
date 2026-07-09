@@ -38,6 +38,9 @@ type Processor struct {
 	sleep func(context.Context, time.Duration) error
 }
 
+// Metrics 暴露 Processor 的可观测计数集，供 Service/obs server 拿 registry 暴露 /metrics。
+func (p *Processor) Metrics() *counters { return p.metrics }
+
 // extractorService 抽象「抽取 + OS partial update」核心行为，供 Processor 测试注入 mock。
 // 生产实现是 *Extractor（extractor.go），本 interface 只暴露 processOne/attemptOne 需要的
 // 单个方法，便于最小化 test surface。
@@ -73,7 +76,7 @@ func NewProcessor(src messageSource, dlq dlqSink, ext extractorService, cfg Serv
 		source:    src,
 		dlqSink:   dlq,
 		dlq:       handler,
-		metrics:   &counters{},
+		metrics:   newCounters(),
 		extractor: ext,
 		cfg:       cfg,
 		sleep:     sleepCtx,
@@ -206,7 +209,7 @@ func (p *Processor) processBatch(ctx context.Context, batch []fetchedMessage) er
 					return werr // DLQ 硬停 fatal
 				}
 				p.metrics.IncRetryExhausted()
-				p.metrics.IncDLQ()
+				p.metrics.IncDLQ(ReasonRetryExhausted)
 				dispositions[i] = dispDLQResolved
 				changed = true
 				continue
@@ -260,7 +263,7 @@ func (p *Processor) processBatch(ctx context.Context, batch []fetchedMessage) er
 func (p *Processor) attemptOne(ctx context.Context, m fetchedMessage) (attemptOutcome, error) {
 	var msg searchmsg.Message
 	if err := json.Unmarshal(m.Value, &msg); err != nil {
-		p.metrics.IncDLQ()
+		p.metrics.IncDLQ(ReasonParseError)
 		if werr := p.writeDLQ(ctx, m, ReasonParseError, "", nil, err); werr != nil {
 			return outcomeFatal, werr
 		}
@@ -276,7 +279,7 @@ func (p *Processor) attemptOne(ctx context.Context, m fetchedMessage) (attemptOu
 	if err != nil {
 		// P2-2：OS permanent 4xx → 走 DLQ ReasonOSPermanent（不走 transient retry）
 		if errors.Is(err, errOSPermanent) {
-			p.metrics.IncDLQ()
+			p.metrics.IncDLQ(ReasonOSPermanent)
 			p.metrics.IncOSPermanent()
 			if werr := p.writeDLQ(ctx, m, ReasonOSPermanent, msg.MessageID, fp, err); werr != nil {
 				return outcomeFatal, werr
@@ -290,7 +293,7 @@ func (p *Processor) attemptOne(ctx context.Context, m fetchedMessage) (attemptOu
 		return outcomeTransient, nil
 	}
 	if dlqReason != "" {
-		p.metrics.IncDLQ()
+		p.metrics.IncDLQ(dlqReason)
 		if werr := p.writeDLQ(ctx, m, dlqReason, msg.MessageID, fp, cause); werr != nil {
 			return outcomeFatal, werr
 		}

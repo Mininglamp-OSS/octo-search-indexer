@@ -54,6 +54,9 @@ func NewService(cfg ServiceConfig) (*Service, error) {
 // Run 运行到 ctx 取消。
 func (s *Service) Run(ctx context.Context) error { return s.proc.Run(ctx) }
 
+// Metrics 暴露底层计数集的私有 registry，供 obs server 走 /metrics。
+func (s *Service) Metrics() *counters { return s.proc.Metrics() }
+
 // Close 关闭底层 Kafka client（Reader + DLQ Writer）。
 func (s *Service) Close() error {
 	var firstErr error
