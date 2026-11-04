@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 
-FROM golang:1.25-alpine AS builder
+FROM golang:1.26.10-alpine AS builder
 WORKDIR /app
 
 # Cache module downloads as a separate layer so code edits don't bust the dep cache.

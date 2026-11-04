@@ -1,6 +1,6 @@
 module github.com/Mininglamp-OSS/octo-search-indexer
 
-go 1.25.0
+go 1.26.10
 
 require (
 	github.com/Mininglamp-OSS/octo-lib v0.0.0-20260622132305-e8f7feac26e7
