@@ -8,7 +8,7 @@ or frontend interfaces.
 
 `payload.file.name` remains the original filename and retains its IK mapping for
 T2 cross-field fulltext queries. `FilePayload.MarshalJSON` additionally writes
-`payload.file.nameLiteral`: `cases.Fold(width.Fold(name))`, using x/text v0.32.0,
+`payload.file.nameLiteral`: `NFC(cases.Fold(width.Fold(name)))`, using x/text v0.32.0,
 without trimming the stored name. Only the query's edge whitespace is trimmed.
 No NFKC, transliteration, simplified/traditional conversion, or wildcard syntax
 is added.
@@ -123,3 +123,14 @@ covers bounded paging/bulk, preflight rejection, repair/verification, restart/id
 and preservation of extracted body/metadata. The companion server's
 `TestF3FilenameOpenSearch` consumes this exact mapping through
 `F3_INDEXER_MAPPING` and verifies four query entry points with real IK analysis.
+
+## Canonical filename equivalence (PR review correction)
+
+After width/case folding, apply NFC canonical normalization in both writer and
+reader. This makes voiced/semi-voiced pairs such as `ｶﾞｲﾄﾞ` / `ガイド` and
+`ﾊﾟｰﾂ` / `パーツ` match in both directions. It does not introduce NFKC;
+punctuation, internal whitespace and compatibility characters such as `①` remain
+significant. Highlights map complete canonical segments to original text.
+Existing non-NFC `nameLiteral` values must be repaired using the updated backfill
+even if the field already exists. Follow the same coordinated rollout above;
+old normalization writers must remain stopped.

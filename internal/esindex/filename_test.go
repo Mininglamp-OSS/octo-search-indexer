@@ -9,6 +9,11 @@ import (
 
 func TestFilenameSerialization(t *testing.T) {
 	for _, tc := range []struct{ name, folded string }{
+		{"ｶﾞｲﾄﾞ.pdf", "ガイド.pdf"},
+		{"ガイド.pdf", "ガイド.pdf"},
+		{"ﾊﾟｰﾂ.pdf", "パーツ.pdf"},
+		{"パーツ.pdf", "パーツ.pdf"},
+		{"Cafe\u0301.pdf", "café.pdf"},
 		{"ＯＣＴＯ方案ｖ１．２.pdf", "octo方案v1.2.pdf"},
 		{"排期  评审.PDF", "排期  评审.pdf"},
 		{"100%_完成*?.pdf", "100%_完成*?.pdf"},
@@ -52,14 +57,14 @@ func TestFilenameMappingContract(t *testing.T) {
 
 func TestFilenameBulkSerialization(t *testing.T) {
 	fileType := 8
-	doc := Doc{MessageID: 1, Payload: &Payload{Type: &fileType, File: &FilePayload{Name: "ＯＣＴＯ v1.2.pdf"}}}
-	doc.Derivatives = []Doc{{MessageID: 1, SubSeq: 2, idOverride: "1-rt2", Payload: &Payload{Type: &fileType, File: &FilePayload{Name: "Straße.pdf"}}}}
+	doc := Doc{MessageID: 1, Payload: &Payload{Type: &fileType, File: &FilePayload{Name: "ｶﾞｲﾄﾞ.pdf"}}}
+	doc.Derivatives = []Doc{{MessageID: 1, SubSeq: 2, idOverride: "1-rt2", Payload: &Payload{Type: &fileType, File: &FilePayload{Name: "ﾊﾟｰﾂ.pdf"}}}}
 	body, err := encodeBulkBody([]Doc{doc})
 	if err != nil {
 		t.Fatal(err)
 	}
 	lines := strings.Split(strings.TrimSpace(string(body)), "\n")
-	for i, want := range []string{"octo v1.2.pdf", "strasse.pdf"} {
+	for i, want := range []string{"ガイド.pdf", "パーツ.pdf"} {
 		var update map[string]any
 		if err = json.Unmarshal([]byte(lines[i*2+1]), &update); err != nil {
 			t.Fatal(err)

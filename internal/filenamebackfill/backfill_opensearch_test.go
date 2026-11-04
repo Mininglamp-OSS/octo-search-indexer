@@ -74,7 +74,7 @@ func TestBackfillOpenSearchConcurrency(t *testing.T) {
 	for _, id := range []string{"1", "2", "3", "4"} {
 		request("PUT", "/_doc/"+id, []byte(`{"messageId":123,"timestamp":100,"channelId":"g","channelType":2,"spaceId":"s","visibles":["original"],"revoked":false,"payload":{"type":8,"file":{"name":"ＯＣＴＯ v1.2.pdf","content":"body stays","contentMeta":{"truncated":true}}}}`))
 	}
-	request("PUT", "/_doc/5", []byte(`{"messageId":5,"timestamp":100,"channelId":"g","channelType":2,"payload":{"type":8,"file":{"name":"😀*?"}}}`))
+	request("PUT", "/_doc/5", []byte(`{"messageId":5,"timestamp":100,"channelId":"g","channelType":2,"payload":{"type":8,"file":{"name":"ｶﾞｲﾄﾞ.pdf","nameLiteral":"カ\u3099イト\u3099.pdf"}}}`))
 	request("POST", "/_refresh", nil)
 	tr := beforeUpdateTransport{base: http.DefaultTransport, before: func(r *http.Request) {
 		raw, err := io.ReadAll(r.Body)
@@ -128,6 +128,20 @@ func TestBackfillOpenSearchConcurrency(t *testing.T) {
 	file := doc["payload"].(map[string]any)["file"].(map[string]any)
 	if doc["revoked"] != true || doc["visibles"].([]any)[0] != "restricted" || file["content"] != "body stays" || file["nameLiteral"] != "octo v1.2.pdf" || file["contentMeta"].(map[string]any)["truncated"] != true {
 		t.Fatalf("backfill clobbered source: %v", doc)
+	}
+	kana := request("GET", "/_doc/5", nil)["_source"].(map[string]any)["payload"].(map[string]any)["file"].(map[string]any)
+	if kana["name"] != "ｶﾞｲﾄﾞ.pdf" || kana["nameLiteral"] != "ガイド.pdf" {
+		t.Fatalf("old non-NFC field not repaired: %v", kana)
+	}
+	for _, query := range []string{"ガイド", "ｶﾞｲﾄﾞ"} {
+		body, err := json.Marshal(map[string]any{"query": map[string]any{"match_phrase": map[string]any{"payload.file.nameLiteral": esindex.FoldFilename(query)}}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		hits := request("POST", "/_search", body)["hits"].(map[string]any)["hits"].([]any)
+		if len(hits) != 1 || hits[0].(map[string]any)["_id"] != "5" {
+			t.Fatalf("kana search: %v", hits)
+		}
 	}
 	renamed := request("GET", "/_doc/2", nil)["_source"].(map[string]any)["payload"].(map[string]any)["file"].(map[string]any)
 	if renamed["name"] != "new.pdf" || renamed["nameLiteral"] != "new.pdf" {
