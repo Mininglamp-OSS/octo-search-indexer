@@ -14,7 +14,7 @@ import (
 )
 
 // requestJSON bounds metadata responses and never logs credentials or source text.
-func requestJSON(ctx context.Context, c *opensearchapi.Client, method, path string, body any, out any) error {
+func requestJSON(ctx context.Context, c *opensearchapi.Client, method, path string, body any, out any) (err error) {
 	var buf bytes.Buffer
 	if body != nil {
 		if err := json.NewEncoder(&buf).Encode(body); err != nil {
@@ -29,7 +29,11 @@ func requestJSON(ctx context.Context, c *opensearchapi.Client, method, path stri
 	if err != nil {
 		return err
 	}
-	defer res.Body.Close()
+	defer func() {
+		if closeErr := res.Body.Close(); err == nil {
+			err = closeErr
+		}
+	}()
 	if res.StatusCode >= 300 {
 		return fmt.Errorf("filename backfill %s %s: HTTP %d", method, path, res.StatusCode)
 	}

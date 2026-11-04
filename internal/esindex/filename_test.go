@@ -103,7 +103,10 @@ func TestFilenameLiveMappingGuard(t *testing.T) {
 			} else {
 				field[tc.field] = tc.value
 			}
-			body, _ := json.Marshal(map[string]any{"octo-message": map[string]any{"mappings": mapping}})
+			body, err := json.Marshal(map[string]any{"octo-message": map[string]any{"mappings": mapping}})
+			if err != nil {
+				t.Fatal(err)
+			}
 			writer := mappingWriter(t, &mappingTransport{body: string(body)})
 			if err := writer.AssertLiveMappingCompatible(context.Background()); (err == nil) != tc.ok {
 				t.Fatalf("mapping check: %v", err)

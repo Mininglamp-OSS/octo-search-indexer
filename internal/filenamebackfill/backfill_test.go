@@ -38,7 +38,9 @@ func mockMetadata(t *testing.T, w http.ResponseWriter, r *http.Request, mutate f
 	if mutate != nil {
 		mutate(r.URL.Path, body)
 	}
-	_ = json.NewEncoder(w).Encode(body)
+	if err := json.NewEncoder(w).Encode(body); err != nil {
+		t.Fatal(err)
+	}
 	return true
 }
 func testClient(t *testing.T, handler http.HandlerFunc) *opensearchapi.Client {
@@ -77,7 +79,9 @@ func TestRunBulkAndVerification(t *testing.T) {
 				switch {
 				case r.URL.Path == "/target/_search":
 					var q map[string]any
-					_ = json.NewDecoder(r.Body).Decode(&q)
+					if err := json.NewDecoder(r.Body).Decode(&q); err != nil {
+						t.Fatal(err)
+					}
 					if _, ok := q["query"].(map[string]any)["match_all"]; !ok {
 						t.Error("source audit must not depend on indexed eligibility")
 					}
@@ -96,7 +100,9 @@ func TestRunBulkAndVerification(t *testing.T) {
 					if refreshed && tc.name == "deleted" {
 						hits = nil
 					}
-					_ = json.NewEncoder(w).Encode(map[string]any{"_scroll_id": "scroll", "hits": map[string]any{"hits": hits}})
+					if err := json.NewEncoder(w).Encode(map[string]any{"_scroll_id": "scroll", "hits": map[string]any{"hits": hits}}); err != nil {
+						t.Fatal(err)
+					}
 				case r.URL.Path == "/target/_bulk":
 					bulkCount++
 					dec := json.NewDecoder(r.Body)
@@ -118,21 +124,33 @@ func TestRunBulkAndVerification(t *testing.T) {
 					if tc.kind != "" {
 						item["error"] = map[string]string{"type": tc.kind}
 					}
-					_ = json.NewEncoder(w).Encode(map[string]any{"errors": tc.status >= 400, "items": []any{map[string]any{"update": item}}})
+					if err := json.NewEncoder(w).Encode(map[string]any{"errors": tc.status >= 400, "items": []any{map[string]any{"update": item}}}); err != nil {
+						t.Fatal(err)
+					}
 				case r.URL.Path == "/target/_count":
 					if tc.name == "deleted" {
-						fmt.Fprint(w, `{"count":0}`)
+						if _, err := fmt.Fprint(w, `{"count":0}`); err != nil {
+							t.Error(err)
+						}
 					} else {
-						fmt.Fprint(w, `{"count":1}`)
+						if _, err := fmt.Fprint(w, `{"count":1}`); err != nil {
+							t.Error(err)
+						}
 					}
 				case r.URL.Path == "/target/_refresh":
 					refreshed = true
-					fmt.Fprint(w, `{"_shards":{"failed":0}}`)
+					if _, err := fmt.Fprint(w, `{"_shards":{"failed":0}}`); err != nil {
+						t.Error(err)
+					}
 				case r.URL.Path == "/_search/scroll" && r.Method == "DELETE":
 					cleared++
-					fmt.Fprint(w, `{"succeeded":true}`)
+					if _, err := fmt.Fprint(w, `{"succeeded":true}`); err != nil {
+						t.Error(err)
+					}
 				case r.URL.Path == "/_search/scroll":
-					fmt.Fprint(w, `{"_scroll_id":"scroll","hits":{"hits":[]}}`)
+					if _, err := fmt.Fprint(w, `{"_scroll_id":"scroll","hits":{"hits":[]}}`); err != nil {
+						t.Error(err)
+					}
 				default:
 					t.Errorf("unexpected %s", r.URL)
 					w.WriteHeader(500)
@@ -220,12 +238,18 @@ func TestDryRunNeverWrites(t *testing.T) {
 		}
 		switch r.URL.Path {
 		case "/target/_search":
-			fmt.Fprint(w, `{"_scroll_id":"s","hits":{"hits":[{"_index":"target","_id":"1","_source":{"payload":{"type":8,"file":{"name":"ＯＣＴＯ","nameLiteral":"wrong"}}}}]}}`)
+			if _, err := fmt.Fprint(w, `{"_scroll_id":"s","hits":{"hits":[{"_index":"target","_id":"1","_source":{"payload":{"type":8,"file":{"name":"ＯＣＴＯ","nameLiteral":"wrong"}}}}]}}`); err != nil {
+				t.Error(err)
+			}
 		case "/_search/scroll":
 			if r.Method == "DELETE" {
-				fmt.Fprint(w, `{"succeeded":true}`)
+				if _, err := fmt.Fprint(w, `{"succeeded":true}`); err != nil {
+					t.Error(err)
+				}
 			} else {
-				fmt.Fprint(w, `{"hits":{"hits":[]}}`)
+				if _, err := fmt.Fprint(w, `{"hits":{"hits":[]}}`); err != nil {
+					t.Error(err)
+				}
 			}
 		default:
 			t.Errorf("dry-run mutated data: %s", r.URL)
@@ -243,7 +267,9 @@ func TestRunRejectsIncompleteSearch(t *testing.T) {
 		c := testClient(t, func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
 			if !mockMetadata(t, w, r, nil) {
-				fmt.Fprint(w, response)
+				if _, err := fmt.Fprint(w, response); err != nil {
+					t.Error(err)
+				}
 			}
 		})
 		if _, err := Run(context.Background(), c, "target", 1, 1000); err == nil {
@@ -260,7 +286,9 @@ func TestBulkByteLimit(t *testing.T) {
 			return
 		}
 		if r.URL.Path == "/_search/scroll" && r.Method == "DELETE" {
-			fmt.Fprint(w, `{"succeeded":true}`)
+			if _, err := fmt.Fprint(w, `{"succeeded":true}`); err != nil {
+				t.Error(err)
+			}
 			return
 		}
 		if r.URL.Path != "/target/_search" {
@@ -268,7 +296,9 @@ func TestBulkByteLimit(t *testing.T) {
 			w.WriteHeader(500)
 			return
 		}
-		_ = json.NewEncoder(w).Encode(map[string]any{"_scroll_id": "s", "hits": map[string]any{"hits": []any{map[string]any{"_index": "target", "_id": "1", "_source": map[string]any{"payload": map[string]any{"type": 8, "file": map[string]string{"name": strings.Repeat("x", maxBulkBytes)}}}}}}})
+		if err := json.NewEncoder(w).Encode(map[string]any{"_scroll_id": "s", "hits": map[string]any{"hits": []any{map[string]any{"_index": "target", "_id": "1", "_source": map[string]any{"payload": map[string]any{"type": 8, "file": map[string]string{"name": strings.Repeat("x", maxBulkBytes)}}}}}}}); err != nil {
+			t.Fatal(err)
+		}
 	})
 	if _, err := Run(context.Background(), c, "target", 1, 1000); err == nil {
 		t.Fatal("oversized update accepted")
@@ -297,7 +327,9 @@ func TestVerificationRequiresIndexedCoverageAndSearch(t *testing.T) {
 				if tc.failed {
 					failed = 1
 				}
-				fmt.Fprintf(w, `{"count":%d,"_shards":{"failed":%d}}`, n, failed)
+				if _, err := fmt.Fprintf(w, `{"count":%d,"_shards":{"failed":%d}}`, n, failed); err != nil {
+					t.Error(err)
+				}
 			})
 			err := verifyIndexed(context.Background(), c, "target", 1, []filenameSample{{id: "1", folded: "octo v1.2.pdf"}})
 			if (err != nil) != tc.wantError {
@@ -310,7 +342,9 @@ func TestVerificationRequiresIndexedCoverageAndSearch(t *testing.T) {
 func TestBulkPartialFailureReportsAllItems(t *testing.T) {
 	c := testClient(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprint(w, `{"errors":true,"items":[{"update":{"_index":"target","_id":"1","status":200,"result":"updated"}},{"update":{"_index":"target","_id":"2","status":409,"error":{"type":"version_conflict_engine_exception"}}},{"update":{"_index":"target","_id":"3","status":404,"error":{"type":"document_missing_exception"}}}]}`)
+		if _, err := fmt.Fprint(w, `{"errors":true,"items":[{"update":{"_index":"target","_id":"1","status":200,"result":"updated"}},{"update":{"_index":"target","_id":"2","status":409,"error":{"type":"version_conflict_engine_exception"}}},{"update":{"_index":"target","_id":"3","status":404,"error":{"type":"document_missing_exception"}}}]}`); err != nil {
+			t.Error(err)
+		}
 	})
 	var stats Stats
 	batch := []pendingUpdate{{id: "1"}, {id: "2"}, {id: "3"}}
@@ -319,5 +353,24 @@ func TestBulkPartialFailureReportsAllItems(t *testing.T) {
 	}
 	if stats.Updated != 1 || stats.Deleted != 1 || stats.Batches != 1 {
 		t.Fatal(stats)
+	}
+}
+
+func TestScrollCleanupFailureReported(t *testing.T) {
+	c := testClient(t, func(w http.ResponseWriter, r *http.Request) {
+		if mockMetadata(t, w, r, nil) {
+			return
+		}
+		if r.Method == http.MethodDelete {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		if _, err := fmt.Fprint(w, `{"_scroll_id":"s","hits":{"hits":[]}}`); err != nil {
+			t.Error(err)
+		}
+	})
+	_, err := RunWithOptions(context.Background(), c, "target", Options{PageSize: 2, Rate: 100, DryRun: true})
+	if err == nil || !strings.Contains(err.Error(), "clear filename scroll") {
+		t.Fatalf("cleanup failure lost: %v", err)
 	}
 }

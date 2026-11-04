@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -207,9 +208,12 @@ func decodeFilename(hit opensearchapi.SearchHit) (string, string, error) {
 
 // Offline migration audit only: bounded filename-only pages, never file bodies.
 // Scanning all eligible names also finds stale nonempty derived values on reruns.
-func walk(ctx context.Context, client *opensearchapi.Client, index string, size int, visit func([]opensearchapi.SearchHit) error) error {
+func walk(ctx context.Context, client *opensearchapi.Client, index string, size int, visit func([]opensearchapi.SearchHit) error) (retErr error) {
 	query := map[string]any{"size": size, "sort": []string{"_doc"}, "_source": []string{"payload.file.name", "payload.file.nameLiteral", "payload.type"}, "query": map[string]any{"match_all": map[string]any{}}}
-	body, _ := json.Marshal(query)
+	body, err := json.Marshal(query)
+	if err != nil {
+		return err
+	}
 	first, err := client.Search(ctx, &opensearchapi.SearchReq{Indices: []string{index}, Body: bytes.NewReader(body), Params: opensearchapi.SearchParams{Scroll: 15 * time.Minute}})
 	if err != nil {
 		return err
@@ -222,8 +226,13 @@ func walk(ctx context.Context, client *opensearchapi.Client, index string, size 
 		if scrollID != "" {
 			cleanup, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			defer cancel()
-			b, _ := json.Marshal(map[string]any{"scroll_id": []string{scrollID}})
-			_, _ = client.Scroll.Delete(cleanup, opensearchapi.ScrollDeleteReq{Body: bytes.NewReader(b)})
+			b, err := json.Marshal(map[string]any{"scroll_id": []string{scrollID}})
+			if err == nil {
+				_, err = client.Scroll.Delete(cleanup, opensearchapi.ScrollDeleteReq{Body: bytes.NewReader(b)})
+			}
+			if err != nil {
+				retErr = errors.Join(retErr, fmt.Errorf("clear filename scroll: %w", err))
+			}
 		}
 	}()
 	if first.Timeout || first.Shards.Failed > 0 {

@@ -8,7 +8,7 @@ or frontend interfaces.
 
 `payload.file.name` remains the original filename and retains its IK mapping for
 T2 cross-field fulltext queries. `FilePayload.MarshalJSON` additionally writes
-`payload.file.nameLiteral`: `NFC(cases.Fold(NFC(width.Fold(name))))`, using x/text v0.32.0,
+`payload.file.nameLiteral`: `NFC(cases.Fold(NFC(width.Fold(name))))`, using x/text v0.41.0,
 without trimming the stored name. Only the query's edge whitespace is trimmed.
 No NFKC, transliteration, simplified/traditional conversion, or wildcard syntax
 is added.

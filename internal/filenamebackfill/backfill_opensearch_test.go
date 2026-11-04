@@ -48,7 +48,11 @@ func TestBackfillOpenSearchConcurrency(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		defer res.Body.Close()
+		defer func() {
+			if err := res.Body.Close(); err != nil {
+				t.Error(err)
+			}
+		}()
 		b, err := io.ReadAll(res.Body)
 		if err != nil {
 			t.Fatal(err)

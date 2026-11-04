@@ -39,7 +39,9 @@ func TestFilenameBackfillCapacity(t *testing.T) {
 	for _, mode := range []string{"serial", "bulk"} {
 		index := prefix + "-" + mode
 		var mapping map[string]any
-		_ = json.Unmarshal(esindex.IndexMappingJSON(), &mapping)
+		if err := json.Unmarshal(esindex.IndexMappingJSON(), &mapping); err != nil {
+			t.Fatal(err)
+		}
 		mapping["settings"].(map[string]any)["index"].(map[string]any)["number_of_replicas"] = 0
 		if err := requestJSON(ctx, client, "PUT", "/"+index, mapping, nil); err != nil {
 			t.Fatal(err)
@@ -47,14 +49,20 @@ func TestFilenameBackfillCapacity(t *testing.T) {
 		t.Cleanup(func() {
 			cleanup, stop := context.WithTimeout(context.Background(), 10*time.Second)
 			defer stop()
-			_ = requestJSON(cleanup, client, "DELETE", "/"+index, nil, nil)
+			if err := requestJSON(cleanup, client, "DELETE", "/"+index, nil, nil); err != nil {
+				t.Fatal(err)
+			}
 		})
 		for from := 0; from < n; from += 200 {
 			var buf bytes.Buffer
 			enc := json.NewEncoder(&buf)
 			for i := from; i < min(from+200, n); i++ {
-				_ = enc.Encode(map[string]any{"index": map[string]any{"_id": strconv.Itoa(i)}})
-				_ = enc.Encode(map[string]any{"messageId": i + 1, "timestamp": 100, "channelId": "g", "channelType": 2, "payload": map[string]any{"type": 8, "file": map[string]any{"name": fmt.Sprintf("ＯＣＴＯ-排期-v1.2-%d.pdf", i), "content": bodyText}}})
+				if err := enc.Encode(map[string]any{"index": map[string]any{"_id": strconv.Itoa(i)}}); err != nil {
+					t.Fatal(err)
+				}
+				if err := enc.Encode(map[string]any{"messageId": i + 1, "timestamp": 100, "channelId": "g", "channelType": 2, "payload": map[string]any{"type": 8, "file": map[string]any{"name": fmt.Sprintf("ＯＣＴＯ-排期-v1.2-%d.pdf", i), "content": bodyText}}}); err != nil {
+					t.Fatal(err)
+				}
 			}
 			res, err := client.Bulk(ctx, opensearchapi.BulkReq{Index: index, Body: &buf})
 			if err != nil {
@@ -86,7 +94,10 @@ func TestFilenameBackfillCapacity(t *testing.T) {
 						return ctx.Err()
 					case <-timer.C:
 					}
-					payload, _ := json.Marshal(map[string]any{"script": map[string]any{"lang": "painless", "source": updateScript, "params": map[string]string{"name": name, "folded": esindex.FoldFilename(name)}}})
+					payload, err := json.Marshal(map[string]any{"script": map[string]any{"lang": "painless", "source": updateScript, "params": map[string]string{"name": name, "folded": esindex.FoldFilename(name)}}})
+					if err != nil {
+						t.Fatal(err)
+					}
 					if _, err := client.Update(ctx, opensearchapi.UpdateReq{Index: index, DocumentID: hit.ID, Body: bytes.NewReader(payload)}); err != nil {
 						return err
 					}
@@ -131,12 +142,18 @@ func TestPreflightLiveWrongAnalyzer(t *testing.T) {
 	defer cancel()
 	index := fmt.Sprintf("test-f3-wrong-analyzer-%d", time.Now().UnixNano())
 	var mapping map[string]any
-	_ = json.Unmarshal(esindex.IndexMappingJSON(), &mapping)
+	if err := json.Unmarshal(esindex.IndexMappingJSON(), &mapping); err != nil {
+		t.Fatal(err)
+	}
 	mapping["settings"].(map[string]any)["analysis"].(map[string]any)["tokenizer"].(map[string]any)["filename_chars"].(map[string]any)["token_chars"] = []string{"letter"}
 	if err := requestJSON(ctx, c, http.MethodPut, "/"+index, mapping, nil); err != nil {
 		t.Fatal(err)
 	}
-	defer requestJSON(context.Background(), c, http.MethodDelete, "/"+index, nil, nil)
+	defer func() {
+		if err := requestJSON(context.Background(), c, http.MethodDelete, "/"+index, nil, nil); err != nil {
+			t.Error(err)
+		}
+	}()
 	if _, err := Run(ctx, c, index, 2, 1000); err == nil {
 		t.Fatal("wrong analyzer accepted even on empty index")
 	}
@@ -161,7 +178,11 @@ func TestPreflightPopulatedUnindexedName(t *testing.T) {
 	if err := requestJSON(ctx, c, "PUT", "/"+index, mapping, nil); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = requestJSON(ctx, c, "DELETE", "/"+index, nil, nil) })
+	t.Cleanup(func() {
+		if err := requestJSON(ctx, c, "DELETE", "/"+index, nil, nil); err != nil {
+			t.Error(err)
+		}
+	})
 	doc := map[string]any{"payload": map[string]any{"type": 8, "file": map[string]any{"name": "historical.pdf"}}}
 	if err := requestJSON(ctx, c, "PUT", "/"+index+"/_doc/1?refresh=true", doc, nil); err != nil {
 		t.Fatal(err)
