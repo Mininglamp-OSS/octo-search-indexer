@@ -45,6 +45,7 @@ type mappingNode struct {
 	Analyzer       string                 `json:"analyzer"`
 	SearchAnalyzer string                 `json:"search_analyzer"`
 	IndexOptions   string                 `json:"index_options"`
+	Enabled        *bool                  `json:"enabled"`
 	Index          *bool                  `json:"index"`
 	Properties     map[string]mappingNode `json:"properties"`
 	Source         struct {
@@ -75,6 +76,17 @@ func preflight(ctx context.Context, c *opensearchapi.Client, index string) error
 	// preserve extracted content. This migration requires the complete source.
 	if root.Source.Enabled != nil && !*root.Source.Enabled || len(root.Source.Includes) > 0 || len(root.Source.Excludes) > 0 {
 		return fmt.Errorf("target requires complete enabled _source without includes/excludes")
+	}
+	for _, node := range []mappingNode{root, root.Properties["payload"], root.Properties["payload"].Properties["file"]} {
+		if node.Enabled != nil && !*node.Enabled || node.Type != "" && node.Type != "object" {
+			return fmt.Errorf("filename ancestors must be enabled plain objects")
+		}
+	}
+	payload := root.Properties["payload"]
+	typ := payload.Properties["type"]
+	name := payload.Properties["file"].Properties["name"]
+	if typ.Type != "integer" || typ.Index != nil && !*typ.Index || name.Type != "text" || name.Index != nil && !*name.Index {
+		return fmt.Errorf("audit requires indexed integer payload.type and indexed text payload.file.name")
 	}
 	f := root.Properties["payload"].Properties["file"].Properties["nameLiteral"]
 	if f.Type != "text" || f.Analyzer != "filename_literal" || (f.SearchAnalyzer != "" && f.SearchAnalyzer != "filename_literal") || f.Index != nil && !*f.Index || (f.IndexOptions != "" && f.IndexOptions != "positions" && f.IndexOptions != "offsets") {

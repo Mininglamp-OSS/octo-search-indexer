@@ -9,6 +9,8 @@ import (
 
 func TestFilenameSerialization(t *testing.T) {
 	for _, tc := range []struct{ name, folded string }{
+		{"ᾷ.pdf", "ᾶι.pdf"},
+		{"ᾷ.pdf", "ᾶι.pdf"},
 		{"ｶﾞｲﾄﾞ.pdf", "ガイド.pdf"},
 		{"ガイド.pdf", "ガイド.pdf"},
 		{"ﾊﾟｰﾂ.pdf", "パーツ.pdf"},

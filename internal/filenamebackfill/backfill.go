@@ -208,7 +208,7 @@ func decodeFilename(hit opensearchapi.SearchHit) (string, string, error) {
 // Offline migration audit only: bounded filename-only pages, never file bodies.
 // Scanning all eligible names also finds stale nonempty derived values on reruns.
 func walk(ctx context.Context, client *opensearchapi.Client, index string, size int, visit func([]opensearchapi.SearchHit) error) error {
-	query := map[string]any{"size": size, "sort": []string{"_doc"}, "_source": []string{"payload.file.name", "payload.file.nameLiteral"}, "query": map[string]any{"bool": map[string]any{"filter": []any{map[string]any{"term": map[string]any{"payload.type": 8}}, map[string]any{"exists": map[string]any{"field": "payload.file.name"}}}}}}
+	query := map[string]any{"size": size, "sort": []string{"_doc"}, "_source": []string{"payload.file.name", "payload.file.nameLiteral", "payload.type"}, "query": map[string]any{"match_all": map[string]any{}}}
 	body, _ := json.Marshal(query)
 	first, err := client.Search(ctx, &opensearchapi.SearchReq{Indices: []string{index}, Body: bytes.NewReader(body), Params: opensearchapi.SearchParams{Scroll: 15 * time.Minute}})
 	if err != nil {
@@ -236,7 +236,26 @@ func walk(ctx context.Context, client *opensearchapi.Client, index string, size 
 				return fmt.Errorf("filename scroll returned unexpected concrete index")
 			}
 		}
-		if err := visit(hits); err != nil {
+		// Select from source, independently of indexed eligibility fields, so an
+		// indexed exists/term predicate cannot silently hide historical files.
+		eligible := make([]opensearchapi.SearchHit, 0, len(hits))
+		for _, hit := range hits {
+			var source struct {
+				Payload struct {
+					Type int `json:"type"`
+					File struct {
+						Name *string `json:"name"`
+					} `json:"file"`
+				} `json:"payload"`
+			}
+			if err := json.Unmarshal(hit.Source, &source); err != nil {
+				return err
+			}
+			if source.Payload.Type == 8 && source.Payload.File.Name != nil {
+				eligible = append(eligible, hit)
+			}
+		}
+		if err := visit(eligible); err != nil {
 			return err
 		}
 		if scrollID == "" {

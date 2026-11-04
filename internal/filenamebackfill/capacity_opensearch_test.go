@@ -141,3 +141,33 @@ func TestPreflightLiveWrongAnalyzer(t *testing.T) {
 		t.Fatal("wrong analyzer accepted even on empty index")
 	}
 }
+
+func TestPreflightPopulatedUnindexedName(t *testing.T) {
+	endpoint := os.Getenv("F3_OPENSEARCH_URL")
+	if endpoint == "" {
+		t.Skip("set F3_OPENSEARCH_URL")
+	}
+	c, err := opensearchapi.NewClient(opensearchapi.Config{Client: opensearch.Config{Addresses: []string{endpoint}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	index := fmt.Sprintf("test-f3-unindexed-%d", time.Now().UnixNano())
+	var mapping map[string]any
+	if err := json.Unmarshal(esindex.IndexMappingJSON(), &mapping); err != nil {
+		t.Fatal(err)
+	}
+	mapping["mappings"].(map[string]any)["properties"].(map[string]any)["payload"].(map[string]any)["properties"].(map[string]any)["file"].(map[string]any)["properties"].(map[string]any)["name"].(map[string]any)["index"] = false
+	if err := requestJSON(ctx, c, "PUT", "/"+index, mapping, nil); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = requestJSON(ctx, c, "DELETE", "/"+index, nil, nil) })
+	doc := map[string]any{"payload": map[string]any{"type": 8, "file": map[string]any{"name": "historical.pdf"}}}
+	if err := requestJSON(ctx, c, "PUT", "/"+index+"/_doc/1?refresh=true", doc, nil); err != nil {
+		t.Fatal(err)
+	}
+	stats, err := Run(ctx, c, index, 2, 1000)
+	if err == nil || stats.Updated != 0 {
+		t.Fatalf("incompatible populated index certified: %+v %v", stats, err)
+	}
+}

@@ -11,7 +11,7 @@ import (
 // FoldFilename is the S14 T1 contract shared with octo-server. Keep punctuation
 // and whitespace, fold width/case and canonical equivalents (NFC, not general NFKC).
 func FoldFilename(name string) string {
-	return norm.NFC.String(cases.Fold().String(width.Fold.String(name)))
+	return norm.NFC.String(cases.Fold().String(norm.NFC.String(width.Fold.String(name))))
 }
 
 // MarshalJSON derives the search field at the serialization boundary so live

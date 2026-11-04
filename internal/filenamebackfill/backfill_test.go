@@ -78,8 +78,11 @@ func TestRunBulkAndVerification(t *testing.T) {
 				case r.URL.Path == "/target/_search":
 					var q map[string]any
 					_ = json.NewDecoder(r.Body).Decode(&q)
+					if _, ok := q["query"].(map[string]any)["match_all"]; !ok {
+						t.Error("source audit must not depend on indexed eligibility")
+					}
 					fields := q["_source"].([]any)
-					if len(fields) != 2 || fields[0] != "payload.file.name" || fields[1] != "payload.file.nameLiteral" {
+					if len(fields) != 3 || fields[0] != "payload.file.name" || fields[1] != "payload.file.nameLiteral" {
 						t.Errorf("unbounded source: %v", fields)
 					}
 					name, literal := "ＯＣＴＯ v1.2.pdf", "wrong-existing-value"
@@ -89,7 +92,7 @@ func TestRunBulkAndVerification(t *testing.T) {
 					if refreshed && tc.name == "rename" {
 						name = "new.pdf"
 					}
-					hits := []any{map[string]any{"_index": "target", "_id": "123-rt2", "_source": map[string]any{"payload": map[string]any{"file": map[string]string{"name": name, "nameLiteral": literal}}}}}
+					hits := []any{map[string]any{"_index": "target", "_id": "123-rt2", "_source": map[string]any{"payload": map[string]any{"type": 8, "file": map[string]string{"name": name, "nameLiteral": literal}}}}}
 					if refreshed && tc.name == "deleted" {
 						hits = nil
 					}
@@ -150,7 +153,7 @@ func TestRunBulkAndVerification(t *testing.T) {
 }
 
 func TestPreflightRejectsBeforeSearchOrWrite(t *testing.T) {
-	for _, which := range []string{"alias", "field", "positions", "source", "tokenizer", "filter", "probe"} {
+	for _, which := range []string{"name-index", "type-index", "ancestor", "alias", "field", "positions", "source", "tokenizer", "filter", "probe"} {
 		t.Run(which, func(t *testing.T) {
 			c := testClient(t, func(w http.ResponseWriter, r *http.Request) {
 				w.Header().Set("Content-Type", "application/json")
@@ -162,6 +165,17 @@ func TestPreflightRejectsBeforeSearchOrWrite(t *testing.T) {
 							return
 						}
 						m := b["target"].(map[string]any)["mappings"].(map[string]any)
+						payload := m["properties"].(map[string]any)["payload"].(map[string]any)
+						if which == "ancestor" {
+							payload["type"] = "nested"
+						}
+						if which == "type-index" {
+							payload["properties"].(map[string]any)["type"].(map[string]any)["index"] = false
+						}
+						if which == "name-index" {
+							payload["properties"].(map[string]any)["file"].(map[string]any)["properties"].(map[string]any)["name"].(map[string]any)["index"] = false
+						}
+
 						if which == "source" {
 							m["_source"] = map[string]any{"excludes": []string{"payload.file.nameLiteral"}}
 						}
@@ -206,7 +220,7 @@ func TestDryRunNeverWrites(t *testing.T) {
 		}
 		switch r.URL.Path {
 		case "/target/_search":
-			fmt.Fprint(w, `{"_scroll_id":"s","hits":{"hits":[{"_index":"target","_id":"1","_source":{"payload":{"file":{"name":"ＯＣＴＯ","nameLiteral":"wrong"}}}}]}}`)
+			fmt.Fprint(w, `{"_scroll_id":"s","hits":{"hits":[{"_index":"target","_id":"1","_source":{"payload":{"type":8,"file":{"name":"ＯＣＴＯ","nameLiteral":"wrong"}}}}]}}`)
 		case "/_search/scroll":
 			if r.Method == "DELETE" {
 				fmt.Fprint(w, `{"succeeded":true}`)
@@ -254,7 +268,7 @@ func TestBulkByteLimit(t *testing.T) {
 			w.WriteHeader(500)
 			return
 		}
-		_ = json.NewEncoder(w).Encode(map[string]any{"_scroll_id": "s", "hits": map[string]any{"hits": []any{map[string]any{"_index": "target", "_id": "1", "_source": map[string]any{"payload": map[string]any{"file": map[string]string{"name": strings.Repeat("x", maxBulkBytes)}}}}}}})
+		_ = json.NewEncoder(w).Encode(map[string]any{"_scroll_id": "s", "hits": map[string]any{"hits": []any{map[string]any{"_index": "target", "_id": "1", "_source": map[string]any{"payload": map[string]any{"type": 8, "file": map[string]string{"name": strings.Repeat("x", maxBulkBytes)}}}}}}})
 	})
 	if _, err := Run(context.Background(), c, "target", 1, 1000); err == nil {
 		t.Fatal("oversized update accepted")
