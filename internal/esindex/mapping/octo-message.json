@@ -1,5 +1,13 @@
 {
   "settings": {
+    "analysis": {
+      "tokenizer": {
+        "filename_chars": { "type": "ngram", "min_gram": 1, "max_gram": 1, "token_chars": [] }
+      },
+      "analyzer": {
+        "filename_literal": { "type": "custom", "tokenizer": "filename_chars", "filter": [] }
+      }
+    },
     "index": {
       "number_of_shards": 1,
       "number_of_replicas": 1
@@ -77,6 +85,7 @@
             "properties": {
               "url":       { "type": "keyword", "ignore_above": 1024 },
               "name":      { "type": "text", "analyzer": "ik_max_word", "search_analyzer": "ik_smart" },
+              "nameLiteral": { "type": "text", "analyzer": "filename_literal", "search_analyzer": "filename_literal", "norms": false },
               "caption":   { "type": "text", "analyzer": "ik_max_word", "search_analyzer": "ik_smart" },
               "size":      { "type": "long" },
               "extension": { "type": "keyword", "ignore_above": 32 },

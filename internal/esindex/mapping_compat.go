@@ -27,6 +27,7 @@ import (
 // migrate-forward 有良性差异；这里只断言**本期变更引入的新字段**齐备，命中 §6.4 的部署竞态
 // （漏迁新字段 → 启动即每条 bulk 4xx）。
 var requiredMappingFieldPaths = []string{
+	"payload.file.nameLiteral", // S14 F3 literal filename search
 	"payload.mergeForward.msgs.from",
 	"payload.mergeForward.msgs.timestamp",
 	"payload.richText.searchText",
@@ -116,6 +117,10 @@ func assertLiveMappingCompatible(ctx context.Context, client *opensearchapi.Clie
 
 	indexable := flattenMappingNode(root)
 	var missing []string
+	name := root.Properties["payload"].Properties["file"].Properties["nameLiteral"]
+	if name.Type != "text" || name.Analyzer != "filename_literal" || (name.SearchAnalyzer != "" && name.SearchAnalyzer != "filename_literal") {
+		missing = append(missing, "payload.file.nameLiteral (text with filename_literal index/search analyzer)")
+	}
 	for _, p := range requiredMappingFieldPaths {
 		if !indexable[p] {
 			missing = append(missing, p)
@@ -175,9 +180,11 @@ func sourceExcludesContains(mappings json.RawMessage, path string) bool {
 // mappingNode 是 OS mapping 树的最小递归形态：一个节点可能有 properties（子字段）、
 // enabled（object 是否索引）、type。
 type mappingNode struct {
-	Enabled    *bool                  `json:"enabled,omitempty"`
-	Type       string                 `json:"type,omitempty"`
-	Properties map[string]mappingNode `json:"properties,omitempty"`
+	Enabled        *bool                  `json:"enabled,omitempty"`
+	Type           string                 `json:"type,omitempty"`
+	Analyzer       string                 `json:"analyzer,omitempty"`
+	SearchAnalyzer string                 `json:"search_analyzer,omitempty"`
+	Properties     map[string]mappingNode `json:"properties,omitempty"`
 }
 
 // MappingIndexableFieldPaths 返回内嵌规范 mapping（octo-message.json）里所有**可索引**叶子

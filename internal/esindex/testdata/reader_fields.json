@@ -1,4 +1,5 @@
 [
+  "payload.file.nameLiteral",
   "messageId",
   "messageSeq",
   "channelId",
