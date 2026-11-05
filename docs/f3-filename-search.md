@@ -1,5 +1,10 @@
 # S14 F3 attachment filename search
 
+T1 literal filename matching supplements the existing T2 fulltext branch.
+A literal non-match must not exclude an existing filename/caption/body fulltext
+hit. The reader retains legacy hit identities and scores; T1-only negative
+examples must not be used as whole-query exclusions.
+
 This change ships with the matching `octo-server` query changes. It does not
 change permissions, message identity, visibility revalidation, fulltext analysis,
 or frontend interfaces.
@@ -110,8 +115,9 @@ bulk makes a large migration fit a short maintenance window. Reproduce with
 | Filename / source | Query | Expected |
 | --- | --- | --- |
 | `ＯＣＴＯ方案ｖ１．２.pdf` | `octo`, `cto`, `v1.2` | Hit; original filename preserved |
-| Same filename | `v12` | No filename-only hit |
-| `排期与评审.pdf`, no matching body | `排期 评审` | No hit |
+| Same filename, no matching caption/body | `v12` | No literal hit and no result in this fixture; `v12` in readable body may still match T2 |
+| `排期与评审.pdf`, no matching body | `排期 评审` | No T1 literal match; existing T2 segmented hit retained |
+| `排期  评审.pdf` (two spaces), no matching body | `排期 评审` (one space) | No T1 literal match; existing T2 segmented hit retained |
 | `排期.pdf` with caption `评审` | `排期 评审` | Existing joint fulltext hit retained |
 | `100%_完成*?.pdf` | `%_`, `*?` | Literal hits, no wildcard interpretation |
 | Two different attachments with the same name | Matching fragment | Both identities retained |
